@@ -17,6 +17,7 @@ Thumbs.db
 
 # Local model / data artifacts (usually large)
 models/
+models_cache/
 outputs/
 logs/
 *.gguf
