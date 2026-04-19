@@ -8,32 +8,24 @@ def personas_dir() -> Path:
 
 
 def user_profile_file() -> Path:
-    return profile_file()
+    return PROJECT_ROOT / "config" / "user_profile.json"
 
 
 def memory_data_dir() -> Path:
     return PROJECT_ROOT / "data" / "memory"
 
 
-def sessions_dir() -> Path:
-    return memory_data_dir() / "sessions"
+def debug_reports_dir() -> Path:
+    return memory_data_dir() / "debug_reports"
 
 
-def profile_file() -> Path:
-    return memory_data_dir() / "profile.json"
+def rag_data_dir() -> Path:
+    return memory_data_dir() / "rag"
 
 
-def relationship_state_file() -> Path:
-    return memory_data_dir() / "relationship_state.json"
+def rag_index_dir() -> Path:
+    return rag_data_dir() / "index"
 
 
-def core_memory_file() -> Path:
-    return memory_data_dir() / "core_memory.jsonl"
-
-
-def archival_memory_file() -> Path:
-    return memory_data_dir() / "archival_memory.jsonl"
-
-
-def memory_indexes_dir() -> Path:
-    return memory_data_dir() / "indexes"
+def rag_documents_dir() -> Path:
+    return PROJECT_ROOT / "data" / "documents"

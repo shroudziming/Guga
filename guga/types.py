@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -13,3 +13,33 @@ class Persona:
     name: str
     system_prompt: str
     description: str = ""
+
+
+@dataclass
+class MemoryHit:
+    id: str
+    summary: str
+    raw_excerpt: str = ""
+    score: float = 0.0
+    source_session_id: str = ""
+    source_message_ids: list[str] = field(default_factory=list)
+    created_at: str = ""
+    importance: float = 0.0
+    confidence: float = 0.0
+
+
+@dataclass
+class DocumentHit:
+    chunk_id: str
+    text: str
+    score: float
+    source_id: str
+    source_path: str = ""
+    created_at: str = ""
+
+
+@dataclass
+class MemoryContext:
+    archival_memories: list[str] = field(default_factory=list)
+    hits: list[MemoryHit] = field(default_factory=list)
+    document_hits: list[DocumentHit] = field(default_factory=list)

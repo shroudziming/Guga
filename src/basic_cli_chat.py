@@ -13,19 +13,26 @@ from guga.chat import ChatSession
 from guga.config import DEFAULT_CACHE_DIR, DEFAULT_MODEL_ID, default_generation_config
 from guga.models import create_chat_model
 from guga.persona import PersonaManager
-from guga.utils.paths import personas_dir
+from guga.utils.debug_reporter import FileDebugSink
+from guga.utils.paths import debug_reports_dir, personas_dir
 
 
 def main() -> None:
     model_id = os.environ.get("Guga_MODEL_ID", DEFAULT_MODEL_ID)
     cache_dir = os.environ.get("Guga_CACHE_DIR", str(DEFAULT_CACHE_DIR))
     persona_name = os.environ.get("Guga_PERSONA", "default")
+    debug_enabled = os.environ.get("Guga_DEBUG", "1") != "0"
 
     print("[Guga] 多轮 CLI 聊天")
-    print("命令: /clear 清空会话, /exit 退出")
+    print("命令: /clear 清空会话, /rag_rebuild 重建RAG索引, /exit 退出")
     print("提示: 生成中按 Ctrl+C 可停止输出")
     print(f"model={model_id}")
     print(f"persona={persona_name}\n")
+    if debug_enabled:
+        print("[DEBUG] 交互调试已开启（可用 Guga_DEBUG=0 关闭）\n")
+    sink = FileDebugSink(debug_reports_dir()) if debug_enabled else None
+    if debug_enabled:
+        print(f"[DEBUG] 报告目录: {debug_reports_dir()}\n")
 
     persona = PersonaManager(personas_dir()).load(persona_name)
     model = create_chat_model(model_id=model_id, cache_dir=cache_dir)
@@ -34,6 +41,8 @@ def main() -> None:
         system_prompt=persona.system_prompt,
         generation=default_generation_config(),
         max_turns=10,
+        debug=debug_enabled,
+        debug_sink=sink,
     )
 
     while True:
@@ -48,6 +57,14 @@ def main() -> None:
         if user_text == "/clear":
             session.clear()
             print("会话已清空。")
+            continue
+
+        if user_text == "/rag_rebuild":
+            result = session.memory_manager.rebuild_rag_indexes(session_id=session.session_id)
+            print(
+                f"RAG 索引已重建: memory_chunks={result['memory_chunks']}, "
+                f"document_chunks={result['document_chunks']}, total_chunks={result['total_chunks']}"
+            )
             continue
 
         cancel_event = Event()

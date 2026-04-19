@@ -4,8 +4,17 @@
 
 ## 当前学习阶段
 
-- 阶段一：本地模型推理 + 多轮聊天（进行中）
-- 阶段二：人设与记忆（结构已预留）
+- 阶段一：本地模型推理 + 多轮聊天（已完成基础版）
+- 阶段二：人设与记忆（进行中，已接入本地 RAG 检索）
+
+## 近期进度（2026-04-19）
+
+- 已完成：CLI 多轮聊天（含流式输出与中断）
+- 已完成：Persona 加载与切换（`default/gentle/rational`）
+- 已完成：会话消息落盘与归档记忆写回
+- 已完成：本地 RAG 检索闭环（memory + documents，语义 + 词法混合检索）
+- 已完成：OpenAI 兼容 API 模型接入（使用中转站 `OPENAI_BASE_URL/OPENAI_API_KEY`），本地模型不够智能，无法评估RAG效果
+- 进行中：记忆质量提升（召回稳定性、写回策略、评估与可观测性）
 
 ## 目录说明
 
@@ -28,4 +37,10 @@
 - `Guga_MODEL_ID`：模型 ID（默认 `Qwen/Qwen2.5-VL-3B-Instruct`）
 - `Guga_CACHE_DIR`：模型缓存目录
 - `Guga_PERSONA`：人设名（默认 `default`）
+
+## 使用在线 API 模型（实验）
+
+支持 OpenAI 兼容接口，配置以所使用中转站为准
+
+- `Guga_MODEL_PROVIDER` 不设或设为 `local` 时，仍使用本地模型。
 

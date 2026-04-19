@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+
+from guga.rag.chunker import chunk_text
+from guga.rag.embedder import BaseEmbedder, build_embedder
+from guga.rag.faiss_store import VectorStore
+from guga.rag.schemas import DocumentChunk, RetrievalHit
+
+
+class RagPipeline:
+    def __init__(
+        self,
+        index_dir: Path,
+        documents_dir: Path,
+        embedding_model: str,
+        chunk_size: int,
+        chunk_overlap: int,
+        debug_hook=None,
+        embedder: BaseEmbedder | None = None,
+    ) -> None:
+        self.index_dir = index_dir
+        self.documents_dir = documents_dir
+        self.embedding_model = embedding_model
+        self.chunk_size = chunk_size
+        self.chunk_overlap = chunk_overlap
+        self.debug_hook = debug_hook
+        self.embedder = embedder or build_embedder(embedding_model)
+        self.store = VectorStore(index_dir)
+        self._loaded = False
+
+    def ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+        self.store.load()
+        self._loaded = True
+
+    def rebuild_indexes(self, memory_root: Path, documents_dir: Path | None = None) -> dict[str, int]:
+        target_docs = documents_dir or self.documents_dir
+        memory_chunks = self._collect_memory_chunks(memory_root)
+        document_chunks = self._collect_document_chunks(target_docs)
+        all_chunks = memory_chunks + document_chunks
+
+        if all_chunks:
+            vectors = self.embedder.encode([chunk.text for chunk in all_chunks])
+        else:
+            vectors = []
+
+        self.store.rebuild(all_chunks, vectors)
+        self.store.save()
+        self._loaded = True
+        self._debug(
+            f"index_update memory_chunks={len(memory_chunks)} document_chunks={len(document_chunks)} total_chunks={len(all_chunks)}"
+        )
+        return {
+            "memory_chunks": len(memory_chunks),
+            "document_chunks": len(document_chunks),
+            "total_chunks": len(all_chunks),
+        }
+
+    def add_memory_record(self, payload: dict) -> None:
+        self.ensure_loaded()
+        chunks = self._memory_chunks_from_payload(payload)
+        if not chunks:
+            return
+        vectors = self.embedder.encode([chunk.text for chunk in chunks])
+        self.store.add(chunks, vectors)
+        self.store.save()
+
+    def retrieve(self, query: str, memory_top_k: int, document_top_k: int) -> tuple[list[RetrievalHit], list[RetrievalHit]]:
+        self.ensure_loaded()
+        if not query.strip() or not self.store.chunks:
+            return [], []
+
+        query_vec = self.embedder.encode([query])[0]
+        memory_hits = self._search(query_vec, top_k=memory_top_k, source_type="memory")
+        document_hits = self._search(query_vec, top_k=document_top_k, source_type="document")
+        return memory_hits, document_hits
+
+    def _search(self, query_vec: list[float], top_k: int, source_type: str) -> list[RetrievalHit]:
+        rows = self.store.search(query_vec=query_vec, top_k=top_k, source_type=source_type)
+        hits: list[RetrievalHit] = []
+        for idx, score in rows:
+            chunk = self.store.chunks[idx]
+            hits.append(
+                RetrievalHit(
+                    chunk_id=chunk.id,
+                    text=chunk.text,
+                    score=round(float(score), 4),
+                    source_type=chunk.source_type,
+                    source_id=chunk.source_id,
+                    source_path=chunk.source_path,
+                    source_session_id=chunk.source_session_id,
+                    source_message_id=chunk.source_message_id,
+                    created_at=chunk.created_at,
+                )
+            )
+        return hits
+
+    def _collect_memory_chunks(self, memory_root: Path) -> list[DocumentChunk]:
+        chunks: list[DocumentChunk] = []
+        archival_file = memory_root / "archival_memory.jsonl"
+        if archival_file.exists():
+            for line in archival_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                chunks.extend(self._memory_chunks_from_payload(payload))
+
+        sessions_dir = memory_root / "sessions"
+        if sessions_dir.exists():
+            for path in sessions_dir.glob("**/*.jsonl"):
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if str(payload.get("role", "")) != "user":
+                        continue
+                    content = str(payload.get("content", "")).strip()
+                    if not content:
+                        continue
+                    chunks.extend(self._build_chunks(
+                        source_type="memory",
+                        source_id=str(payload.get("id", self._hash_text(content))),
+                        text=content,
+                        source_session_id=str(payload.get("session_id", "")),
+                        source_message_id=str(payload.get("id", "")),
+                        created_at=str(payload.get("created_at", "")),
+                    ))
+
+        return chunks
+
+    def _memory_chunks_from_payload(self, payload: dict) -> list[DocumentChunk]:
+        status = str(payload.get("status", "active"))
+        if status != "active":
+            return []
+
+        summary = str(payload.get("summary") or payload.get("raw_excerpt") or "").strip()
+        if not summary:
+            return []
+
+        source_message_ids = payload.get("source_message_ids", [])
+        if isinstance(source_message_ids, str):
+            source_message_ids = [source_message_ids]
+        if not isinstance(source_message_ids, list):
+            source_message_ids = []
+
+        source_id = str(payload.get("id") or self._hash_text(summary))
+        source_message_id = str(source_message_ids[0]) if source_message_ids else ""
+        return self._build_chunks(
+            source_type="memory",
+            source_id=source_id,
+            text=summary,
+            source_session_id=str(payload.get("source_session_id", "")),
+            source_message_id=source_message_id,
+            created_at=str(payload.get("created_at", "")),
+        )
+
+    def _collect_document_chunks(self, docs_dir: Path) -> list[DocumentChunk]:
+        if not docs_dir.exists():
+            return []
+
+        chunks: list[DocumentChunk] = []
+        patterns = ("*.txt", "*.md", "*.json", "*.jsonl")
+        files: list[Path] = []
+        for pattern in patterns:
+            files.extend(docs_dir.glob(f"**/{pattern}"))
+
+        for file_path in files:
+            text = file_path.read_text(encoding="utf-8", errors="ignore").strip()
+            if not text:
+                continue
+            rel_path = file_path.relative_to(docs_dir).as_posix()
+            chunks.extend(
+                self._build_chunks(
+                    source_type="document",
+                    source_id=rel_path,
+                    text=text,
+                    source_path=str(file_path),
+                )
+            )
+        return chunks
+
+    def _build_chunks(
+        self,
+        source_type: str,
+        source_id: str,
+        text: str,
+        source_path: str = "",
+        source_session_id: str = "",
+        source_message_id: str = "",
+        created_at: str = "",
+    ) -> list[DocumentChunk]:
+        pieces = chunk_text(text, chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
+        chunks: list[DocumentChunk] = []
+        for idx, piece in enumerate(pieces):
+            chunk_id = f"{source_type}:{source_id}:c{idx}"
+            chunks.append(
+                DocumentChunk(
+                    id=chunk_id,
+                    text=piece,
+                    source_type=source_type,
+                    source_id=source_id,
+                    source_path=source_path,
+                    source_session_id=source_session_id,
+                    source_message_id=source_message_id,
+                    created_at=created_at,
+                )
+            )
+        return chunks
+
+    def _hash_text(self, text: str) -> str:
+        return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+
+    def _debug(self, message: str) -> None:
+        if self.debug_hook is None:
+            return
+        self.debug_hook(message)

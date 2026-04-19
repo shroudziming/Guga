@@ -5,3 +5,6 @@ accelerate>=0.30.0
 safetensors>=0.4.3
 huggingface_hub>=0.23.0
 tokenizers>=0.19.1
+sentence-transformers>=2.7.0
+faiss-cpu>=1.8.0
+numpy>=1.26.0

@@ -1,27 +1,23 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
-
-from guga.memory.clock import now_iso
-from guga.memory.schema import ProfileRecord
-from guga.memory.storage import read_json, write_json
 
 
 class ProfileStore:
-    """存储用户结构化档案（本地 JSON）。"""
+    """阶段二预留：存储长期偏好信息（本地 JSON）。"""
 
     def __init__(self, file_path: Path) -> None:
         self.file_path = file_path
 
-    def load(self) -> ProfileRecord:
-        payload = read_json(self.file_path, default=None)
-        if not isinstance(payload, dict):
-            return ProfileRecord(updated_at=now_iso())
-        profile = ProfileRecord.from_dict(payload)
-        if not profile.updated_at:
-            profile.updated_at = now_iso()
-        return profile
+    def load(self) -> dict[str, str]:
+        if not self.file_path.exists():
+            return {}
+        return json.loads(self.file_path.read_text(encoding="utf-8"))
 
-    def save(self, profile: ProfileRecord) -> None:
-        profile.updated_at = now_iso()
-        write_json(self.file_path, profile.to_dict())
+    def save(self, profile: dict[str, str]) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file_path.write_text(
+            json.dumps(profile, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )

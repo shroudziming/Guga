@@ -18,6 +18,21 @@ Thumbs.db
 # Local model / data artifacts (usually large)
 models/
 models_cache/
+data/
 outputs/
 logs/
 *.gguf
+# Claude
+.claude/
+
+# Python tooling artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+CLAUDE.md
