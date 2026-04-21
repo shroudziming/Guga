@@ -17,6 +17,15 @@ else:
 
 
 class ChatSession:
+    """Orchestrate one chat session around the model + memory/RAG pipeline.
+
+    Flow per turn:
+    1) ingest user text into in-memory history and persistent session store
+    2) retrieve memory/document context via MemoryManager (RAG step)
+    3) compose system prompt with retrieved context and generate answer
+    4) persist assistant response and finalize turn writeback
+    """
+
     def __init__(
         self,
         model: ChatModel,
@@ -28,6 +37,18 @@ class ChatSession:
         debug: bool = False,
         debug_sink: Callable[[str], None] | None = None,
     ) -> None:
+        """Initialize session state and bind model/memory dependencies.
+
+        Args:
+            model: Chat model implementation (local or API-backed).
+            system_prompt: Base persona/system instruction.
+            generation: Sampling config used by model generation.
+            max_turns: Max recent dialogue turns kept in ChatHistory.
+            memory_manager: Optional external memory manager.
+            session_id: Optional existing session id for resume scenarios.
+            debug: Whether to emit debug logs.
+            debug_sink: Optional sink function for debug output.
+        """
         self.model = model
         self.system_prompt = system_prompt
         self.generation = generation
@@ -39,6 +60,19 @@ class ChatSession:
         self._debug("session_ready")
 
     def reply(self, user_input: str) -> str:
+        """Run one non-streaming dialogue turn.
+
+        Upstream input:
+            Raw user text from CLI/UI.
+
+        Downstream output:
+            Final assistant text returned by model.generate_reply.
+
+        Side effects:
+            - Persist user/assistant messages to session storage.
+            - Perform RAG retrieval and inject context into system prompt.
+            - Trigger memory writeback in MemoryManager.finalize_turn.
+        """
         self._debug("reply_start")
         self.history.add_user(user_input)
         self.memory_manager.record_user_message(session_id=self.session_id, text=user_input)
@@ -67,6 +101,19 @@ class ChatSession:
         return answer
 
     def reply_stream(self, user_input: str, cancel_event: Event | None = None) -> Iterator[str]:
+        """Run one streaming dialogue turn and yield output chunks.
+
+        Args:
+            user_input: Raw user text from CLI/UI.
+            cancel_event: Optional cancellation signal for streaming models.
+
+        Yields:
+            Incremental text chunks from model streaming generation.
+
+        Notes:
+            Retrieval/prompt assembly is identical to reply(); only generation
+            output mode differs (streamed chunks vs single final string).
+        """
         self._debug("reply_start")
         self.history.add_user(user_input)
         self.memory_manager.record_user_message(session_id=self.session_id, text=user_input)
@@ -109,6 +156,7 @@ class ChatSession:
         self._debug("finalize_done")
 
     def clear(self) -> None:
+        """Clear only in-memory short history; persisted memory files remain."""
         self.history.clear()
 
     def _debug(self, message: str) -> None:

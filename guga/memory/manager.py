@@ -56,7 +56,13 @@ class _SessionStore:
 
 
 class MemoryManager:
-    """Local RAG memory manager for learning (memory + document retrieval)."""
+    """Manage memory retrieval/writeback around the chat turn lifecycle.
+
+    This class is the center of the RAG flow used by ChatSession:
+    - before generation: retrieve memory/doc context (prepare_context)
+    - prompt assembly: inject retrieval hits into system prompt
+    - after generation: write back user memory and update vector index
+    """
 
     def __init__(
         self,
@@ -69,6 +75,18 @@ class MemoryManager:
         recency_weight: float = DEFAULT_MEMORY_RECENCY_WEIGHT,
         enable_semantic: bool = DEFAULT_RAG_ENABLE_SEMANTIC,
     ) -> None:
+        """Create manager with lexical + optional semantic retrieval capabilities.
+
+        Args:
+            memory_root: Root directory for memory files and indexes.
+            model: Reserved for future use (kept for API compatibility).
+            debug: Whether to emit debug traces.
+            debug_sink: Optional debug output sink callback.
+            top_k: Max memory hits returned to prompt context.
+            document_top_k: Max document hits returned to prompt context.
+            recency_weight: Weight for recency term in lexical scoring.
+            enable_semantic: Whether to enable vector-based retrieval pipeline.
+        """
         _ = model
         self.memory_root = memory_root or memory_data_dir()
         self.debug = debug
@@ -96,6 +114,26 @@ class MemoryManager:
             )
 
     def prepare_context(self, user_text: str, session_id: str) -> MemoryContext:
+        """Retrieve context for current user input and return structured hits.
+
+        Upstream:
+            Called by ChatSession before model generation.
+
+        Retrieval steps:
+            1) Load archival records for lexical matching.
+            2) Retrieve semantic hits from RagPipeline (memory + documents).
+            3) Compute lexical scores and merge with semantic memory hits.
+
+        Args:
+            user_text: Current user query text.
+            session_id: Active session id for trace/debug logs.
+
+        Returns:
+            MemoryContext containing:
+            - hits: merged memory hits used in prompt
+            - document_hits: semantic document hits
+            - archival_memories: summaries of selected memory hits
+        """
         started = perf_counter()
         records = self._load_archival_records()
         self._debug(
@@ -131,6 +169,15 @@ class MemoryManager:
         )
 
     def compose_system_prompt(self, base_prompt: str, memory_context: MemoryContext) -> str:
+        """Build final system prompt by combining persona + retrieval results.
+
+        Args:
+            base_prompt: Persona/system base instruction.
+            memory_context: Retrieval result from prepare_context.
+
+        Returns:
+            A single system prompt string consumed by the chat model.
+        """
         sections = ["[Base Persona]", base_prompt]
         sections.append("\n[Relevant Memory]")
         if memory_context.hits:
@@ -155,6 +202,11 @@ class MemoryManager:
         return "\n".join(sections)
 
     def record_user_message(self, session_id: str, text: str, source: str = "chat") -> str:
+        """Persist current user message and cache it in per-turn state.
+
+        Returns:
+            message_id written to sessions/<session_id>.jsonl.
+        """
         message_id = self.session_store.append_message(session_id=session_id, role="user", content=text, source=source)
         state = self._turn_state.setdefault(session_id, {})
         state["user_text"] = text
@@ -163,6 +215,11 @@ class MemoryManager:
         return message_id
 
     def record_assistant_message(self, session_id: str, text: str, source: str = "chat") -> str:
+        """Persist assistant reply and cache it in per-turn state.
+
+        Returns:
+            message_id written to sessions/<session_id>.jsonl.
+        """
         message_id = self.session_store.append_message(session_id=session_id, role="assistant", content=text, source=source)
         state = self._turn_state.setdefault(session_id, {})
         state["assistant_text"] = text
@@ -171,6 +228,16 @@ class MemoryManager:
         return message_id
 
     def finalize_turn(self, session_id: str) -> None:
+        """Finalize one turn: optional archival writeback and index update.
+
+        Upstream:
+            Called by ChatSession after assistant response is generated.
+
+        Behavior:
+            - If user text passes archive policy, append one memory record.
+            - If semantic retrieval is enabled, update vector index incrementally.
+            - Clear cached per-turn state for this session.
+        """
         started = perf_counter()
         state = self._turn_state.get(session_id, {})
         user_text = state.get("user_text", "").strip()
@@ -210,6 +277,11 @@ class MemoryManager:
         self._turn_state.pop(session_id, None)
 
     def rebuild_rag_indexes(self, session_id: str = "manual") -> dict[str, int]:
+        """Force full rebuild of memory/document vector indexes.
+
+        Returns:
+            Dict with counts: memory_chunks, document_chunks, total_chunks.
+        """
         if self.rag_pipeline is None:
             return {"memory_chunks": 0, "document_chunks": 0, "total_chunks": 0}
 
@@ -222,6 +294,11 @@ class MemoryManager:
         return result
 
     def _retrieve_semantic(self, user_text: str, session_id: str) -> tuple[list[RetrievalHit], list[RetrievalHit]]:
+        """Retrieve semantic hits from RagPipeline with safe failure fallback.
+
+        Returns:
+            (memory_hits, document_hits). Empty lists on disabled/failed cases.
+        """
         if self.rag_pipeline is None:
             return [], []
 
@@ -237,6 +314,7 @@ class MemoryManager:
             return [], []
 
     def _ensure_semantic_index(self, session_id: str) -> None:
+        """Ensure semantic index is loaded; build it once if persisted data is absent."""
         if self.rag_pipeline is None or self._semantic_ready:
             return
 
@@ -250,6 +328,7 @@ class MemoryManager:
         self._semantic_ready = True
 
     def _merge_memory_hits(self, semantic_hits: list[RetrievalHit], lexical_hits: list[MemoryHit]) -> list[MemoryHit]:
+        """Merge semantic and lexical memory hits, deduplicate, sort, and truncate."""
         merged: list[MemoryHit] = []
         seen: set[str] = set()
 
@@ -284,6 +363,7 @@ class MemoryManager:
         return merged[: self.top_k]
 
     def _to_document_hits(self, semantic_document_hits: list[RetrievalHit]) -> list[DocumentHit]:
+        """Convert RetrievalHit rows into prompt-ready DocumentHit objects."""
         rows: list[DocumentHit] = []
         for hit in semantic_document_hits:
             rows.append(
@@ -300,12 +380,14 @@ class MemoryManager:
         return rows[: self.document_top_k]
 
     def _should_archive(self, user_text: str) -> bool:
+        """Heuristic writeback policy deciding whether user text becomes memory."""
         if len(user_text) >= 12:
             return True
         trigger_keywords = ["喜欢", "不喜欢", "工作", "焦虑", "压力", "我是", "我叫"]
         return any(keyword in user_text for keyword in trigger_keywords)
 
     def _load_archival_records(self) -> list[dict]:
+        """Load and normalize active archival memory records from JSONL file."""
         if not self.archival_file.exists():
             return []
 
@@ -324,6 +406,7 @@ class MemoryManager:
         return records
 
     def _normalize_archival_record(self, payload: dict) -> dict | None:
+        """Normalize one raw archival payload to internal scoring schema."""
         summary = str(payload.get("summary") or payload.get("raw_excerpt") or "").strip()
         if not summary:
             return None
@@ -347,6 +430,7 @@ class MemoryManager:
         }
 
     def _to_hit(self, item: dict, score: float) -> MemoryHit:
+        """Convert normalized archival dict to MemoryHit with rounded score."""
         return MemoryHit(
             id=item["id"],
             summary=item["summary"],
@@ -360,6 +444,12 @@ class MemoryManager:
         )
 
     def _score(self, item: dict, query: str) -> float:
+        """Compute lexical relevance score for one archival memory record.
+
+        Score terms:
+            overlap(query_tokens, memory_text) + recency term + small priors
+            for importance/confidence.
+        """
         text = f"{item.get('summary', '')} {item.get('raw_excerpt', '')}"
         query_tokens = self._tokens(query)
         if not query_tokens:
@@ -377,6 +467,7 @@ class MemoryManager:
         return overlap_score + (self.recency_weight * recency_score) + (0.05 * importance) + (0.05 * confidence)
 
     def _recency_score(self, created_at: str) -> float:
+        """Map timestamp recency to [0, 1] with linear decay over 30 days."""
         if not created_at:
             return 0.0
         try:
@@ -395,6 +486,7 @@ class MemoryManager:
         return 1.0 - (age_days / 30)
 
     def _tokens(self, text: str) -> list[str]:
+        """Tokenize query for lexical matching (word split + CJK n-gram fallback)."""
         compact = text.replace("，", " ").replace("。", " ").replace("？", " ").strip()
         pieces = [item for item in compact.split() if item]
         if len(pieces) >= 2:
@@ -412,6 +504,7 @@ class MemoryManager:
         return self._char_ngrams(compact)
 
     def _char_ngrams(self, text: str) -> list[str]:
+        """Build 2/3-gram token list for short CJK/ascii text matching."""
         if len(text) < 2:
             return [text] if text else []
 

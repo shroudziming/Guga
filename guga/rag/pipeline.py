@@ -11,6 +11,14 @@ from guga.rag.schemas import DocumentChunk, RetrievalHit
 
 
 class RagPipeline:
+    """Build and query vector indexes for memory/documents in the RAG flow.
+
+    Upstream caller is MemoryManager:
+    - prepare_context -> retrieve
+    - finalize_turn -> add_memory_record
+    - manual command -> rebuild_indexes
+    """
+
     def __init__(
         self,
         index_dir: Path,
@@ -21,6 +29,17 @@ class RagPipeline:
         debug_hook=None,
         embedder: BaseEmbedder | None = None,
     ) -> None:
+        """Initialize embedder + vector store configuration.
+
+        Args:
+            index_dir: Persisted index directory (chunks + vectors).
+            documents_dir: Root directory of external/local documents.
+            embedding_model: Embedding model name for sentence-transformers.
+            chunk_size: Max chars per chunk.
+            chunk_overlap: Overlap chars between adjacent chunks.
+            debug_hook: Optional callback used for debug logs.
+            embedder: Optional injected embedder for tests/custom behavior.
+        """
         self.index_dir = index_dir
         self.documents_dir = documents_dir
         self.embedding_model = embedding_model
@@ -32,12 +51,23 @@ class RagPipeline:
         self._loaded = False
 
     def ensure_loaded(self) -> None:
+        """Load persisted vector/chunk index into memory once per process."""
         if self._loaded:
             return
         self.store.load()
         self._loaded = True
 
     def rebuild_indexes(self, memory_root: Path, documents_dir: Path | None = None) -> dict[str, int]:
+        """Rebuild full index from memory files and document directory.
+
+        Data sources:
+            - memory_root/archival_memory.jsonl
+            - memory_root/sessions/**/*.jsonl (user messages)
+            - documents_dir/**/*.txt|md|json|jsonl
+
+        Returns:
+            Chunk counters for memory/document/total.
+        """
         target_docs = documents_dir or self.documents_dir
         memory_chunks = self._collect_memory_chunks(memory_root)
         document_chunks = self._collect_document_chunks(target_docs)
@@ -61,6 +91,7 @@ class RagPipeline:
         }
 
     def add_memory_record(self, payload: dict) -> None:
+        """Incrementally append one new memory record into vector index."""
         self.ensure_loaded()
         chunks = self._memory_chunks_from_payload(payload)
         if not chunks:
@@ -70,6 +101,16 @@ class RagPipeline:
         self.store.save()
 
     def retrieve(self, query: str, memory_top_k: int, document_top_k: int) -> tuple[list[RetrievalHit], list[RetrievalHit]]:
+        """Retrieve semantic hits for memory and documents with one query.
+
+        Args:
+            query: User query text for semantic retrieval.
+            memory_top_k: Max memory results.
+            document_top_k: Max document results.
+
+        Returns:
+            Tuple: (memory_hits, document_hits).
+        """
         self.ensure_loaded()
         if not query.strip() or not self.store.chunks:
             return [], []
@@ -80,6 +121,7 @@ class RagPipeline:
         return memory_hits, document_hits
 
     def _search(self, query_vec: list[float], top_k: int, source_type: str) -> list[RetrievalHit]:
+        """Search vectors by source_type and map rows into RetrievalHit objects."""
         rows = self.store.search(query_vec=query_vec, top_k=top_k, source_type=source_type)
         hits: list[RetrievalHit] = []
         for idx, score in rows:
@@ -100,6 +142,7 @@ class RagPipeline:
         return hits
 
     def _collect_memory_chunks(self, memory_root: Path) -> list[DocumentChunk]:
+        """Collect chunked memory texts from archival and session user messages."""
         chunks: list[DocumentChunk] = []
         archival_file = memory_root / "archival_memory.jsonl"
         if archival_file.exists():
@@ -141,6 +184,7 @@ class RagPipeline:
         return chunks
 
     def _memory_chunks_from_payload(self, payload: dict) -> list[DocumentChunk]:
+        """Convert one archival memory payload into chunk list (if active/valid)."""
         status = str(payload.get("status", "active"))
         if status != "active":
             return []
@@ -167,6 +211,7 @@ class RagPipeline:
         )
 
     def _collect_document_chunks(self, docs_dir: Path) -> list[DocumentChunk]:
+        """Collect chunked document texts from supported file extensions."""
         if not docs_dir.exists():
             return []
 
@@ -201,6 +246,7 @@ class RagPipeline:
         source_message_id: str = "",
         created_at: str = "",
     ) -> list[DocumentChunk]:
+        """Split text into overlapping chunks and attach retrieval metadata."""
         pieces = chunk_text(text, chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
         chunks: list[DocumentChunk] = []
         for idx, piece in enumerate(pieces):
