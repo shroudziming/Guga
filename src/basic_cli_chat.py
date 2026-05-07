@@ -17,7 +17,26 @@ from guga.utils.debug_reporter import FileDebugSink
 from guga.utils.paths import debug_reports_dir, personas_dir
 
 
+def _load_env_file() -> None:
+    """Load PROJECT_ROOT/.env into process env if keys are not already set."""
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def main() -> None:
+    _load_env_file()
+
     model_id = os.environ.get("Guga_MODEL_ID", DEFAULT_MODEL_ID)
     cache_dir = os.environ.get("Guga_CACHE_DIR", str(DEFAULT_CACHE_DIR))
     persona_name = os.environ.get("Guga_PERSONA", "default")

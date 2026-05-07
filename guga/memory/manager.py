@@ -157,9 +157,20 @@ class MemoryManager:
         memory_hit_ids = [hit.id for hit in merged_memory_hits]
         doc_hit_ids = [hit.chunk_id for hit in document_hits]
         source_ids = [hit.source_session_id for hit in merged_memory_hits]
+        memory_raw_payload = [
+            {
+                "id": hit.id,
+                "score": round(hit.score, 4),
+                "summary": hit.summary,
+                "raw_excerpt": hit.raw_excerpt,
+                "source_session_id": hit.source_session_id,
+                "source_message_ids": hit.source_message_ids,
+            }
+            for hit in merged_memory_hits
+        ]
         self._debug(
             session_id,
-            f"retrieve_done query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} selected_mem={len(merged_memory_hits)} selected_doc={len(document_hits)} hit_ids={memory_hit_ids} doc_hit_ids={doc_hit_ids} source_ids={source_ids} latency_ms={elapsed_ms}",
+            f"retrieve_done query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} selected_mem={len(merged_memory_hits)} selected_doc={len(document_hits)} hit_ids={memory_hit_ids} doc_hit_ids={doc_hit_ids} source_ids={source_ids} memory_raw={json.dumps(memory_raw_payload, ensure_ascii=False)} latency_ms={elapsed_ms}",
         )
 
         return MemoryContext(

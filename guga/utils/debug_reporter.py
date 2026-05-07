@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -13,7 +14,8 @@ class FileDebugSink:
         session_id = self._extract_session_id(message)
         target = self._targets.get(session_id)
         if target is None:
-            target = self.report_dir / f"{session_id}.log"
+            stamp = self._beijing_file_stamp()
+            target = self.report_dir / f"{stamp}.{session_id}.log"
             self._targets[session_id] = target
 
         with target.open("a", encoding="utf-8") as handle:
@@ -26,3 +28,8 @@ class FileDebugSink:
             if value:
                 return value
         return "unknown_session"
+
+    def _beijing_file_stamp(self) -> str:
+        tz = timezone(timedelta(hours=8))
+        now = datetime.now(tz)
+        return f"{now.year}.{now.month}.{now.day}.{now.hour}.{now.minute}"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from collections.abc import Iterator
 from threading import Event
@@ -84,6 +85,7 @@ class ChatSession:
 
         system_prompt = self.memory_manager.compose_system_prompt(self.system_prompt, memory_context)
         self._debug("prompt_assemble_done")
+        self._debug(f"system_prompt={json.dumps(system_prompt, ensure_ascii=False)}")
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(self.history.as_messages())
@@ -125,6 +127,7 @@ class ChatSession:
 
         system_prompt = self.memory_manager.compose_system_prompt(self.system_prompt, memory_context)
         self._debug("prompt_assemble_done")
+        self._debug(f"system_prompt={json.dumps(system_prompt, ensure_ascii=False)}")
 
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(self.history.as_messages())

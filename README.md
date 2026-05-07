@@ -43,4 +43,19 @@
 支持 OpenAI 兼容接口，配置以所使用中转站为准
 
 - `Guga_MODEL_PROVIDER` 不设或设为 `local` 时，仍使用本地模型。
+- API 路径已支持流式输出（当中转站支持 SSE `stream=true` 时生效）。
+
+### .env
+
+CLI 启动时会自动读取 `Guga/.env`（若环境变量已存在，则以现有环境变量优先）。
+
+示例：
+
+```env
+Guga_MODEL_PROVIDER=api
+Guga_MODEL_ID=replace_with_your_model_id
+OPENAI_BASE_URL=replace_with_your_api_url
+OPENAI_API_KEY=replace_with_your_token
+Guga_API_TIMEOUT=90
+```
 
