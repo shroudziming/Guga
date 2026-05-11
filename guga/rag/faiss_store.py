@@ -18,6 +18,7 @@ class VectorStore:
         self.dim = 0
         self._faiss = None
         self._index = None
+        self._typed_indexes: dict[str, tuple[object, list[int]]] = {}
         self._load_faiss()
 
     def _load_faiss(self) -> None:
@@ -63,32 +64,57 @@ class VectorStore:
         self._rebuild_index()
 
     def _rebuild_index(self) -> None:
+        self._index = None
+        self._typed_indexes = {}
         if not self._faiss or not self.vectors:
-            self._index = None
             return
 
-        index = self._faiss.IndexFlatIP(self.dim)
         import numpy as np
 
+        index = self._faiss.IndexFlatIP(self.dim)
         matrix = np.array(self.vectors, dtype="float32")
         index.add(matrix)
         self._index = index
+
+        rows_by_type: dict[str, list[int]] = {}
+        for idx, chunk in enumerate(self.chunks):
+            rows_by_type.setdefault(chunk.source_type, []).append(idx)
+
+        for source_type, row_ids in rows_by_type.items():
+            if not source_type or not row_ids:
+                continue
+            typed_index = self._faiss.IndexFlatIP(self.dim)
+            typed_matrix = np.array([self.vectors[idx] for idx in row_ids], dtype="float32")
+            typed_index.add(typed_matrix)
+            self._typed_indexes[source_type] = (typed_index, row_ids)
 
     def search(self, query_vec: list[float], top_k: int, source_type: str = "") -> list[tuple[int, float]]:
         if top_k <= 0 or not query_vec or not self.chunks:
             return []
 
-        if self._index is not None and not source_type:
+        if self._faiss is not None:
             import numpy as np
 
-            q = np.array([query_vec], dtype="float32")
-            scores, indices = self._index.search(q, min(top_k, len(self.chunks)))
-            results: list[tuple[int, float]] = []
-            for idx, score in zip(indices[0], scores[0]):
-                if int(idx) < 0:
-                    continue
-                results.append((int(idx), float(score)))
-            return results
+            if source_type and source_type in self._typed_indexes:
+                typed_index, row_ids = self._typed_indexes[source_type]
+                q = np.array([query_vec], dtype="float32")
+                scores, indices = typed_index.search(q, min(top_k, len(row_ids)))
+                results: list[tuple[int, float]] = []
+                for idx, score in zip(indices[0], scores[0]):
+                    if int(idx) < 0:
+                        continue
+                    results.append((row_ids[int(idx)], float(score)))
+                return results
+
+            if self._index is not None and not source_type:
+                q = np.array([query_vec], dtype="float32")
+                scores, indices = self._index.search(q, min(top_k, len(self.chunks)))
+                results: list[tuple[int, float]] = []
+                for idx, score in zip(indices[0], scores[0]):
+                    if int(idx) < 0:
+                        continue
+                    results.append((int(idx), float(score)))
+                return results
 
         candidates: list[tuple[int, float]] = []
         for idx, (chunk, vec) in enumerate(zip(self.chunks, self.vectors)):

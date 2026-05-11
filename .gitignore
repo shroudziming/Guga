@@ -25,6 +25,9 @@ logs/
 # Claude
 .claude/
 
+# Codex local workspace state
+.codex/
+
 # Python tooling artifacts
 .pytest_cache/
 .mypy_cache/

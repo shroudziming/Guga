@@ -6,7 +6,34 @@ from pathlib import Path
 
 from guga.rag.chunker import chunk_text
 from guga.rag.embedder import HashingEmbedder
+from guga.rag.faiss_store import VectorStore
 from guga.rag.pipeline import RagPipeline
+from guga.rag.schemas import DocumentChunk
+
+
+class FakeFaissIndex:
+    def __init__(self, dim: int) -> None:
+        self.dim = dim
+        self.rows = 0
+        self.search_calls = 0
+
+    def add(self, matrix) -> None:
+        self.rows = len(matrix)
+
+    def search(self, query, top_k: int):
+        self.search_calls += 1
+        count = min(top_k, self.rows)
+        return [[1.0 - (idx * 0.1) for idx in range(count)]], [[idx for idx in range(count)]]
+
+
+class FakeFaiss:
+    def __init__(self) -> None:
+        self.indexes: list[FakeFaissIndex] = []
+
+    def IndexFlatIP(self, dim: int) -> FakeFaissIndex:
+        index = FakeFaissIndex(dim)
+        self.indexes.append(index)
+        return index
 
 
 class RagPipelineTest(unittest.TestCase):
@@ -48,6 +75,29 @@ class RagPipelineTest(unittest.TestCase):
             self.assertTrue(doc_hits)
             self.assertEqual(memory_hits[0].source_type, "memory")
             self.assertEqual(doc_hits[0].source_type, "document")
+
+    def test_vector_store_uses_typed_faiss_index_for_source_type_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = VectorStore(Path(tmp))
+            fake_faiss = FakeFaiss()
+            store._faiss = fake_faiss
+            chunks = [
+                DocumentChunk(id="memory:m1:c0", text="memory one", source_type="memory", source_id="m1"),
+                DocumentChunk(id="document:d1:c0", text="document one", source_type="document", source_id="d1"),
+                DocumentChunk(id="memory:m2:c0", text="memory two", source_type="memory", source_id="m2"),
+            ]
+            vectors = [
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [0.5, 0.5],
+            ]
+
+            store.rebuild(chunks=chunks, vectors=vectors)
+            rows = store.search(query_vec=[1.0, 0.0], top_k=2, source_type="memory")
+
+            self.assertEqual([idx for idx, _ in rows], [0, 2])
+            typed_search_calls = sum(index.search_calls for index in fake_faiss.indexes if index.rows == 2)
+            self.assertEqual(typed_search_calls, 1)
 
 
 if __name__ == "__main__":
