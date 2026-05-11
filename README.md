@@ -1,5 +1,12 @@
 # Guga
 
+## 当前 RAG / FAISS 状态
+
+- 本地 RAG 流程同时支持对话记忆和文档片段检索。
+- 向量索引由 memory JSONL 文件和支持的文档文件重建，并持久化到 `data/memory/rag/index/`。
+- FAISS 检索现在保留全局索引，并按 `source_type` 维护分类型索引；`memory` 和 `document` 查询会直接使用对应 FAISS 索引，不再因为来源过滤退回 Python 点积遍历。
+- `.codex/` 属于本地 Codex 工作区状态，不应由 Git 追踪。
+
 这里存放“聊天陪伴机器人”学习路线的代码与配置。
 
 ## 当前学习阶段
