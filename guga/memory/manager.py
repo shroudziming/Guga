@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-import json
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+import json
 from pathlib import Path
+from threading import RLock
 from time import perf_counter
 from uuid import uuid4
 
@@ -16,7 +18,11 @@ from guga.config import (
     DEFAULT_RAG_EMBEDDING_MODEL,
     DEFAULT_RAG_ENABLE_SEMANTIC,
 )
+from guga.memory.event_summary_store import EventSummaryStore
+from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
+from guga.memory.portrait import UserPortraitStore
 from guga.memory.profile_store import ProfileStore
+from guga.memory.summarizer import MemoryBankSummarizer
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
 from guga.types import DocumentHit, MemoryContext, MemoryHit
@@ -87,19 +93,28 @@ class MemoryManager:
             recency_weight: Weight for recency term in lexical scoring.
             enable_semantic: Whether to enable vector-based retrieval pipeline.
         """
-        _ = model
+        self.model = model
         self.memory_root = memory_root or memory_data_dir()
         self.debug = debug
         self.debug_sink = debug_sink
         self.top_k = max(1, top_k)
         self.document_top_k = max(1, document_top_k)
         self.recency_weight = max(0.0, recency_weight)
+        self.decay_threshold = 0.05
+        self.reinforce_min_score = 0.55
 
         self.memory_root.mkdir(parents=True, exist_ok=True)
         self.archival_file = self.memory_root / "archival_memory.jsonl"
+        self.session_memory_file = self.memory_root / "session_memories.jsonl"
         self.profile_store = ProfileStore(self.memory_root / "profile.json")
+        self.event_summary_store = EventSummaryStore(self.memory_root / "event_summaries.jsonl")
+        self.portrait_store = UserPortraitStore(self.memory_root / "profile.json", self.memory_root / "personality_insights.jsonl")
+        self.summarizer = MemoryBankSummarizer(model=model)
         self.session_store = _SessionStore(self.memory_root / "sessions")
         self._turn_state: dict[str, dict[str, str]] = {}
+        self._turn_state_lock = RLock()
+        self._finalize_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guga-memory")
+        self._finalize_futures: list[Future] = []
 
         self.rag_pipeline: RagPipeline | None = None
         self._semantic_ready = False
@@ -135,6 +150,7 @@ class MemoryManager:
             - archival_memories: summaries of selected memory hits
         """
         started = perf_counter()
+        self._apply_decay_policy(session_id)
         records = self._load_archival_records()
         self._debug(
             session_id,
@@ -150,8 +166,11 @@ class MemoryManager:
                 continue
             lexical_hits.append(self._to_hit(record, score))
 
-        merged_memory_hits = self._merge_memory_hits(semantic_memory_hits, lexical_hits)
+        merged_memory_hits = self._merge_memory_hits(semantic_memory_hits, lexical_hits, records)
+        self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text)
         document_hits = self._to_document_hits(semantic_document_hits)
+        user_portrait = str(self.portrait_store.load().get("portrait_summary", "")).strip()
+        event_summary_hits = [hit for hit in merged_memory_hits if hit.memory_type == "event_summary"]
 
         elapsed_ms = int((perf_counter() - started) * 1000)
         memory_hit_ids = [hit.id for hit in merged_memory_hits]
@@ -163,6 +182,9 @@ class MemoryManager:
                 "score": round(hit.score, 4),
                 "summary": hit.summary,
                 "raw_excerpt": hit.raw_excerpt,
+                "memory_type": hit.memory_type,
+                "retention": hit.retention,
+                "memory_strength": hit.memory_strength,
                 "source_session_id": hit.source_session_id,
                 "source_message_ids": hit.source_message_ids,
             }
@@ -177,6 +199,8 @@ class MemoryManager:
             archival_memories=[hit.summary for hit in merged_memory_hits],
             hits=merged_memory_hits,
             document_hits=document_hits,
+            event_summaries=event_summary_hits,
+            user_portrait=user_portrait,
         )
 
     def compose_system_prompt(self, base_prompt: str, memory_context: MemoryContext) -> str:
@@ -190,12 +214,38 @@ class MemoryManager:
             A single system prompt string consumed by the chat model.
         """
         sections = ["[Base Persona]", base_prompt]
+        sections.append("\n[User Portrait]")
+        if memory_context.user_portrait:
+            sections.append(memory_context.user_portrait)
+        else:
+            sections.append("- 当前还没有稳定用户画像。")
+
         sections.append("\n[Relevant Memory]")
-        if memory_context.hits:
-            for hit in memory_context.hits:
+        sections.append("\n[Relevant Event Summaries]")
+        if memory_context.event_summaries:
+            for hit in memory_context.event_summaries:
                 source_message = hit.source_message_ids[0] if hit.source_message_ids else ""
                 source_ref = f"{hit.source_session_id}/{source_message}".strip("/")
-                sections.append(f"- ({hit.id} | score={hit.score:.2f} | src={source_ref}) {hit.summary}")
+                sections.append(
+                    f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | S={hit.memory_strength} | src={source_ref}) {hit.summary}"
+                )
+        else:
+            sections.append("- 当前未检索到相关事件摘要。")
+
+        sections.append("\n[Relevant Conversation Memories]")
+        if memory_context.hits:
+            has_conversation_memory = False
+            for hit in memory_context.hits:
+                if hit.memory_type == "event_summary":
+                    continue
+                has_conversation_memory = True
+                source_message = hit.source_message_ids[0] if hit.source_message_ids else ""
+                source_ref = f"{hit.source_session_id}/{source_message}".strip("/")
+                sections.append(
+                    f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | S={hit.memory_strength} | src={source_ref}) {hit.summary}"
+                )
+            if not has_conversation_memory:
+                sections.append("- 当前未检索到可靠历史记忆。")
         else:
             sections.append("- 当前未检索到可靠历史记忆。")
 
@@ -219,9 +269,13 @@ class MemoryManager:
             message_id written to sessions/<session_id>.jsonl.
         """
         message_id = self.session_store.append_message(session_id=session_id, role="user", content=text, source=source)
-        state = self._turn_state.setdefault(session_id, {})
-        state["user_text"] = text
-        state["user_message_id"] = message_id
+        turn_payload = self._build_session_memory(session_id=session_id, message_id=message_id, text=text)
+        self._append_jsonl(self.session_memory_file, turn_payload)
+        with self._turn_state_lock:
+            state = self._turn_state.setdefault(session_id, {})
+            state["user_text"] = text
+            state["user_message_id"] = message_id
+            state["session_memory_id"] = turn_payload["id"]
         self._debug(session_id, f"ingest role=user message_id={message_id}")
         return message_id
 
@@ -232,9 +286,10 @@ class MemoryManager:
             message_id written to sessions/<session_id>.jsonl.
         """
         message_id = self.session_store.append_message(session_id=session_id, role="assistant", content=text, source=source)
-        state = self._turn_state.setdefault(session_id, {})
-        state["assistant_text"] = text
-        state["assistant_message_id"] = message_id
+        with self._turn_state_lock:
+            state = self._turn_state.setdefault(session_id, {})
+            state["assistant_text"] = text
+            state["assistant_message_id"] = message_id
         self._debug(session_id, f"ingest role=assistant message_id={message_id}")
         return message_id
 
@@ -249,19 +304,63 @@ class MemoryManager:
             - If semantic retrieval is enabled, update vector index incrementally.
             - Clear cached per-turn state for this session.
         """
+        state = self._pop_turn_state(session_id)
+        self._finalize_turn_state(session_id=session_id, state=state)
+
+    def finalize_turn_async(self, session_id: str) -> Future:
+        """Queue turn finalization in the background and return immediately."""
+        state = self._pop_turn_state(session_id)
+        if not state:
+            completed: Future = Future()
+            completed.set_result(None)
+            return completed
+
+        self._debug(session_id, "finalize_background_queued")
+        future = self._finalize_executor.submit(self._finalize_turn_state, session_id, state)
+        self._finalize_futures.append(future)
+
+        def _log_done(done: Future) -> None:
+            try:
+                done.result()
+            except Exception as exc:
+                self._debug(session_id, f"finalize_background_failed reason={exc}")
+                return
+            self._debug(session_id, "finalize_background_done")
+
+        future.add_done_callback(_log_done)
+        return future
+
+    def wait_for_background_tasks(self, timeout: float | None = None) -> None:
+        """Wait for queued background memory work; useful in tests or graceful shutdown."""
+        futures = list(self._finalize_futures)
+        for future in futures:
+            future.result(timeout=timeout)
+
+    def _pop_turn_state(self, session_id: str) -> dict[str, str]:
+        with self._turn_state_lock:
+            return dict(self._turn_state.pop(session_id, {}))
+
+    def _finalize_turn_state(self, session_id: str, state: dict[str, str]) -> None:
         started = perf_counter()
-        state = self._turn_state.get(session_id, {})
         user_text = state.get("user_text", "").strip()
-        if user_text and self._should_archive(user_text):
+        assistant_text = state.get("assistant_text", "").strip()
+        session_memory_payload = self._load_memory_by_id(self.session_memory_file, state.get("session_memory_id", ""))
+        memory_candidate = self.summarizer.extract_archival_memory(user_text=user_text, assistant_text=assistant_text) if user_text else {}
+        should_archive = bool(memory_candidate.get("should_archive")) if memory_candidate else False
+        if user_text and (should_archive or self._should_archive(user_text)):
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
             payload = {
                 "id": f"mem_{uuid4().hex[:10]}",
                 "type": "episodic",
-                "topic": "general",
-                "summary": f"用户提到：{user_text}",
+                "topic": str(memory_candidate.get("topic") or "general"),
+                "summary": str(memory_candidate.get("summary") or f"用户提到：{user_text}"),
                 "raw_excerpt": user_text,
-                "importance": 0.7,
-                "confidence": 0.7,
-                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "importance": float(memory_candidate.get("importance", 0.7) or 0.7),
+                "confidence": float(memory_candidate.get("confidence", 0.7) or 0.7),
+                "created_at": now,
+                "last_recalled_at": now,
+                "memory_strength": 1,
+                "retention": 1.0,
                 "source_session_id": session_id,
                 "source_message_ids": [state.get("user_message_id", "")],
                 "status": "active",
@@ -285,7 +384,13 @@ class MemoryManager:
             elapsed_ms = int((perf_counter() - started) * 1000)
             self._debug(session_id, f"writeback status=no_archival_write latency_ms={elapsed_ms}")
 
-        self._turn_state.pop(session_id, None)
+        if session_memory_payload and self.rag_pipeline is not None:
+            try:
+                self.rag_pipeline.add_memory_record(session_memory_payload)
+            except Exception as exc:
+                self._debug(session_id, f"index_update status=session_memory_failed reason={exc}")
+        if user_text:
+            self._refresh_hierarchical_memory(session_id=session_id)
 
     def rebuild_rag_indexes(self, session_id: str = "manual") -> dict[str, int]:
         """Force full rebuild of memory/document vector indexes.
@@ -338,10 +443,16 @@ class MemoryManager:
             )
         self._semantic_ready = True
 
-    def _merge_memory_hits(self, semantic_hits: list[RetrievalHit], lexical_hits: list[MemoryHit]) -> list[MemoryHit]:
+    def _merge_memory_hits(
+        self,
+        semantic_hits: list[RetrievalHit],
+        lexical_hits: list[MemoryHit],
+        records: list[dict],
+    ) -> list[MemoryHit]:
         """Merge semantic and lexical memory hits, deduplicate, sort, and truncate."""
         merged: list[MemoryHit] = []
         seen: set[str] = set()
+        record_by_id = {str(record.get("id", "")): record for record in records}
 
         for hit in semantic_hits:
             key = hit.source_id or hit.chunk_id
@@ -349,17 +460,23 @@ class MemoryManager:
                 continue
             seen.add(key)
             source_message_ids = [hit.source_message_id] if hit.source_message_id else []
+            record = record_by_id.get(key, {})
+            normalized = normalize_memorybank_fields(record) if record else {}
             merged.append(
                 MemoryHit(
                     id=key,
                     summary=hit.text,
                     raw_excerpt=hit.text,
-                    score=hit.score,
+                    score=round(hit.score * float(normalized.get("retention", 1.0) or 1.0), 4),
+                    memory_type=str(normalized.get("type") or hit.source_type or "episodic"),
                     source_session_id=hit.source_session_id,
                     source_message_ids=source_message_ids,
                     created_at=hit.created_at,
-                    importance=0.0,
-                    confidence=0.0,
+                    last_recalled_at=str(normalized.get("last_recalled_at", "")),
+                    memory_strength=int(normalized.get("memory_strength", 1) or 1),
+                    retention=float(normalized.get("retention", 1.0) or 1.0),
+                    importance=float(normalized.get("importance", 0.0) or 0.0),
+                    confidence=float(normalized.get("confidence", 0.0) or 0.0),
                 )
             )
 
@@ -372,6 +489,23 @@ class MemoryManager:
 
         merged.sort(key=lambda item: item.score, reverse=True)
         return merged[: self.top_k]
+
+    def _reinforce_recalled_memories(self, hits: list[MemoryHit], session_id: str, query: str) -> None:
+        if not self._should_reinforce_query(query):
+            return
+        recalled_ids = {
+            hit.id
+            for hit in hits
+            if hit.id.startswith(("mem_", "evt_", "turn_")) and hit.score >= self.reinforce_min_score
+        }
+        if not recalled_ids:
+            return
+        archival_changed = reinforce_jsonl_records(self.archival_file, recalled_ids)
+        event_changed = reinforce_jsonl_records(self.event_summary_store.file_path, recalled_ids)
+        session_changed = reinforce_jsonl_records(self.session_memory_file, recalled_ids)
+        changed = archival_changed + event_changed + session_changed
+        if changed:
+            self._debug(session_id, f"memory_update recalled_ids={changed} action=reinforce")
 
     def _to_document_hits(self, semantic_document_hits: list[RetrievalHit]) -> list[DocumentHit]:
         """Convert RetrievalHit rows into prompt-ready DocumentHit objects."""
@@ -399,11 +533,114 @@ class MemoryManager:
 
     def _load_archival_records(self) -> list[dict]:
         """Load and normalize active archival memory records from JSONL file."""
-        if not self.archival_file.exists():
-            return []
-
         records: list[dict] = []
-        for line in self.archival_file.read_text(encoding="utf-8").splitlines():
+        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file):
+            if not path.exists():
+                continue
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                normalized = self._normalize_archival_record(payload)
+                if normalized and normalized["status"] == "active":
+                    records.append(normalized)
+        return records
+
+    def _apply_decay_policy(self, session_id: str) -> None:
+        total_checked = 0
+        total_decayed = 0
+        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file):
+            stats = refresh_jsonl_retention(path, decay_threshold=self.decay_threshold)
+            total_checked += stats["checked"]
+            total_decayed += stats["decayed"]
+        if total_checked:
+            self._debug(session_id, f"memory_decay checked={total_checked} decayed={total_decayed}")
+
+    def _build_session_memory(self, session_id: str, message_id: str, text: str) -> dict:
+        now = datetime.now().astimezone().isoformat(timespec="seconds")
+        return {
+            "id": f"turn_{message_id}",
+            "type": "conversation_turn",
+            "summary": text,
+            "raw_excerpt": text,
+            "importance": 0.5,
+            "confidence": 0.9,
+            "created_at": now,
+            "last_recalled_at": now,
+            "memory_strength": 1,
+            "retention": 1.0,
+            "source_session_id": session_id,
+            "source_message_ids": [message_id],
+            "status": "active",
+        }
+
+    def _refresh_hierarchical_memory(self, session_id: str) -> None:
+        session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
+        day, dialogue, message_ids = self._load_daily_dialogue(session_file)
+        if not dialogue:
+            return
+        daily_event = self.event_summary_store.refresh_daily_summary(
+            session_id=session_id,
+            day=day,
+            dialogue=dialogue,
+            source_message_ids=message_ids,
+            summarizer=self.summarizer,
+        )
+        global_event = self.event_summary_store.refresh_global_summary(self.summarizer)
+        daily_portrait = self.portrait_store.refresh_daily_insight(
+            day=day,
+            dialogue=dialogue,
+            source_session_id=session_id,
+            source_message_ids=message_ids,
+            summarizer=self.summarizer,
+        )
+        profile = self.portrait_store.refresh_global_portrait(self.summarizer)
+        if self.rag_pipeline is not None:
+            for payload in (daily_event, global_event):
+                if payload:
+                    try:
+                        self.rag_pipeline.add_memory_record(payload)
+                    except Exception as exc:
+                        self._debug(session_id, f"index_update status=hierarchy_failed id={payload.get('id', '')} reason={exc}")
+        self._debug(
+            session_id,
+            f"hierarchy_update daily_event_id={daily_event.get('id', '') if daily_event else ''} global_event_id={global_event.get('id', '') if global_event else ''} daily_portrait_id={daily_portrait.get('id', '') if daily_portrait else ''} portrait_len={len(str(profile.get('portrait_summary', '')))}",
+        )
+
+    def _load_daily_dialogue(self, session_file: Path) -> tuple[str, str, list[str]]:
+        if not session_file.exists():
+            return datetime.now().astimezone().date().isoformat(), "", []
+
+        current_rows = self._read_session_rows(session_file)
+        if not current_rows:
+            return datetime.now().astimezone().date().isoformat(), "", []
+
+        day = self._day_bucket(str(current_rows[-1].get("created_at", "")))
+        rows: list[dict] = []
+        sessions_dir = self.memory_root / "sessions"
+        if sessions_dir.exists():
+            for path in sessions_dir.glob("*.jsonl"):
+                rows.extend(row for row in self._read_session_rows(path) if self._day_bucket(str(row.get("created_at", ""))) == day)
+        rows.sort(key=lambda row: str(row.get("created_at", "")))
+
+        message_ids = [str(row.get("id", "")) for row in rows if str(row.get("id", ""))]
+        lines = []
+        for row in rows:
+            role = str(row.get("role", "")).strip() or "message"
+            content = str(row.get("content", "")).strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return day, "\n".join(lines), message_ids
+
+    def _read_session_rows(self, session_file: Path) -> list[dict]:
+        rows: list[dict] = []
+        if not session_file.exists():
+            return rows
+        for line in session_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -411,10 +648,40 @@ class MemoryManager:
                 payload = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            normalized = self._normalize_archival_record(payload)
-            if normalized and normalized["status"] == "active":
-                records.append(normalized)
-        return records
+            if isinstance(payload, dict):
+                rows.append(payload)
+        return rows
+
+    def _day_bucket(self, created_at: str) -> str:
+        try:
+            return datetime.fromisoformat(created_at).date().isoformat()
+        except ValueError:
+            return datetime.now().astimezone().date().isoformat()
+
+    def _append_jsonl(self, path: Path, payload: dict) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _load_memory_by_id(self, path: Path, memory_id: str) -> dict:
+        if not path.exists() or not memory_id:
+            return {}
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(payload.get("id", "")) == memory_id:
+                return payload
+        return {}
+
+    def _should_reinforce_query(self, query: str) -> bool:
+        lower = query.lower()
+        triggers = ["记得", "记住", "想起", "回忆", "remember", "recall", "what did", "do you know about me"]
+        return any(trigger in lower for trigger in triggers)
 
     def _normalize_archival_record(self, payload: dict) -> dict | None:
         """Normalize one raw archival payload to internal scoring schema."""
@@ -428,13 +695,18 @@ class MemoryManager:
         if not isinstance(source_message_ids, list):
             source_message_ids = []
 
+        normalized = normalize_memorybank_fields(payload)
         return {
             "id": str(payload.get("id") or f"mem_{uuid4().hex[:10]}"),
+            "type": str(payload.get("type", "episodic")),
             "summary": summary,
             "raw_excerpt": str(payload.get("raw_excerpt", "")),
             "source_session_id": str(payload.get("source_session_id", "")),
             "source_message_ids": [str(item) for item in source_message_ids if str(item)],
             "created_at": str(payload.get("created_at", "")),
+            "last_recalled_at": str(normalized.get("last_recalled_at", "")),
+            "memory_strength": int(normalized.get("memory_strength", 1) or 1),
+            "retention": retention_score(normalized),
             "importance": float(payload.get("importance", 0.0) or 0.0),
             "confidence": float(payload.get("confidence", 0.0) or 0.0),
             "status": str(payload.get("status", "active")),
@@ -447,9 +719,13 @@ class MemoryManager:
             summary=item["summary"],
             raw_excerpt=item["raw_excerpt"],
             score=round(score, 4),
+            memory_type=item["type"],
             source_session_id=item["source_session_id"],
             source_message_ids=item["source_message_ids"],
             created_at=item["created_at"],
+            last_recalled_at=item["last_recalled_at"],
+            memory_strength=item["memory_strength"],
+            retention=item["retention"],
             importance=item["importance"],
             confidence=item["confidence"],
         )
@@ -475,7 +751,13 @@ class MemoryManager:
         importance = max(0.0, min(float(item.get("importance", 0.0) or 0.0), 1.0))
         confidence = max(0.0, min(float(item.get("confidence", 0.0) or 0.0), 1.0))
 
-        return overlap_score + (self.recency_weight * recency_score) + (0.05 * importance) + (0.05 * confidence)
+        retention = max(0.0, min(float(item.get("retention", 1.0) or 1.0), 1.0))
+        return (
+            (overlap_score * retention)
+            + (self.recency_weight * recency_score)
+            + (0.05 * importance)
+            + (0.05 * confidence)
+        )
 
     def _recency_score(self, created_at: str) -> float:
         """Map timestamp recency to [0, 1] with linear decay over 30 days."""

@@ -24,7 +24,7 @@ class ChatSession:
     1) ingest user text into in-memory history and persistent session store
     2) retrieve memory/document context via MemoryManager (RAG step)
     3) compose system prompt with retrieved context and generate answer
-    4) persist assistant response and finalize turn writeback
+    4) persist assistant response and queue memory writeback in the background
     """
 
     def __init__(
@@ -72,7 +72,7 @@ class ChatSession:
         Side effects:
             - Persist user/assistant messages to session storage.
             - Perform RAG retrieval and inject context into system prompt.
-            - Trigger memory writeback in MemoryManager.finalize_turn.
+            - Queue memory writeback in MemoryManager.finalize_turn_async.
         """
         self._debug("reply_start")
         self.history.add_user(user_input)
@@ -93,13 +93,18 @@ class ChatSession:
         generate_started = perf_counter()
         self._debug("model_generate_start")
         answer = self.model.generate_reply(messages, self.generation)
+        if not str(answer).strip():
+            self._debug("model_generate_empty_retry")
+            answer = self.model.generate_reply(messages, self._retry_generation_config())
+        if not str(answer).strip():
+            answer = "刚才没有生成出有效回复，可以再说一遍吗？"
         generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
         self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
 
         self.history.add_assistant(answer)
         self.memory_manager.record_assistant_message(session_id=self.session_id, text=answer)
-        self.memory_manager.finalize_turn(self.session_id)
-        self._debug("finalize_done")
+        self.memory_manager.finalize_turn_async(self.session_id)
+        self._debug("finalize_queued")
         return answer
 
     def reply_stream(self, user_input: str, cancel_event: Event | None = None) -> Iterator[str]:
@@ -153,10 +158,23 @@ class ChatSession:
             self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
 
         answer = "".join(chunks).strip()
+        if not answer:
+            self._debug("model_generate_empty_retry")
+            try:
+                answer = self.model.generate_reply(messages, self._retry_generation_config()).strip()
+            except Exception as exc:
+                self._debug(f"model_generate_empty_retry_failed reason={exc}")
+                answer = ""
+            if answer:
+                yield answer
+            else:
+                answer = "刚才没有生成出有效回复，可以再说一遍吗？"
+                yield answer
+
         self.history.add_assistant(answer)
         self.memory_manager.record_assistant_message(session_id=self.session_id, text=answer)
-        self.memory_manager.finalize_turn(self.session_id)
-        self._debug("finalize_done")
+        self.memory_manager.finalize_turn_async(self.session_id)
+        self._debug("finalize_queued")
 
     def clear(self) -> None:
         """Clear only in-memory short history; persisted memory files remain."""
@@ -170,3 +188,10 @@ class ChatSession:
             self.debug_sink(output)
             return
         print(output)
+
+    def _retry_generation_config(self) -> GenerationConfig:
+        return GenerationConfig(
+            max_new_tokens=max(self.generation.max_new_tokens, 1536),
+            temperature=self.generation.temperature,
+            top_p=self.generation.top_p,
+        )

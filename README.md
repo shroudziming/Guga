@@ -59,3 +59,28 @@ OPENAI_API_KEY=replace_with_your_token
 Guga_API_TIMEOUT=90
 ```
 
+可选生成参数：
+
+```env
+Guga_MAX_NEW_TOKENS=1024
+Guga_TEMPERATURE=0.7
+Guga_TOP_P=0.9
+Guga_MEMORY_MAX_NEW_TOKENS=512
+```
+
+MemoryBank 的事件摘要、用户画像和长期记忆抽取会复用当前聊天模型。使用 DeepSeek 等 OpenAI-compatible API 时，可按如下配置：
+
+```env
+Guga_MODEL_PROVIDER=api
+Guga_MODEL_ID=deepseek-chat
+Guga_API_BASE_URL=https://api.deepseek.com
+Guga_API_KEY=replace_with_your_deepseek_key
+Guga_API_TIMEOUT=90
+```
+
+默认策略：只要 `MemoryManager` 收到当前模型对象，就会启用 LLM 记忆总结；如需关闭并使用规则 fallback，可设置：
+
+```env
+Guga_MEMORY_USE_LLM_SUMMARY=0
+```
+

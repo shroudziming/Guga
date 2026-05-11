@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from guga.types import GenerationConfig
@@ -18,9 +19,31 @@ DEFAULT_RAG_CHUNK_OVERLAP = 40
 DEFAULT_RAG_ENABLE_SEMANTIC = True
 
 
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return max(minimum, value)
+
+
+def _env_float(name: str, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return max(minimum, min(maximum, value))
+
+
 def default_generation_config() -> GenerationConfig:
     return GenerationConfig(
-        max_new_tokens=128,
-        temperature=0.7,
-        top_p=0.9,
+        max_new_tokens=_env_int("Guga_MAX_NEW_TOKENS", 1024, minimum=64),
+        temperature=_env_float("Guga_TEMPERATURE", 0.7),
+        top_p=_env_float("Guga_TOP_P", 0.9),
     )

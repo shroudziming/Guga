@@ -46,6 +46,22 @@ class VectorStore:
         self.vectors.extend(vectors)
         self._rebuild_index()
 
+    def replace_by_source_id(self, source_id: str, chunks: list[DocumentChunk], vectors: list[list[float]]) -> None:
+        kept_chunks: list[DocumentChunk] = []
+        kept_vectors: list[list[float]] = []
+        for chunk, vector in zip(self.chunks, self.vectors):
+            if chunk.source_id == source_id:
+                continue
+            kept_chunks.append(chunk)
+            kept_vectors.append(vector)
+        self.chunks = kept_chunks
+        self.vectors = kept_vectors
+        if self.dim == 0 and vectors:
+            self.dim = len(vectors[0])
+        self.chunks.extend(chunks)
+        self.vectors.extend(vectors)
+        self._rebuild_index()
+
     def _rebuild_index(self) -> None:
         if not self._faiss or not self.vectors:
             self._index = None

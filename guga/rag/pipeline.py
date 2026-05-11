@@ -62,7 +62,9 @@ class RagPipeline:
 
         Data sources:
             - memory_root/archival_memory.jsonl
-            - memory_root/sessions/**/*.jsonl (user messages)
+            - memory_root/event_summaries.jsonl
+            - memory_root/session_memories.jsonl
+            - memory_root/sessions/**/*.jsonl (legacy fallback user messages)
             - documents_dir/**/*.txt|md|json|jsonl
 
         Returns:
@@ -97,7 +99,11 @@ class RagPipeline:
         if not chunks:
             return
         vectors = self.embedder.encode([chunk.text for chunk in chunks])
-        self.store.add(chunks, vectors)
+        source_id = str(payload.get("id", ""))
+        if source_id:
+            self.store.replace_by_source_id(source_id, chunks, vectors)
+        else:
+            self.store.add(chunks, vectors)
         self.store.save()
 
     def retrieve(self, query: str, memory_top_k: int, document_top_k: int) -> tuple[list[RetrievalHit], list[RetrievalHit]]:
@@ -144,17 +150,21 @@ class RagPipeline:
     def _collect_memory_chunks(self, memory_root: Path) -> list[DocumentChunk]:
         """Collect chunked memory texts from archival and session user messages."""
         chunks: list[DocumentChunk] = []
-        archival_file = memory_root / "archival_memory.jsonl"
-        if archival_file.exists():
-            for line in archival_file.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                chunks.extend(self._memory_chunks_from_payload(payload))
+        session_memory_file = memory_root / "session_memories.jsonl"
+        for jsonl_file in (memory_root / "archival_memory.jsonl", memory_root / "event_summaries.jsonl", session_memory_file):
+            if jsonl_file.exists():
+                for line in jsonl_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    chunks.extend(self._memory_chunks_from_payload(payload))
+
+        if session_memory_file.exists():
+            return chunks
 
         sessions_dir = memory_root / "sessions"
         if sessions_dir.exists():
@@ -208,6 +218,11 @@ class RagPipeline:
             source_session_id=str(payload.get("source_session_id", "")),
             source_message_id=source_message_id,
             created_at=str(payload.get("created_at", "")),
+            metadata={
+                "memory_type": str(payload.get("type", "episodic")),
+                "retention": str(payload.get("retention", "")),
+                "memory_strength": str(payload.get("memory_strength", "")),
+            },
         )
 
     def _collect_document_chunks(self, docs_dir: Path) -> list[DocumentChunk]:
@@ -245,6 +260,7 @@ class RagPipeline:
         source_session_id: str = "",
         source_message_id: str = "",
         created_at: str = "",
+        metadata: dict[str, str] | None = None,
     ) -> list[DocumentChunk]:
         """Split text into overlapping chunks and attach retrieval metadata."""
         pieces = chunk_text(text, chunk_size=self.chunk_size, chunk_overlap=self.chunk_overlap)
@@ -261,6 +277,7 @@ class RagPipeline:
                     source_session_id=source_session_id,
                     source_message_id=source_message_id,
                     created_at=created_at,
+                    metadata=metadata or {},
                 )
             )
         return chunks

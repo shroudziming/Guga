@@ -1,0 +1,4 @@
+interface:
+  display_name: "Guga MemoryBank Repro"
+  short_description: "Reproduce the MemoryBank paper inside Guga."
+  default_prompt: "Implement a MemoryBank-inspired long-term memory mechanism in Guga."
