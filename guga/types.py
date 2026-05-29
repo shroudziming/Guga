@@ -30,6 +30,11 @@ class MemoryHit:
     retention: float = 1.0
     importance: float = 0.0
     confidence: float = 0.0
+    day: str = ""
+    semantic_score: float = 0.0
+    lexical_score: float = 0.0
+    score_source: str = ""
+    is_current_turn: bool = False
 
 
 @dataclass

@@ -2,15 +2,19 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
+import re
 from threading import RLock
 from time import perf_counter
 from uuid import uuid4
 
 from guga.config import (
+    DEFAULT_CURRENT_TURN_SCORE_FACTOR,
     DEFAULT_DOCUMENT_TOP_K,
+    DEFAULT_MEMORY_MIN_SCORE,
     DEFAULT_MEMORY_RECENCY_WEIGHT,
     DEFAULT_MEMORY_TOP_K,
     DEFAULT_RAG_CHUNK_OVERLAP,
@@ -102,6 +106,18 @@ class MemoryManager:
         self.recency_weight = max(0.0, recency_weight)
         self.decay_threshold = 0.05
         self.reinforce_min_score = 0.55
+        self.current_turn_score_factor = self._env_float(
+            "Guga_CURRENT_TURN_SCORE_FACTOR",
+            DEFAULT_CURRENT_TURN_SCORE_FACTOR,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.memory_min_score = self._env_float(
+            "Guga_MEMORY_MIN_SCORE",
+            DEFAULT_MEMORY_MIN_SCORE,
+            minimum=0.0,
+            maximum=10.0,
+        )
 
         self.memory_root.mkdir(parents=True, exist_ok=True)
         self.archival_file = self.memory_root / "archival_memory.jsonl"
@@ -112,6 +128,7 @@ class MemoryManager:
         self.summarizer = MemoryBankSummarizer(model=model)
         self.session_store = _SessionStore(self.memory_root / "sessions")
         self._turn_state: dict[str, dict[str, str]] = {}
+        self._date_context_by_session: dict[str, str] = {}
         self._turn_state_lock = RLock()
         self._finalize_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guga-memory")
         self._finalize_futures: list[Future] = []
@@ -151,10 +168,14 @@ class MemoryManager:
         """
         started = perf_counter()
         self._apply_decay_policy(session_id)
+        current_turn_ids = self._current_turn_ids(session_id)
         records = self._load_archival_records()
+        if self._mentions_recent_current(user_text):
+            records.extend(self._load_session_message_records(session_id))
+        time_hints = self._build_time_hints(user_text, session_id, records)
         self._debug(
             session_id,
-            f"retrieve_start query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} candidates={len(records)}",
+            f"retrieve_start query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} candidates={len(records)} min_score={self.memory_min_score:.2f} current_turn_factor={self.current_turn_score_factor:.2f} time_hints={json.dumps(time_hints, ensure_ascii=False)}",
         )
 
         semantic_memory_hits, semantic_document_hits = self._retrieve_semantic(user_text=user_text, session_id=session_id)
@@ -162,12 +183,20 @@ class MemoryManager:
         lexical_hits: list[MemoryHit] = []
         for record in records:
             score = self._score(record, user_text)
+            score = self._apply_time_score_adjustments(score, record, time_hints, session_id)
             if score <= 0:
                 continue
             lexical_hits.append(self._to_hit(record, score))
 
-        merged_memory_hits = self._merge_memory_hits(semantic_memory_hits, lexical_hits, records)
-        self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text)
+        merged_memory_hits = self._merge_memory_hits(
+            semantic_memory_hits,
+            lexical_hits,
+            records,
+            current_turn_ids=current_turn_ids,
+            time_hints=time_hints,
+            session_id=session_id,
+        )
+        self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text, current_turn_ids=current_turn_ids)
         document_hits = self._to_document_hits(semantic_document_hits)
         user_portrait = str(self.portrait_store.load().get("portrait_summary", "")).strip()
         event_summary_hits = [hit for hit in merged_memory_hits if hit.memory_type == "event_summary"]
@@ -187,6 +216,11 @@ class MemoryManager:
                 "memory_strength": hit.memory_strength,
                 "source_session_id": hit.source_session_id,
                 "source_message_ids": hit.source_message_ids,
+                "day": hit.day,
+                "semantic_score": hit.semantic_score,
+                "lexical_score": hit.lexical_score,
+                "score_source": hit.score_source,
+                "is_current_turn": hit.is_current_turn,
             }
             for hit in merged_memory_hits
         ]
@@ -448,55 +482,136 @@ class MemoryManager:
         semantic_hits: list[RetrievalHit],
         lexical_hits: list[MemoryHit],
         records: list[dict],
+        current_turn_ids: set[str],
+        time_hints: dict[str, str | bool],
+        session_id: str,
     ) -> list[MemoryHit]:
-        """Merge semantic and lexical memory hits, deduplicate, sort, and truncate."""
-        merged: list[MemoryHit] = []
-        seen: set[str] = set()
+        """Merge semantic and lexical routes by id, then filter prompt noise."""
+        candidates: dict[str, MemoryHit] = {}
         record_by_id = {str(record.get("id", "")): record for record in records}
 
         for hit in semantic_hits:
             key = hit.source_id or hit.chunk_id
-            if key in seen:
+            if not key:
                 continue
-            seen.add(key)
-            source_message_ids = [hit.source_message_id] if hit.source_message_id else []
             record = record_by_id.get(key, {})
             normalized = normalize_memorybank_fields(record) if record else {}
-            merged.append(
+            source_message_ids = [hit.source_message_id] if hit.source_message_id else list(record.get("source_message_ids", []))
+            retention = float(normalized.get("retention", record.get("retention", 1.0) if record else 1.0) or 1.0)
+            score = hit.score * retention
+            score = self._apply_time_score_adjustments(score, record or self._record_from_semantic_hit(key, hit), time_hints, session_id)
+            self._store_memory_candidate(
+                candidates,
                 MemoryHit(
                     id=key,
-                    summary=hit.text,
-                    raw_excerpt=hit.text,
-                    score=round(hit.score * float(normalized.get("retention", 1.0) or 1.0), 4),
+                    summary=str(record.get("summary") or hit.text),
+                    raw_excerpt=str(record.get("raw_excerpt") or hit.text),
+                    score=round(score, 4),
                     memory_type=str(normalized.get("type") or hit.source_type or "episodic"),
-                    source_session_id=hit.source_session_id,
-                    source_message_ids=source_message_ids,
-                    created_at=hit.created_at,
+                    source_session_id=hit.source_session_id or str(record.get("source_session_id", "")),
+                    source_message_ids=[str(item) for item in source_message_ids if str(item)],
+                    created_at=hit.created_at or str(record.get("created_at", "")),
                     last_recalled_at=str(normalized.get("last_recalled_at", "")),
                     memory_strength=int(normalized.get("memory_strength", 1) or 1),
-                    retention=float(normalized.get("retention", 1.0) or 1.0),
+                    retention=retention,
                     importance=float(normalized.get("importance", 0.0) or 0.0),
                     confidence=float(normalized.get("confidence", 0.0) or 0.0),
-                )
+                    day=str(record.get("day", "")),
+                    semantic_score=round(score, 4),
+                    score_source="semantic",
+                ),
             )
 
         lexical_hits.sort(key=lambda item: item.score, reverse=True)
         for hit in lexical_hits:
-            if hit.id in seen:
-                continue
-            seen.add(hit.id)
+            self._store_memory_candidate(candidates, hit)
+
+        merged = []
+        for hit in candidates.values():
+            self._finalize_route_scores(hit)
+            if self._is_current_turn_hit(hit, current_turn_ids):
+                self._weaken_current_turn_hit(hit)
             merged.append(hit)
 
         merged.sort(key=lambda item: item.score, reverse=True)
-        return merged[: self.top_k]
+        return self._filter_memory_hits(merged)
 
-    def _reinforce_recalled_memories(self, hits: list[MemoryHit], session_id: str, query: str) -> None:
+    def _record_from_semantic_hit(self, key: str, hit: RetrievalHit) -> dict:
+        return {
+            "id": key,
+            "type": hit.source_type or "episodic",
+            "summary": hit.text,
+            "raw_excerpt": hit.text,
+            "source_session_id": hit.source_session_id,
+            "source_message_ids": [hit.source_message_id] if hit.source_message_id else [],
+            "created_at": hit.created_at,
+            "day": self._day_bucket(hit.created_at) if hit.created_at else "",
+        }
+
+    def _store_memory_candidate(self, candidates: dict[str, MemoryHit], hit: MemoryHit) -> None:
+        existing = candidates.get(hit.id)
+        if existing is None:
+            candidates[hit.id] = hit
+            return
+
+        semantic_score = max(existing.semantic_score, hit.semantic_score)
+        lexical_score = max(existing.lexical_score, hit.lexical_score)
+        keep = hit if hit.score > existing.score else existing
+        candidates[hit.id] = keep
+        keep.semantic_score = semantic_score
+        keep.lexical_score = lexical_score
+        keep.source_message_ids = list(dict.fromkeys(existing.source_message_ids + hit.source_message_ids))
+        keep.day = keep.day or existing.day or hit.day
+
+    def _finalize_route_scores(self, hit: MemoryHit) -> None:
+        semantic_score = round(max(0.0, hit.semantic_score), 4)
+        lexical_score = round(max(0.0, hit.lexical_score), 4)
+        hit.semantic_score = semantic_score
+        hit.lexical_score = lexical_score
+        if semantic_score <= 0 and lexical_score <= 0:
+            hit.score = round(max(0.0, hit.score), 4)
+            return
+        hit.score = max(semantic_score, lexical_score)
+        if semantic_score > 0 and lexical_score > 0 and semantic_score == lexical_score:
+            hit.score_source = "semantic+lexical"
+        elif lexical_score >= semantic_score:
+            hit.score_source = "lexical"
+        else:
+            hit.score_source = "semantic"
+
+    def _weaken_current_turn_hit(self, hit: MemoryHit) -> None:
+        hit.is_current_turn = True
+        hit.score = round(hit.score * self.current_turn_score_factor, 4)
+        hit.semantic_score = round(hit.semantic_score * self.current_turn_score_factor, 4)
+        hit.lexical_score = round(hit.lexical_score * self.current_turn_score_factor, 4)
+
+    def _filter_memory_hits(self, hits: list[MemoryHit]) -> list[MemoryHit]:
+        eligible = [hit for hit in hits if hit.score >= self.memory_min_score]
+        if eligible:
+            return eligible[: self.top_k]
+        current_hits = [hit for hit in hits if hit.is_current_turn]
+        return current_hits[:1]
+
+    def _current_turn_ids(self, session_id: str) -> set[str]:
+        with self._turn_state_lock:
+            state = dict(self._turn_state.get(session_id, {}))
+        return {str(value) for key in ("user_message_id", "session_memory_id") if (value := state.get(key))}
+
+    def _is_current_turn_hit(self, hit: MemoryHit, current_turn_ids: set[str]) -> bool:
+        if not current_turn_ids:
+            return False
+        return hit.id in current_turn_ids or any(message_id in current_turn_ids for message_id in hit.source_message_ids)
+
+    def _reinforce_recalled_memories(self, hits: list[MemoryHit], session_id: str, query: str, current_turn_ids: set[str]) -> None:
         if not self._should_reinforce_query(query):
             return
         recalled_ids = {
             hit.id
             for hit in hits
-            if hit.id.startswith(("mem_", "evt_", "turn_")) and hit.score >= self.reinforce_min_score
+            if hit.id.startswith(("mem_", "evt_", "turn_"))
+            and not hit.is_current_turn
+            and not self._is_current_turn_hit(hit, current_turn_ids)
+            and hit.score >= self.reinforce_min_score
         }
         if not recalled_ids:
             return
@@ -549,6 +664,161 @@ class MemoryManager:
                 if normalized and normalized["status"] == "active":
                     records.append(normalized)
         return records
+
+    def _load_session_message_records(self, session_id: str, limit: int = 8) -> list[dict]:
+        """Expose recent raw session messages only for explicit recent-turn queries."""
+        session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
+        rows = self._read_session_rows(session_file)[-limit:]
+        records: list[dict] = []
+        for row in rows:
+            message_id = str(row.get("id", ""))
+            content = str(row.get("content", "")).strip()
+            if not message_id or not content:
+                continue
+            role = str(row.get("role", "")).strip() or "message"
+            created_at = str(row.get("created_at", ""))
+            records.append(
+                {
+                    "id": f"chat_{message_id}",
+                    "type": "conversation_turn",
+                    "summary": f"{role}: {content}",
+                    "raw_excerpt": content,
+                    "source_session_id": session_id,
+                    "source_message_ids": [message_id],
+                    "created_at": created_at,
+                    "day": self._day_bucket(created_at) if created_at else "",
+                    "last_recalled_at": created_at,
+                    "memory_strength": 1,
+                    "retention": 1.0,
+                    "importance": 0.4,
+                    "confidence": 1.0,
+                    "status": "active",
+                }
+            )
+        return records
+
+    def _build_time_hints(self, query: str, session_id: str, records: list[dict]) -> dict[str, str | bool]:
+        hints: dict[str, str | bool] = {}
+        day = self._extract_query_day(query, session_id)
+        if day:
+            hints["day"] = day
+        if self._mentions_recent_current(query):
+            hints["recent_current_session"] = True
+        if self._mentions_last_session(query):
+            preferred_session_id = self._latest_non_current_session_id(records, session_id)
+            if preferred_session_id:
+                hints["preferred_session_id"] = preferred_session_id
+        return hints
+
+    def _extract_query_day(self, query: str, session_id: str) -> str:
+        normalized = query.strip()
+        iso_match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", normalized)
+        if iso_match:
+            day = self._safe_iso_day(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
+            if day:
+                self._date_context_by_session[session_id] = day
+            return day
+
+        cn_year_match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})(?:日|号)?", normalized)
+        if cn_year_match:
+            day = self._safe_iso_day(int(cn_year_match.group(1)), int(cn_year_match.group(2)), int(cn_year_match.group(3)))
+            if day:
+                self._date_context_by_session[session_id] = day
+            return day
+
+        month_day_match = re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})(?:日|号)?", normalized)
+        if month_day_match:
+            year = datetime.now().astimezone().year
+            day = self._safe_iso_day(year, int(month_day_match.group(1)), int(month_day_match.group(2)))
+            if day:
+                self._date_context_by_session[session_id] = day
+            return day
+
+        today = datetime.now().astimezone().date()
+        if "前天" in normalized:
+            day = (today - timedelta(days=2)).isoformat()
+        elif "昨天" in normalized:
+            day = (today - timedelta(days=1)).isoformat()
+        elif "今天" in normalized:
+            day = today.isoformat()
+        elif "那天" in normalized:
+            day = self._date_context_by_session.get(session_id, "")
+        else:
+            day = ""
+        if day:
+            self._date_context_by_session[session_id] = day
+        return day
+
+    def _safe_iso_day(self, year: int, month: int, day: int) -> str:
+        try:
+            return datetime(year, month, day).date().isoformat()
+        except ValueError:
+            return ""
+
+    def _mentions_recent_current(self, query: str) -> bool:
+        lower = query.lower()
+        return any(token in lower for token in ("刚才", "上一轮", "前一轮", "刚刚", "just now", "previous turn"))
+
+    def _mentions_last_session(self, query: str) -> bool:
+        lower = query.lower()
+        return any(token in lower for token in ("上次", "上一次", "上回", "last time", "previous chat", "last chat"))
+
+    def _latest_non_current_session_id(self, records: list[dict], session_id: str) -> str:
+        latest_session_id = ""
+        latest_created_at = ""
+        for record in records:
+            candidate_session_id = str(record.get("source_session_id", ""))
+            if not candidate_session_id or candidate_session_id == session_id:
+                continue
+            created_at = str(record.get("created_at", ""))
+            if created_at >= latest_created_at:
+                latest_created_at = created_at
+                latest_session_id = candidate_session_id
+        return latest_session_id
+
+    def _apply_time_score_adjustments(
+        self,
+        score: float,
+        item: dict,
+        time_hints: dict[str, str | bool],
+        session_id: str,
+    ) -> float:
+        adjusted = max(0.0, score)
+        day = str(time_hints.get("day", "") or "")
+        if day:
+            record_day = self._record_day(item)
+            if record_day == day:
+                adjusted = max(adjusted, 0.45)
+                if item.get("type") == "event_summary":
+                    adjusted += 0.2
+                if str(item.get("id", "")).startswith(f"evt_daily_{day.replace('-', '')}"):
+                    adjusted += 0.15
+            elif record_day:
+                adjusted *= 0.35
+
+        if bool(time_hints.get("recent_current_session")):
+            if str(item.get("source_session_id", "")) == session_id:
+                adjusted = max(adjusted, 0.35 + (0.25 * self._recency_score(str(item.get("created_at", "")))))
+            elif item.get("source_session_id"):
+                adjusted *= 0.6
+
+        preferred_session_id = str(time_hints.get("preferred_session_id", "") or "")
+        if preferred_session_id:
+            if str(item.get("source_session_id", "")) == preferred_session_id:
+                adjusted = max(adjusted, 0.55)
+                if item.get("type") == "event_summary":
+                    adjusted += 0.15
+            elif item.get("source_session_id"):
+                adjusted *= 0.5
+
+        return adjusted
+
+    def _record_day(self, item: dict) -> str:
+        day = str(item.get("day", "") or "").strip()
+        if day:
+            return day
+        created_at = str(item.get("created_at", "") or "")
+        return self._day_bucket(created_at) if created_at else ""
 
     def _apply_decay_policy(self, session_id: str) -> None:
         total_checked = 0
@@ -704,6 +974,7 @@ class MemoryManager:
             "source_session_id": str(payload.get("source_session_id", "")),
             "source_message_ids": [str(item) for item in source_message_ids if str(item)],
             "created_at": str(payload.get("created_at", "")),
+            "day": str(payload.get("day") or self._day_bucket(str(payload.get("created_at", "")))),
             "last_recalled_at": str(normalized.get("last_recalled_at", "")),
             "memory_strength": int(normalized.get("memory_strength", 1) or 1),
             "retention": retention_score(normalized),
@@ -728,6 +999,9 @@ class MemoryManager:
             retention=item["retention"],
             importance=item["importance"],
             confidence=item["confidence"],
+            day=item.get("day", ""),
+            lexical_score=round(score, 4),
+            score_source="lexical",
         )
 
     def _score(self, item: dict, query: str) -> float:
@@ -758,6 +1032,16 @@ class MemoryManager:
             + (0.05 * importance)
             + (0.05 * confidence)
         )
+
+    def _env_float(self, name: str, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            return default
+        return max(minimum, min(maximum, value))
 
     def _recency_score(self, created_at: str) -> float:
         """Map timestamp recency to [0, 1] with linear decay over 30 days."""

@@ -88,23 +88,31 @@ class MemoryBankSummarizer:
         if not self.use_llm:
             return fallback
         prompt = (
-            "Based on the following dialogue, summarize the user's personality traits, preferences, "
-            "and emotional state. Separate stable traits from temporary emotions.\n\n"
+            "Based on the following dialogue, summarize only memory-worthy user profile observations.\n"
+            "Output concise bullet points in the user's language. Label each bullet as stable or temporary.\n"
+            "Stable: identity, long-term preferences, repeated interests, durable goals, work/school/family context.\n"
+            "Temporary: short-lived mood, current state, or situational needs.\n"
+            "Do not infer personality from one-off system feedback, bug reports, incomplete-output complaints, "
+            "single-turn emotion, or one-turn tone. If evidence is insufficient, return an empty string.\n\n"
             f"{dialogue}"
         )
         return self._generate(prompt, fallback=fallback)
 
     def summarize_global_portrait(self, daily_personalities: Sequence[str]) -> str:
         joined = "\n".join(f"- {item}" for item in daily_personalities if item.strip())
-        fallback = self._dedupe_lines(joined, limit=8)
+        fallback = self._fallback_global_portrait(daily_personalities)
         if not self.use_llm:
             return fallback
         prompt = (
-            "The following are user traits and emotions observed across multiple days. "
-            "Provide a concise, general, non-duplicative user portrait. Preserve uncertainty when evidence is weak.\n\n"
+            "Build a conservative global user portrait from these daily profile observations.\n"
+            "Keep only stable identity facts, long-term preferences, repeated interests, durable goals, and persistent context.\n"
+            "Exclude temporary observations unless the same pattern appears across multiple days with clear evidence.\n"
+            "Never convert one-off system feedback, bug reports, incomplete-output complaints, single-turn emotion, "
+            "or one-turn tone into a stable personality trait.\n"
+            "If evidence is weak or only temporary/noisy, return an empty string. Output concise bullet points only.\n\n"
             f"{joined}"
         )
-        return self._generate(prompt, fallback=fallback)
+        return self._filter_global_portrait_text(self._generate(prompt, fallback=fallback))
 
     def _generate(self, prompt: str, fallback: str) -> str:
         if self.model is None:
@@ -192,21 +200,84 @@ class MemoryBankSummarizer:
         return self._dedupe_lines("\n".join(selected), limit=6)
 
     def _fallback_personality(self, dialogue: str) -> str:
+        if self._is_profile_noise(dialogue):
+            return ""
         lower = dialogue.lower()
         traits: list[str] = []
         if any(token in lower for token in ("不喜欢", "dislike", "don't like", "讨厌")):
-            traits.append("用户表达了明确的负向偏好或互动边界。")
+            traits.append("stable_preference: 用户表达了明确的负向偏好或互动边界。")
         if any(token in lower for token in ("喜欢", "like", "prefer", "偏好")):
-            traits.append("用户表达了个人偏好。")
+            traits.append("stable_preference: 用户表达了个人偏好。")
         if any(token in lower for token in ("焦虑", "压力", "stress", "anxious", "sad", "难过")):
-            traits.append("用户近期可能存在压力或情绪波动。")
+            traits.append("temporary_state: 用户近期可能存在压力或情绪波动。")
         if any(token in lower for token in ("工作", "work", "job")):
-            traits.append("用户谈到了工作或职业背景。")
-        if any(token in lower for token in ("我叫", "my name is", "i am ", "i'm ")):
-            traits.append("用户提供了身份相关信息。")
+            traits.append("stable_context: 用户谈到了工作或职业背景。")
+        identity_excerpt = self._extract_identity_excerpt(dialogue)
+        if identity_excerpt:
+            traits.append(f"stable_identity: 用户提供了身份相关信息：{identity_excerpt}")
         if not traits:
-            return self._fallback_event_summary(dialogue)
+            return ""
         return "\n".join(f"- {item}" for item in traits)
+
+    def _extract_identity_excerpt(self, dialogue: str) -> str:
+        for raw in dialogue.splitlines():
+            line = raw.strip()
+            if line.lower().startswith("user:"):
+                line = line[5:].strip()
+            elif line.startswith("用户:"):
+                line = line[3:].strip()
+            lower = line.lower()
+            if any(token in lower for token in ("我叫", "我是", "my name is", "i am ", "i'm ")):
+                return line[:120]
+        return ""
+
+    def _fallback_global_portrait(self, daily_personalities: Sequence[str]) -> str:
+        stable_lines: list[str] = []
+        for item in daily_personalities:
+            for raw in item.splitlines():
+                line = raw.strip().lstrip("- ").strip()
+                if not line or self._is_global_portrait_noise(line):
+                    continue
+                stable_lines.append(line)
+        return self._dedupe_lines("\n".join(stable_lines), limit=8)
+
+    def _filter_global_portrait_text(self, text: str) -> str:
+        lines = []
+        for raw in text.splitlines():
+            line = raw.strip().lstrip("- ").strip()
+            if not line or self._is_global_portrait_noise(line):
+                continue
+            lines.append(line)
+        return self._dedupe_lines("\n".join(lines), limit=8)
+
+    def _is_global_portrait_noise(self, text: str) -> bool:
+        lower = text.lower()
+        temporary_terms = ("temporary", "temporary_state", "临时", "暂时", "近期", "当前", "一时", "短期")
+        if any(token in lower for token in temporary_terms):
+            return True
+        return self._is_profile_noise(text)
+
+    def _is_profile_noise(self, text: str) -> bool:
+        lower = text.lower()
+        feedback_terms = (
+            "bug",
+            "debug",
+            "token",
+            "tokens",
+            "没输出",
+            "没有输出",
+            "没回复",
+            "输出不足",
+            "回答不完整",
+            "还没结束",
+            "终止",
+            "报错",
+            "错误",
+            "卡住",
+            "等待",
+        )
+        system_terms = ("llm", "大模型", "模型", "系统", "assistant", "你", "回复", "回答", "输出")
+        return any(token in lower for token in feedback_terms) and any(token in lower for token in system_terms)
 
     def _dedupe_lines(self, text: str, limit: int) -> str:
         rows: list[str] = []
