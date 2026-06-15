@@ -5,9 +5,11 @@ import math
 from datetime import datetime, timezone
 from pathlib import Path
 
+from guga.memory.time_utils import format_beijing, now_beijing_iso
+
 
 def now_iso() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return now_beijing_iso()
 
 
 def parse_iso(value: str) -> datetime | None:
@@ -53,7 +55,7 @@ def reinforce_jsonl_records(path: Path, memory_ids: set[str], now: datetime | No
         return []
 
     current = now or datetime.now(timezone.utc)
-    recalled_at = current.astimezone().isoformat(timespec="seconds")
+    recalled_at = format_beijing(current)
     rows: list[dict] = []
     changed_ids: list[str] = []
 

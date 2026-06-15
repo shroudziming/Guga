@@ -31,6 +31,9 @@ class MemoryHit:
     importance: float = 0.0
     confidence: float = 0.0
     day: str = ""
+    valid_at: str = ""
+    invalid_at: str = ""
+    time_source: str = ""
     semantic_score: float = 0.0
     lexical_score: float = 0.0
     score_source: str = ""

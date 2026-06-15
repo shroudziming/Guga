@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
 from pathlib import Path
 
 from guga.memory.forgetting import now_iso, normalize_memorybank_fields
 from guga.memory.summarizer import MemoryBankSummarizer
+from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket
 
 
 class EventSummaryStore:
@@ -29,26 +29,31 @@ class EventSummaryStore:
         rows = self._read_rows()
         existing = self._find(rows, f"evt_daily_{day.replace('-', '')}")
         created_at = str(existing.get("created_at") or now_iso()) if existing else now_iso()
+        updated_at = now_iso()
         strength = int(existing.get("memory_strength", 1) or 1) if existing else 1
         last_recalled_at = str(existing.get("last_recalled_at") or created_at) if existing else created_at
         payload = normalize_memorybank_fields(
-            {
-                "id": f"evt_daily_{day.replace('-', '')}",
-                "type": "event_summary",
-                "scope": "daily",
-                "day": day,
-                "summary": summary,
-                "raw_excerpt": dialogue[-2000:],
-                "source_session_id": session_id,
-                "source_message_ids": source_message_ids,
-                "created_at": created_at,
-                "updated_at": now_iso(),
-                "last_recalled_at": last_recalled_at,
-                "memory_strength": strength,
-                "importance": 0.75,
-                "confidence": 0.8,
-                "status": "active",
-            }
+            apply_temporal_fields(
+                {
+                    "id": f"evt_daily_{day.replace('-', '')}",
+                    "type": "event_summary",
+                    "scope": "daily",
+                    "day": day,
+                    "summary": summary,
+                    "raw_excerpt": dialogue[-2000:],
+                    "source_session_id": session_id,
+                    "source_message_ids": source_message_ids,
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "last_recalled_at": last_recalled_at,
+                    "memory_strength": strength,
+                    "importance": 0.75,
+                    "confidence": 0.8,
+                    "status": "active",
+                },
+                text=f"{dialogue}\n{summary}",
+                reference_time=updated_at,
+            )
         )
         self._upsert(rows, payload)
         self._write_rows(rows)
@@ -67,25 +72,30 @@ class EventSummaryStore:
 
         existing = self._find(rows, "evt_global")
         created_at = str(existing.get("created_at") or now_iso()) if existing else now_iso()
+        updated_at = now_iso()
         strength = int(existing.get("memory_strength", 1) or 1) if existing else 1
         last_recalled_at = str(existing.get("last_recalled_at") or created_at) if existing else created_at
         payload = normalize_memorybank_fields(
-            {
-                "id": "evt_global",
-                "type": "event_summary",
-                "scope": "global",
-                "summary": summary,
-                "raw_excerpt": "\n".join(daily_summaries[-20:]),
-                "source_session_id": "",
-                "source_message_ids": [],
-                "created_at": created_at,
-                "updated_at": now_iso(),
-                "last_recalled_at": last_recalled_at,
-                "memory_strength": strength,
-                "importance": 0.85,
-                "confidence": 0.75,
-                "status": "active",
-            }
+            apply_temporal_fields(
+                {
+                    "id": "evt_global",
+                    "type": "event_summary",
+                    "scope": "global",
+                    "summary": summary,
+                    "raw_excerpt": "\n".join(daily_summaries[-20:]),
+                    "source_session_id": "",
+                    "source_message_ids": [],
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "last_recalled_at": last_recalled_at,
+                    "memory_strength": strength,
+                    "importance": 0.85,
+                    "confidence": 0.75,
+                    "status": "active",
+                },
+                text="\n".join(daily_summaries[-20:]) + "\n" + summary,
+                reference_time=updated_at,
+            )
         )
         self._upsert(rows, payload)
         self._write_rows(rows)
@@ -152,7 +162,4 @@ class EventSummaryStore:
         rows.append(payload)
 
     def _day_bucket(self, created_at: str) -> str:
-        try:
-            return datetime.fromisoformat(created_at).date().isoformat()
-        except ValueError:
-            return datetime.now().astimezone().date().isoformat()
+        return time_day_bucket(created_at)

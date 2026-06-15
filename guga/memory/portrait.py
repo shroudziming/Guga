@@ -5,6 +5,7 @@ from pathlib import Path
 
 from guga.memory.forgetting import now_iso
 from guga.memory.summarizer import MemoryBankSummarizer
+from guga.memory.time_utils import apply_temporal_fields
 
 
 class UserPortraitStore:
@@ -39,19 +40,24 @@ class UserPortraitStore:
         row_id = f"portrait_daily_{day.replace('-', '')}"
         existing = self._find(rows, row_id)
         created_at = str(existing.get("created_at") or now_iso()) if existing else now_iso()
-        payload = {
-            "id": row_id,
-            "type": "user_portrait",
-            "scope": "daily",
-            "day": day,
-            "summary": summary,
-            "raw_excerpt": dialogue[-2000:],
-            "source_session_id": source_session_id,
-            "source_message_ids": source_message_ids,
-            "created_at": created_at,
-            "updated_at": now_iso(),
-            "status": "active",
-        }
+        updated_at = now_iso()
+        payload = apply_temporal_fields(
+            {
+                "id": row_id,
+                "type": "user_portrait",
+                "scope": "daily",
+                "day": day,
+                "summary": summary,
+                "raw_excerpt": dialogue[-2000:],
+                "source_session_id": source_session_id,
+                "source_message_ids": source_message_ids,
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "status": "active",
+            },
+            text=f"{dialogue}\n{summary}",
+            reference_time=updated_at,
+        )
         self._upsert(rows, payload)
         self._write_daily_rows(rows)
         return payload
@@ -67,6 +73,7 @@ class UserPortraitStore:
         profile = self.load()
         profile.setdefault("schema_version", 2)
         profile["updated_at"] = now_iso()
+        profile["time_source"] = "transaction_time"
         profile["portrait_summary"] = portrait_summary
         profile["daily_personality_count"] = len(daily_summaries)
         profile["daily_personality_ids"] = [str(row.get("id", "")) for row in rows[-20:]]
@@ -91,6 +98,7 @@ class UserPortraitStore:
         self._maybe_add(profile["temporary_states"], text, ["焦虑", "压力", "难过", "开心", "最近", "stress", "anxious", "sad", "recently"], lower)
 
         profile["updated_at"] = now_iso()
+        profile["time_source"] = "transaction_time"
         profile["portrait_summary"] = self._build_summary(profile)
         self.save(profile)
         return profile

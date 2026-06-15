@@ -2,11 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
-import re
 from threading import RLock
 from time import perf_counter
 from uuid import uuid4
@@ -27,6 +26,7 @@ from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_re
 from guga.memory.portrait import UserPortraitStore
 from guga.memory.profile_store import ProfileStore
 from guga.memory.summarizer import MemoryBankSummarizer
+from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
 from guga.types import DocumentHit, MemoryContext, MemoryHit
@@ -58,7 +58,7 @@ class _SessionStore:
             "content": content,
             "source": source,
             "metadata": metadata or {},
-            "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "created_at": now_beijing_iso(),
         }
         with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -217,6 +217,9 @@ class MemoryManager:
                 "source_session_id": hit.source_session_id,
                 "source_message_ids": hit.source_message_ids,
                 "day": hit.day,
+                "valid_at": hit.valid_at,
+                "invalid_at": hit.invalid_at,
+                "time_source": hit.time_source,
                 "semantic_score": hit.semantic_score,
                 "lexical_score": hit.lexical_score,
                 "score_source": hit.score_source,
@@ -382,23 +385,27 @@ class MemoryManager:
         memory_candidate = self.summarizer.extract_archival_memory(user_text=user_text, assistant_text=assistant_text) if user_text else {}
         should_archive = bool(memory_candidate.get("should_archive")) if memory_candidate else False
         if user_text and (should_archive or self._should_archive(user_text)):
-            now = datetime.now().astimezone().isoformat(timespec="seconds")
-            payload = {
-                "id": f"mem_{uuid4().hex[:10]}",
-                "type": "episodic",
-                "topic": str(memory_candidate.get("topic") or "general"),
-                "summary": str(memory_candidate.get("summary") or f"用户提到：{user_text}"),
-                "raw_excerpt": user_text,
-                "importance": float(memory_candidate.get("importance", 0.7) or 0.7),
-                "confidence": float(memory_candidate.get("confidence", 0.7) or 0.7),
-                "created_at": now,
-                "last_recalled_at": now,
-                "memory_strength": 1,
-                "retention": 1.0,
-                "source_session_id": session_id,
-                "source_message_ids": [state.get("user_message_id", "")],
-                "status": "active",
-            }
+            now = now_beijing_iso()
+            payload = apply_temporal_fields(
+                {
+                    "id": f"mem_{uuid4().hex[:10]}",
+                    "type": "episodic",
+                    "topic": str(memory_candidate.get("topic") or "general"),
+                    "summary": str(memory_candidate.get("summary") or f"用户提到：{user_text}"),
+                    "raw_excerpt": user_text,
+                    "importance": float(memory_candidate.get("importance", 0.7) or 0.7),
+                    "confidence": float(memory_candidate.get("confidence", 0.7) or 0.7),
+                    "created_at": now,
+                    "last_recalled_at": now,
+                    "memory_strength": 1,
+                    "retention": 1.0,
+                    "source_session_id": session_id,
+                    "source_message_ids": [state.get("user_message_id", "")],
+                    "status": "active",
+                },
+                text=f"{user_text}\n{memory_candidate.get('summary', '')}",
+                reference_time=now,
+            )
             with self.archival_file.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -517,6 +524,9 @@ class MemoryManager:
                     importance=float(normalized.get("importance", 0.0) or 0.0),
                     confidence=float(normalized.get("confidence", 0.0) or 0.0),
                     day=str(record.get("day", "")),
+                    valid_at=str(record.get("valid_at", "")),
+                    invalid_at=str(record.get("invalid_at", "")),
+                    time_source=str(record.get("time_source", "")),
                     semantic_score=round(score, 4),
                     score_source="semantic",
                 ),
@@ -546,6 +556,9 @@ class MemoryManager:
             "source_message_ids": [hit.source_message_id] if hit.source_message_id else [],
             "created_at": hit.created_at,
             "day": self._day_bucket(hit.created_at) if hit.created_at else "",
+            "valid_at": hit.created_at,
+            "invalid_at": "",
+            "time_source": "semantic_hit_created_at",
         }
 
     def _store_memory_candidate(self, candidates: dict[str, MemoryHit], hit: MemoryHit) -> None:
@@ -562,6 +575,9 @@ class MemoryManager:
         keep.lexical_score = lexical_score
         keep.source_message_ids = list(dict.fromkeys(existing.source_message_ids + hit.source_message_ids))
         keep.day = keep.day or existing.day or hit.day
+        keep.valid_at = keep.valid_at or existing.valid_at or hit.valid_at
+        keep.invalid_at = keep.invalid_at or existing.invalid_at or hit.invalid_at
+        keep.time_source = keep.time_source or existing.time_source or hit.time_source
 
     def _finalize_route_scores(self, hit: MemoryHit) -> None:
         semantic_score = round(max(0.0, hit.semantic_score), 4)
@@ -586,11 +602,12 @@ class MemoryManager:
         hit.lexical_score = round(hit.lexical_score * self.current_turn_score_factor, 4)
 
     def _filter_memory_hits(self, hits: list[MemoryHit]) -> list[MemoryHit]:
-        eligible = [hit for hit in hits if hit.score >= self.memory_min_score]
-        if eligible:
-            return eligible[: self.top_k]
-        current_hits = [hit for hit in hits if hit.is_current_turn]
-        return current_hits[:1]
+        historical = [hit for hit in hits if not hit.is_current_turn and hit.score >= self.memory_min_score]
+        current_hits = [hit for hit in hits if hit.is_current_turn and hit.score >= self.memory_min_score]
+        if historical:
+            return (historical + current_hits)[: self.top_k]
+        fallback_current = current_hits or [hit for hit in hits if hit.is_current_turn]
+        return fallback_current[:1]
 
     def _current_turn_ids(self, session_id: str) -> set[str]:
         with self._turn_state_lock:
@@ -678,22 +695,26 @@ class MemoryManager:
             role = str(row.get("role", "")).strip() or "message"
             created_at = str(row.get("created_at", ""))
             records.append(
-                {
-                    "id": f"chat_{message_id}",
-                    "type": "conversation_turn",
-                    "summary": f"{role}: {content}",
-                    "raw_excerpt": content,
-                    "source_session_id": session_id,
-                    "source_message_ids": [message_id],
-                    "created_at": created_at,
-                    "day": self._day_bucket(created_at) if created_at else "",
-                    "last_recalled_at": created_at,
-                    "memory_strength": 1,
-                    "retention": 1.0,
-                    "importance": 0.4,
-                    "confidence": 1.0,
-                    "status": "active",
-                }
+                apply_temporal_fields(
+                    {
+                        "id": f"chat_{message_id}",
+                        "type": "conversation_turn",
+                        "summary": f"{role}: {content}",
+                        "raw_excerpt": content,
+                        "source_session_id": session_id,
+                        "source_message_ids": [message_id],
+                        "created_at": created_at,
+                        "day": self._day_bucket(created_at) if created_at else "",
+                        "last_recalled_at": created_at,
+                        "memory_strength": 1,
+                        "retention": 1.0,
+                        "importance": 0.4,
+                        "confidence": 1.0,
+                        "status": "active",
+                    },
+                    text=content,
+                    reference_time=created_at,
+                )
             )
         return records
 
@@ -712,35 +733,9 @@ class MemoryManager:
 
     def _extract_query_day(self, query: str, session_id: str) -> str:
         normalized = query.strip()
-        iso_match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", normalized)
-        if iso_match:
-            day = self._safe_iso_day(int(iso_match.group(1)), int(iso_match.group(2)), int(iso_match.group(3)))
-            if day:
-                self._date_context_by_session[session_id] = day
-            return day
-
-        cn_year_match = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})(?:日|号)?", normalized)
-        if cn_year_match:
-            day = self._safe_iso_day(int(cn_year_match.group(1)), int(cn_year_match.group(2)), int(cn_year_match.group(3)))
-            if day:
-                self._date_context_by_session[session_id] = day
-            return day
-
-        month_day_match = re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})(?:日|号)?", normalized)
-        if month_day_match:
-            year = datetime.now().astimezone().year
-            day = self._safe_iso_day(year, int(month_day_match.group(1)), int(month_day_match.group(2)))
-            if day:
-                self._date_context_by_session[session_id] = day
-            return day
-
-        today = datetime.now().astimezone().date()
-        if "前天" in normalized:
-            day = (today - timedelta(days=2)).isoformat()
-        elif "昨天" in normalized:
-            day = (today - timedelta(days=1)).isoformat()
-        elif "今天" in normalized:
-            day = today.isoformat()
+        extracted = extract_semantic_time(normalized, reference_time=now_beijing())
+        if extracted is not None:
+            day = extracted[0].date().isoformat()
         elif "那天" in normalized:
             day = self._date_context_by_session.get(session_id, "")
         else:
@@ -748,12 +743,6 @@ class MemoryManager:
         if day:
             self._date_context_by_session[session_id] = day
         return day
-
-    def _safe_iso_day(self, year: int, month: int, day: int) -> str:
-        try:
-            return datetime(year, month, day).date().isoformat()
-        except ValueError:
-            return ""
 
     def _mentions_recent_current(self, query: str) -> bool:
         lower = query.lower()
@@ -814,11 +803,19 @@ class MemoryManager:
         return adjusted
 
     def _record_day(self, item: dict) -> str:
+        time_source = str(item.get("time_source", "") or "")
+        if time_source.startswith("semantic_"):
+            semantic_day = str(item.get("semantic_day", "") or "").strip()
+            if semantic_day:
+                return semantic_day
+            valid_at = str(item.get("valid_at", "") or "").strip()
+            if valid_at:
+                return self._day_bucket(valid_at)
         day = str(item.get("day", "") or "").strip()
-        if day:
+        if item.get("type") == "event_summary" and day:
             return day
         created_at = str(item.get("created_at", "") or "")
-        return self._day_bucket(created_at) if created_at else ""
+        return self._day_bucket(created_at) if item.get("type") == "event_summary" and created_at else ""
 
     def _apply_decay_policy(self, session_id: str) -> None:
         total_checked = 0
@@ -831,22 +828,26 @@ class MemoryManager:
             self._debug(session_id, f"memory_decay checked={total_checked} decayed={total_decayed}")
 
     def _build_session_memory(self, session_id: str, message_id: str, text: str) -> dict:
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        return {
-            "id": f"turn_{message_id}",
-            "type": "conversation_turn",
-            "summary": text,
-            "raw_excerpt": text,
-            "importance": 0.5,
-            "confidence": 0.9,
-            "created_at": now,
-            "last_recalled_at": now,
-            "memory_strength": 1,
-            "retention": 1.0,
-            "source_session_id": session_id,
-            "source_message_ids": [message_id],
-            "status": "active",
-        }
+        now = now_beijing_iso()
+        return apply_temporal_fields(
+            {
+                "id": f"turn_{message_id}",
+                "type": "conversation_turn",
+                "summary": text,
+                "raw_excerpt": text,
+                "importance": 0.5,
+                "confidence": 0.9,
+                "created_at": now,
+                "last_recalled_at": now,
+                "memory_strength": 1,
+                "retention": 1.0,
+                "source_session_id": session_id,
+                "source_message_ids": [message_id],
+                "status": "active",
+            },
+            text=text,
+            reference_time=now,
+        )
 
     def _refresh_hierarchical_memory(self, session_id: str) -> None:
         session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
@@ -883,11 +884,11 @@ class MemoryManager:
 
     def _load_daily_dialogue(self, session_file: Path) -> tuple[str, str, list[str]]:
         if not session_file.exists():
-            return datetime.now().astimezone().date().isoformat(), "", []
+            return now_beijing().date().isoformat(), "", []
 
         current_rows = self._read_session_rows(session_file)
         if not current_rows:
-            return datetime.now().astimezone().date().isoformat(), "", []
+            return now_beijing().date().isoformat(), "", []
 
         day = self._day_bucket(str(current_rows[-1].get("created_at", "")))
         rows: list[dict] = []
@@ -923,10 +924,7 @@ class MemoryManager:
         return rows
 
     def _day_bucket(self, created_at: str) -> str:
-        try:
-            return datetime.fromisoformat(created_at).date().isoformat()
-        except ValueError:
-            return datetime.now().astimezone().date().isoformat()
+        return time_day_bucket(created_at)
 
     def _append_jsonl(self, path: Path, payload: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -966,6 +964,7 @@ class MemoryManager:
             source_message_ids = []
 
         normalized = normalize_memorybank_fields(payload)
+        valid_at = str(payload.get("valid_at") or payload.get("created_at", ""))
         return {
             "id": str(payload.get("id") or f"mem_{uuid4().hex[:10]}"),
             "type": str(payload.get("type", "episodic")),
@@ -974,7 +973,12 @@ class MemoryManager:
             "source_session_id": str(payload.get("source_session_id", "")),
             "source_message_ids": [str(item) for item in source_message_ids if str(item)],
             "created_at": str(payload.get("created_at", "")),
+            "updated_at": str(payload.get("updated_at", "")),
             "day": str(payload.get("day") or self._day_bucket(str(payload.get("created_at", "")))),
+            "valid_at": valid_at,
+            "invalid_at": str(payload.get("invalid_at", "")),
+            "semantic_day": str(payload.get("semantic_day") or (time_day_bucket(valid_at) if valid_at else "")),
+            "time_source": str(payload.get("time_source", "")),
             "last_recalled_at": str(normalized.get("last_recalled_at", "")),
             "memory_strength": int(normalized.get("memory_strength", 1) or 1),
             "retention": retention_score(normalized),
@@ -1000,6 +1004,9 @@ class MemoryManager:
             importance=item["importance"],
             confidence=item["confidence"],
             day=item.get("day", ""),
+            valid_at=item.get("valid_at", ""),
+            invalid_at=item.get("invalid_at", ""),
+            time_source=item.get("time_source", ""),
             lexical_score=round(score, 4),
             score_source="lexical",
         )
