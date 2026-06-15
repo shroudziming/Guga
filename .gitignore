@@ -16,7 +16,7 @@ venv/
 Thumbs.db
 
 # Local model / data artifacts (usually large)
-models/
+/models/
 models_cache/
 data/
 outputs/
