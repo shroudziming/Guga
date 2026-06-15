@@ -91,3 +91,27 @@ Guga_API_TIMEOUT=90
 Guga_MEMORY_USE_LLM_SUMMARY=0
 ```
 
+### Tool calling
+
+When the active model supports OpenAI-compatible `tool_calls`, Guga can expose a
+small local tool registry to the model during generation. Tool results are fed
+back into the same turn so the model can continue answering naturally.
+
+Enabled by default:
+
+- `guga_parse_time`: parse explicit and relative time expressions using Beijing
+  time.
+- `guga_list_dir`: list files under the Guga project root.
+- `guga_read_file`: read UTF-8 text files under the Guga project root.
+
+Registered but disabled by default:
+
+- `guga_write_file`: enable with `Guga_ENABLE_WRITE_TOOL=1`.
+- `guga_run_command`: enable with `Guga_ENABLE_COMMAND_TOOL=1`.
+
+Tool loop limit:
+
+```text
+Guga_MAX_TOOL_ROUNDS=3
+```
+
