@@ -334,12 +334,22 @@ class MemoryManager:
         message_id = self.session_store.append_message(session_id=session_id, role="user", content=text, source=source)
         turn_payload = self._build_session_memory(session_id=session_id, message_id=message_id, text=text)
         self._append_jsonl(self.session_memory_file, turn_payload)
+        fact_payload = self.timeline_fact_store.append_from_turn(
+            user_text=text,
+            session_id=session_id,
+            source_message_ids=[message_id],
+            created_at=str(turn_payload.get("created_at", "")),
+        )
         with self._turn_state_lock:
             state = self._turn_state.setdefault(session_id, {})
             state["user_text"] = text
             state["user_message_id"] = message_id
             state["session_memory_id"] = turn_payload["id"]
+            if fact_payload:
+                state["timeline_fact_id"] = str(fact_payload.get("id", ""))
         self._debug(session_id, f"ingest role=user message_id={message_id}")
+        if fact_payload:
+            self._debug(session_id, f"timeline_fact_added fact_id={fact_payload.get('id', '')} day={fact_payload.get('semantic_day', '')}")
         return message_id
 
     def record_assistant_message(self, session_id: str, text: str, source: str = "chat") -> str:
@@ -451,20 +461,12 @@ class MemoryManager:
             elapsed_ms = int((perf_counter() - started) * 1000)
             self._debug(session_id, f"writeback status=no_archival_write latency_ms={elapsed_ms}")
 
-        if user_text:
-            fact_payload = self.timeline_fact_store.append_from_turn(
-                user_text=user_text,
-                session_id=session_id,
-                source_message_ids=[state.get("user_message_id", "")],
-                created_at=str(session_memory_payload.get("created_at", "")) if session_memory_payload else "",
-            )
-            if fact_payload and self.rag_pipeline is not None:
-                try:
-                    self.rag_pipeline.add_memory_record(fact_payload)
-                except Exception as exc:
-                    self._debug(session_id, f"index_update status=timeline_fact_failed reason={exc}")
-            if fact_payload:
-                self._debug(session_id, f"timeline_fact_added fact_id={fact_payload.get('id', '')} day={fact_payload.get('semantic_day', '')}")
+        fact_payload = self._load_memory_by_id(self.timeline_fact_file, state.get("timeline_fact_id", ""))
+        if fact_payload and self.rag_pipeline is not None:
+            try:
+                self.rag_pipeline.add_memory_record(fact_payload)
+            except Exception as exc:
+                self._debug(session_id, f"index_update status=timeline_fact_failed reason={exc}")
 
         if session_memory_payload and self.rag_pipeline is not None:
             try:
@@ -715,7 +717,7 @@ class MemoryManager:
     def _current_turn_ids(self, session_id: str) -> set[str]:
         with self._turn_state_lock:
             state = dict(self._turn_state.get(session_id, {}))
-        return {str(value) for key in ("user_message_id", "session_memory_id") if (value := state.get(key))}
+        return {str(value) for key in ("user_message_id", "session_memory_id", "timeline_fact_id") if (value := state.get(key))}
 
     def _is_current_turn_hit(self, hit: MemoryHit, current_turn_ids: set[str]) -> bool:
         if not current_turn_ids:

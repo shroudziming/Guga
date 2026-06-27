@@ -45,6 +45,16 @@ class TimelineFactsTest(unittest.TestCase):
         self.assertTrue(fact["source_message_ids"])
         self.assertIn("提交项目报告", fact["semantic_text"])
 
+    def test_time_bound_plan_is_retrievable_before_background_finalize(self) -> None:
+        self.manager.record_user_message("sess_ingest", "我在2026年7月4日要和导师开会，请你记住。")
+
+        context = self.manager.prepare_context("你记得我2026年7月4日要做什么吗？", session_id="sess_other")
+
+        self.assertTrue((self.memory_root / "timeline_facts.jsonl").exists())
+        self.assertGreaterEqual(len(context.hits), 1)
+        self.assertEqual(context.hits[0].memory_type, "timeline_fact")
+        self.assertIn("导师开会", context.hits[0].summary)
+
     def test_finalize_turn_does_not_write_fact_for_casual_today_chat(self) -> None:
         session_id = "sess_no_fact"
         self.manager.record_user_message(session_id, "你好，今天随便聊聊。")
