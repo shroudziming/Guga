@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import os
@@ -31,6 +32,23 @@ from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
 from guga.types import DocumentHit, MemoryContext, MemoryHit
 from guga.utils.paths import memory_data_dir, rag_documents_dir
+
+
+@dataclass(frozen=True)
+class _QueryPlan:
+    route: str
+    time_hints: dict[str, str | bool]
+    reason: str = ""
+    day: str = ""
+    preferred_session_id: str = ""
+
+    def as_debug_payload(self) -> dict[str, str | bool]:
+        payload: dict[str, str | bool] = {"route": self.route, "reason": self.reason}
+        if self.day:
+            payload["day"] = self.day
+        if self.preferred_session_id:
+            payload["preferred_session_id"] = self.preferred_session_id
+        return payload
 
 
 class _SessionStore:
@@ -170,12 +188,14 @@ class MemoryManager:
         self._apply_decay_policy(session_id)
         current_turn_ids = self._current_turn_ids(session_id)
         records = self._load_archival_records()
-        if self._mentions_recent_current(user_text):
+        query_plan = self._build_query_plan(user_text, session_id, records)
+        if query_plan.route == "recent_turn":
             records.extend(self._load_session_message_records(session_id))
-        time_hints = self._build_time_hints(user_text, session_id, records)
+        records = self._records_for_query_plan(records, query_plan, session_id)
+        time_hints = query_plan.time_hints
         self._debug(
             session_id,
-            f"retrieve_start query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} candidates={len(records)} min_score={self.memory_min_score:.2f} current_turn_factor={self.current_turn_score_factor:.2f} time_hints={json.dumps(time_hints, ensure_ascii=False)}",
+            f"retrieve_start query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} candidates={len(records)} min_score={self.memory_min_score:.2f} current_turn_factor={self.current_turn_score_factor:.2f} query_plan={json.dumps(query_plan.as_debug_payload(), ensure_ascii=False)} time_hints={json.dumps(time_hints, ensure_ascii=False)}",
         )
 
         semantic_memory_hits, semantic_document_hits = self._retrieve_semantic(user_text=user_text, session_id=session_id)
@@ -720,31 +740,105 @@ class MemoryManager:
             )
         return records
 
-    def _build_time_hints(self, query: str, session_id: str, records: list[dict]) -> dict[str, str | bool]:
-        hints: dict[str, str | bool] = {}
-        day = self._extract_query_day(query, session_id)
+    def _build_query_plan(self, query: str, session_id: str, records: list[dict]) -> _QueryPlan:
+        normalized = query.strip()
+        day, source = self._extract_query_day_with_source(normalized, session_id)
         if day:
-            hints["day"] = day
-        if self._mentions_recent_current(query):
-            hints["recent_current_session"] = True
-        if self._mentions_last_session(query):
+            return _QueryPlan(
+                route="date_window",
+                time_hints={"day": day},
+                reason=source,
+                day=day,
+            )
+
+        if self._mentions_recent_current(normalized):
+            return _QueryPlan(
+                route="recent_turn",
+                time_hints={"recent_current_session": True},
+                reason="recent_current_session_reference",
+            )
+
+        if self._mentions_last_session(normalized):
             preferred_session_id = self._latest_non_current_session_id(records, session_id)
+            hints: dict[str, str | bool] = {}
             if preferred_session_id:
                 hints["preferred_session_id"] = preferred_session_id
-        return hints
+            return _QueryPlan(
+                route="last_session",
+                time_hints=hints,
+                reason="last_session_reference",
+                preferred_session_id=preferred_session_id,
+            )
 
-    def _extract_query_day(self, query: str, session_id: str) -> str:
+        if self._mentions_user_portrait(normalized):
+            return _QueryPlan(route="portrait", time_hints={}, reason="long_term_user_profile")
+
+        return _QueryPlan(route="hybrid", time_hints={}, reason="default_hybrid")
+
+    def _records_for_query_plan(self, records: list[dict], query_plan: _QueryPlan, session_id: str) -> list[dict]:
+        if query_plan.route == "date_window":
+            candidates = [record for record in records if self._record_matches_day(record, query_plan.day)]
+            if query_plan.reason in {"semantic_explicit_date", "contextual_date"}:
+                return candidates
+            if any(str(record.get("source_session_id", "")) != session_id for record in candidates):
+                return candidates
+            return records
+
+        if query_plan.route == "recent_turn":
+            return [record for record in records if str(record.get("source_session_id", "")) == session_id]
+
+        if query_plan.route == "last_session":
+            if not query_plan.preferred_session_id:
+                return []
+            return [record for record in records if str(record.get("source_session_id", "")) == query_plan.preferred_session_id]
+
+        if query_plan.route == "portrait":
+            return []
+
+        return records
+
+    def _record_matches_day(self, item: dict, day: str) -> bool:
+        if not day:
+            return False
+        record_day = self._record_day(item)
+        if record_day:
+            return record_day == day
+        created_at = str(item.get("created_at", "") or "")
+        return bool(created_at and self._day_bucket(created_at) == day)
+
+    def _mentions_user_portrait(self, query: str) -> bool:
+        lower = query.lower()
+        return any(
+            token in lower
+            for token in (
+                "我是谁",
+                "你觉得我是谁",
+                "你了解我",
+                "关于我",
+                "我的画像",
+                "用户画像",
+                "我的偏好",
+                "我喜欢什么",
+                "who am i",
+                "what do you know about me",
+            )
+        )
+
+    def _extract_query_day_with_source(self, query: str, session_id: str) -> tuple[str, str]:
         normalized = query.strip()
         extracted = extract_semantic_time(normalized, reference_time=now_beijing())
         if extracted is not None:
             day = extracted[0].date().isoformat()
+            source = extracted[1]
         elif "那天" in normalized:
             day = self._date_context_by_session.get(session_id, "")
+            source = "contextual_date" if day else ""
         else:
             day = ""
+            source = ""
         if day:
             self._date_context_by_session[session_id] = day
-        return day
+        return day, source
 
     def _mentions_recent_current(self, query: str) -> bool:
         lower = query.lower()
