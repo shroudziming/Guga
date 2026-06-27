@@ -84,7 +84,12 @@ def reinforce_jsonl_records(path: Path, memory_ids: set[str], now: datetime | No
     return changed_ids
 
 
-def refresh_jsonl_retention(path: Path, decay_threshold: float, now: datetime | None = None) -> dict[str, int]:
+def refresh_jsonl_retention(
+    path: Path,
+    decay_threshold: float,
+    now: datetime | None = None,
+    min_age_days: float = 0.0,
+) -> dict[str, int]:
     if not path.exists():
         return {"checked": 0, "decayed": 0}
 
@@ -105,8 +110,13 @@ def refresh_jsonl_retention(path: Path, decay_threshold: float, now: datetime | 
         if str(payload.get("status", "active")) == "active":
             checked += 1
             payload["retention"] = retention_score(payload, now=current)
+            anchor = str(payload.get("last_recalled_at") or payload.get("created_at") or "")
+            if elapsed_days(anchor, now=current) < min_age_days:
+                rows.append(payload)
+                continue
             if float(payload["retention"]) < decay_threshold:
                 payload["status"] = "decayed"
+                payload["decayed_at"] = format_beijing(current)
                 decayed += 1
         rows.append(payload)
 
