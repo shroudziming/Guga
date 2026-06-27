@@ -202,11 +202,12 @@ class MemoryManager:
 
         lexical_hits: list[MemoryHit] = []
         for record in records:
-            score = self._score(record, user_text)
-            score = self._apply_time_score_adjustments(score, record, time_hints, session_id)
+            score, components = self._score_components(record, user_text)
+            score, temporal_components = self._apply_time_score_components(score, record, time_hints, session_id)
+            components.update(temporal_components)
             if score <= 0:
                 continue
-            lexical_hits.append(self._to_hit(record, score))
+            lexical_hits.append(self._to_hit(record, score, score_components=components))
 
         merged_memory_hits = self._merge_memory_hits(
             semantic_memory_hits,
@@ -243,6 +244,7 @@ class MemoryManager:
                 "semantic_score": hit.semantic_score,
                 "lexical_score": hit.lexical_score,
                 "score_source": hit.score_source,
+                "score_components": hit.score_components,
                 "is_current_turn": hit.is_current_turn,
             }
             for hit in merged_memory_hits
@@ -528,7 +530,19 @@ class MemoryManager:
             source_message_ids = [hit.source_message_id] if hit.source_message_id else list(record.get("source_message_ids", []))
             retention = float(normalized.get("retention", record.get("retention", 1.0) if record else 1.0) or 1.0)
             score = hit.score * retention
-            score = self._apply_time_score_adjustments(score, record or self._record_from_semantic_hit(key, hit), time_hints, session_id)
+            components: dict[str, float | str | bool] = {
+                "route": "semantic",
+                "semantic_raw_score": round(hit.score, 4),
+                "retention": round(retention, 4),
+                "semantic_retained_score": round(score, 4),
+            }
+            score, temporal_components = self._apply_time_score_components(
+                score,
+                record or self._record_from_semantic_hit(key, hit),
+                time_hints,
+                session_id,
+            )
+            components.update(temporal_components)
             self._store_memory_candidate(
                 candidates,
                 MemoryHit(
@@ -551,6 +565,7 @@ class MemoryManager:
                     time_source=str(record.get("time_source", "")),
                     semantic_score=round(score, 4),
                     score_source="semantic",
+                    score_components=components,
                 ),
             )
 
@@ -600,6 +615,25 @@ class MemoryManager:
         keep.valid_at = keep.valid_at or existing.valid_at or hit.valid_at
         keep.invalid_at = keep.invalid_at or existing.invalid_at or hit.invalid_at
         keep.time_source = keep.time_source or existing.time_source or hit.time_source
+        keep.score_components = self._merge_score_components(existing.score_components, hit.score_components, keep.score_components)
+
+    def _merge_score_components(
+        self,
+        existing: dict[str, float | str | bool],
+        incoming: dict[str, float | str | bool],
+        selected: dict[str, float | str | bool],
+    ) -> dict[str, float | str | bool]:
+        merged = dict(selected)
+        for prefix, components in (("semantic", existing), ("lexical", incoming)):
+            route = str(components.get("route", ""))
+            if route not in {"semantic", "lexical"}:
+                continue
+            target_prefix = route
+            for key, value in components.items():
+                if key == "route":
+                    continue
+                merged[f"{target_prefix}_{key}"] = value
+        return merged
 
     def _finalize_route_scores(self, hit: MemoryHit) -> None:
         semantic_score = round(max(0.0, hit.semantic_score), 4)
@@ -616,12 +650,22 @@ class MemoryManager:
             hit.score_source = "lexical"
         else:
             hit.score_source = "semantic"
+        hit.score_components = dict(hit.score_components)
+        hit.score_components["semantic_score"] = semantic_score
+        hit.score_components["lexical_score"] = lexical_score
+        hit.score_components["final_score"] = round(hit.score, 4)
+        hit.score_components["score_source"] = hit.score_source
 
     def _weaken_current_turn_hit(self, hit: MemoryHit) -> None:
         hit.is_current_turn = True
+        original_score = hit.score
         hit.score = round(hit.score * self.current_turn_score_factor, 4)
         hit.semantic_score = round(hit.semantic_score * self.current_turn_score_factor, 4)
         hit.lexical_score = round(hit.lexical_score * self.current_turn_score_factor, 4)
+        hit.score_components = dict(hit.score_components)
+        hit.score_components["current_turn_factor"] = round(self.current_turn_score_factor, 4)
+        hit.score_components["score_before_current_turn_factor"] = round(original_score, 4)
+        hit.score_components["final_score"] = hit.score
 
     def _filter_memory_hits(self, hits: list[MemoryHit]) -> list[MemoryHit]:
         historical = [hit for hit in hits if not hit.is_current_turn and hit.score >= self.memory_min_score]
@@ -868,35 +912,69 @@ class MemoryManager:
         time_hints: dict[str, str | bool],
         session_id: str,
     ) -> float:
+        adjusted, _ = self._apply_time_score_components(score, item, time_hints, session_id)
+        return adjusted
+
+    def _apply_time_score_components(
+        self,
+        score: float,
+        item: dict,
+        time_hints: dict[str, str | bool],
+        session_id: str,
+    ) -> tuple[float, dict[str, float | str | bool]]:
         adjusted = max(0.0, score)
+        before = adjusted
+        rule = "none"
         day = str(time_hints.get("day", "") or "")
         if day:
             record_day = self._record_day(item)
             if record_day == day:
                 adjusted = max(adjusted, 0.45)
+                rule = "date_match"
                 if item.get("type") == "event_summary":
                     adjusted += 0.2
+                    rule = "date_match_event_summary"
                 if str(item.get("id", "")).startswith(f"evt_daily_{day.replace('-', '')}"):
                     adjusted += 0.15
+                    rule = "date_match_daily_summary"
             elif record_day:
                 adjusted *= 0.35
+                rule = "date_mismatch_downweight"
 
         if bool(time_hints.get("recent_current_session")):
             if str(item.get("source_session_id", "")) == session_id:
                 adjusted = max(adjusted, 0.35 + (0.25 * self._recency_score(str(item.get("created_at", "")))))
+                rule = "recent_current_session"
             elif item.get("source_session_id"):
                 adjusted *= 0.6
+                rule = "recent_other_session_downweight"
 
         preferred_session_id = str(time_hints.get("preferred_session_id", "") or "")
         if preferred_session_id:
             if str(item.get("source_session_id", "")) == preferred_session_id:
                 adjusted = max(adjusted, 0.55)
+                rule = "last_session_match"
                 if item.get("type") == "event_summary":
                     adjusted += 0.15
+                    rule = "last_session_event_summary"
             elif item.get("source_session_id"):
                 adjusted *= 0.5
+                rule = "last_session_mismatch_downweight"
 
-        return adjusted
+        components: dict[str, float | str | bool] = {
+            "score_before_temporal": round(before, 4),
+            "temporal_adjustment": round(adjusted - before, 4),
+            "score_after_temporal": round(adjusted, 4),
+            "temporal_rule": rule,
+        }
+        if day:
+            components["query_day"] = day
+            components["record_day"] = self._record_day(item)
+        if preferred_session_id:
+            components["preferred_session_id"] = preferred_session_id
+        if bool(time_hints.get("recent_current_session")):
+            components["recent_current_session"] = True
+        return adjusted, components
 
     def _record_day(self, item: dict) -> str:
         time_source = str(item.get("time_source", "") or "")
@@ -1088,7 +1166,12 @@ class MemoryManager:
             "status": str(payload.get("status", "active")),
         }
 
-    def _to_hit(self, item: dict, score: float) -> MemoryHit:
+    def _to_hit(
+        self,
+        item: dict,
+        score: float,
+        score_components: dict[str, float | str | bool] | None = None,
+    ) -> MemoryHit:
         """Convert normalized archival dict to MemoryHit with rounded score."""
         return MemoryHit(
             id=item["id"],
@@ -1110,9 +1193,14 @@ class MemoryManager:
             time_source=item.get("time_source", ""),
             lexical_score=round(score, 4),
             score_source="lexical",
+            score_components=score_components or {},
         )
 
     def _score(self, item: dict, query: str) -> float:
+        score, _ = self._score_components(item, query)
+        return score
+
+    def _score_components(self, item: dict, query: str) -> tuple[float, dict[str, float | str | bool]]:
         """Compute lexical relevance score for one archival memory record.
 
         Score terms:
@@ -1121,25 +1209,47 @@ class MemoryManager:
         """
         text = f"{item.get('summary', '')} {item.get('raw_excerpt', '')}"
         query_tokens = self._tokens(query)
+        components: dict[str, float | str | bool] = {
+            "route": "lexical",
+            "query_token_count": len(query_tokens),
+        }
         if not query_tokens:
-            return 0.0
+            components["lexical_base_score"] = 0.0
+            return 0.0, components
 
         matches = sum(1 for token in query_tokens if token in text)
         overlap_score = matches / max(1, len(query_tokens))
+        components["lexical_matches"] = matches
+        components["lexical_overlap"] = round(overlap_score, 4)
         if overlap_score <= 0:
-            return 0.0
+            components["lexical_base_score"] = 0.0
+            return 0.0, components
 
         recency_score = self._recency_score(item.get("created_at", ""))
         importance = max(0.0, min(float(item.get("importance", 0.0) or 0.0), 1.0))
         confidence = max(0.0, min(float(item.get("confidence", 0.0) or 0.0), 1.0))
 
         retention = max(0.0, min(float(item.get("retention", 1.0) or 1.0), 1.0))
-        return (
-            (overlap_score * retention)
-            + (self.recency_weight * recency_score)
-            + (0.05 * importance)
-            + (0.05 * confidence)
+        retained_overlap = overlap_score * retention
+        recency_bonus = self.recency_weight * recency_score
+        importance_bonus = 0.05 * importance
+        confidence_bonus = 0.05 * confidence
+        score = retained_overlap + recency_bonus + importance_bonus + confidence_bonus
+        components.update(
+            {
+                "retention": round(retention, 4),
+                "retained_overlap": round(retained_overlap, 4),
+                "recency": round(recency_score, 4),
+                "recency_weight": round(self.recency_weight, 4),
+                "recency_bonus": round(recency_bonus, 4),
+                "importance": round(importance, 4),
+                "importance_bonus": round(importance_bonus, 4),
+                "confidence": round(confidence, 4),
+                "confidence_bonus": round(confidence_bonus, 4),
+                "lexical_base_score": round(score, 4),
+            }
         )
+        return score, components
 
     def _env_float(self, name: str, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
         raw = os.environ.get(name, "").strip()
