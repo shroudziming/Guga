@@ -502,6 +502,8 @@ class MemoryManager:
             if not key:
                 continue
             record = record_by_id.get(key, {})
+            if (hit.source_type or "memory") == "memory" and not record:
+                continue
             normalized = normalize_memorybank_fields(record) if record else {}
             source_message_ids = [hit.source_message_id] if hit.source_message_id else list(record.get("source_message_ids", []))
             retention = float(normalized.get("retention", record.get("retention", 1.0) if record else 1.0) or 1.0)
@@ -953,6 +955,11 @@ class MemoryManager:
 
     def _normalize_archival_record(self, payload: dict) -> dict | None:
         """Normalize one raw archival payload to internal scoring schema."""
+        if payload.get("exclude_from_retrieval") is True:
+            return None
+        if str(payload.get("type", "")) == "system_feedback":
+            return None
+
         summary = str(payload.get("summary") or payload.get("raw_excerpt") or "").strip()
         if not summary:
             return None

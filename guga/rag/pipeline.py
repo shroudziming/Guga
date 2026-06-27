@@ -195,6 +195,11 @@ class RagPipeline:
 
     def _memory_chunks_from_payload(self, payload: dict) -> list[DocumentChunk]:
         """Convert one archival memory payload into chunk list (if active/valid)."""
+        if payload.get("exclude_from_retrieval") is True:
+            return []
+        if str(payload.get("type", "")) == "system_feedback":
+            return []
+
         status = str(payload.get("status", "active"))
         if status != "active":
             return []
