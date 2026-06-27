@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -115,7 +116,7 @@ class MemoryBankReproTest(unittest.TestCase):
             updated = json.loads(archival.read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(updated["memory_strength"], 1)
 
-    def test_decay_policy_marks_low_retention_memory_decayed(self) -> None:
+    def test_decay_policy_disabled_by_default_keeps_old_memory_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
             archival = memory_root / "archival_memory.jsonl"
@@ -140,11 +141,70 @@ class MemoryBankReproTest(unittest.TestCase):
             )
             manager = MemoryManager(memory_root=memory_root, enable_semantic=False)
 
-            context = manager.prepare_context("你记得我在哪工作吗", session_id="sess_probe")
+            manager.prepare_context("你记得我在哪工作吗", session_id="sess_probe")
 
             updated = json.loads(archival.read_text(encoding="utf-8").splitlines()[0])
-            self.assertEqual(updated["status"], "decayed")
-            self.assertEqual(context.hits, [])
+            self.assertEqual(updated["status"], "active")
+            self.assertNotIn("decayed_at", updated)
+
+    def test_decay_policy_enabled_requires_one_year_and_writes_decayed_at(self) -> None:
+        original_enabled = os.environ.get("Guga_MEMORY_DECAY_ENABLED")
+        original_min_age = os.environ.get("Guga_MEMORY_DECAY_MIN_AGE_DAYS")
+        os.environ["Guga_MEMORY_DECAY_ENABLED"] = "1"
+        os.environ.pop("Guga_MEMORY_DECAY_MIN_AGE_DAYS", None)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                memory_root = Path(tmp)
+                archival = memory_root / "archival_memory.jsonl"
+                rows = [
+                    {
+                        "id": "mem_under_year",
+                        "type": "episodic",
+                        "summary": "用户提到：我在上海工作",
+                        "raw_excerpt": "我在上海工作",
+                        "created_at": "2026-01-01T00:00:00+08:00",
+                        "last_recalled_at": "2026-01-01T00:00:00+08:00",
+                        "memory_strength": 1,
+                        "source_session_id": "sess_recent",
+                        "source_message_ids": ["msg_recent"],
+                        "status": "active",
+                    },
+                    {
+                        "id": "mem_over_year",
+                        "type": "episodic",
+                        "summary": "用户提到：我在北京工作",
+                        "raw_excerpt": "我在北京工作",
+                        "created_at": "2024-01-01T00:00:00+08:00",
+                        "last_recalled_at": "2024-01-01T00:00:00+08:00",
+                        "memory_strength": 1,
+                        "source_session_id": "sess_old",
+                        "source_message_ids": ["msg_old"],
+                        "status": "active",
+                    },
+                ]
+                archival.write_text(
+                    "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+                    encoding="utf-8",
+                )
+                manager = MemoryManager(memory_root=memory_root, enable_semantic=False)
+
+                manager.prepare_context("你记得我在哪工作吗", session_id="sess_probe")
+
+                updated_rows = [json.loads(line) for line in archival.read_text(encoding="utf-8").splitlines()]
+                by_id = {row["id"]: row for row in updated_rows}
+                self.assertEqual(by_id["mem_under_year"]["status"], "active")
+                self.assertNotIn("decayed_at", by_id["mem_under_year"])
+                self.assertEqual(by_id["mem_over_year"]["status"], "decayed")
+                self.assertTrue(by_id["mem_over_year"]["decayed_at"].endswith("+08:00"))
+        finally:
+            if original_enabled is None:
+                os.environ.pop("Guga_MEMORY_DECAY_ENABLED", None)
+            else:
+                os.environ["Guga_MEMORY_DECAY_ENABLED"] = original_enabled
+            if original_min_age is None:
+                os.environ.pop("Guga_MEMORY_DECAY_MIN_AGE_DAYS", None)
+            else:
+                os.environ["Guga_MEMORY_DECAY_MIN_AGE_DAYS"] = original_min_age
 
     def test_finalize_turn_writes_memorybank_layers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
