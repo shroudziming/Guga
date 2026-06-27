@@ -14,6 +14,9 @@ from uuid import uuid4
 from guga.config import (
     DEFAULT_CURRENT_TURN_SCORE_FACTOR,
     DEFAULT_DOCUMENT_TOP_K,
+    DEFAULT_MEMORY_DECAY_ENABLED,
+    DEFAULT_MEMORY_DECAY_MIN_AGE_DAYS,
+    DEFAULT_MEMORY_DECAY_THRESHOLD,
     DEFAULT_MEMORY_MIN_SCORE,
     DEFAULT_MEMORY_RECENCY_WEIGHT,
     DEFAULT_MEMORY_TOP_K,
@@ -123,7 +126,19 @@ class MemoryManager:
         self.top_k = max(1, top_k)
         self.document_top_k = max(1, document_top_k)
         self.recency_weight = max(0.0, recency_weight)
-        self.decay_threshold = 0.05
+        self.decay_enabled = self._env_bool("Guga_MEMORY_DECAY_ENABLED", DEFAULT_MEMORY_DECAY_ENABLED)
+        self.decay_threshold = self._env_float(
+            "Guga_MEMORY_DECAY_THRESHOLD",
+            DEFAULT_MEMORY_DECAY_THRESHOLD,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.decay_min_age_days = self._env_float(
+            "Guga_MEMORY_DECAY_MIN_AGE_DAYS",
+            DEFAULT_MEMORY_DECAY_MIN_AGE_DAYS,
+            minimum=0.0,
+            maximum=36500.0,
+        )
         self.reinforce_min_score = 0.55
         self.current_turn_score_factor = self._env_float(
             "Guga_CURRENT_TURN_SCORE_FACTOR",
@@ -1035,14 +1050,23 @@ class MemoryManager:
         return self._day_bucket(created_at) if item.get("type") == "event_summary" and created_at else ""
 
     def _apply_decay_policy(self, session_id: str) -> None:
+        if not self.decay_enabled:
+            return
         total_checked = 0
         total_decayed = 0
         for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.timeline_fact_file):
-            stats = refresh_jsonl_retention(path, decay_threshold=self.decay_threshold)
+            stats = refresh_jsonl_retention(
+                path,
+                decay_threshold=self.decay_threshold,
+                min_age_days=self.decay_min_age_days,
+            )
             total_checked += stats["checked"]
             total_decayed += stats["decayed"]
         if total_checked:
-            self._debug(session_id, f"memory_decay checked={total_checked} decayed={total_decayed}")
+            self._debug(
+                session_id,
+                f"memory_decay enabled=1 checked={total_checked} decayed={total_decayed} threshold={self.decay_threshold:.4f} min_age_days={self.decay_min_age_days:.1f}",
+            )
 
     def _build_session_memory(self, session_id: str, message_id: str, text: str) -> dict:
         now = now_beijing_iso()
@@ -1303,6 +1327,12 @@ class MemoryManager:
         except ValueError:
             return default
         return max(minimum, min(maximum, value))
+
+    def _env_bool(self, name: str, default: bool = False) -> bool:
+        raw = os.environ.get(name, "").strip().lower()
+        if not raw:
+            return default
+        return raw in {"1", "true", "yes", "on", "y"}
 
     def _recency_score(self, created_at: str) -> float:
         """Map timestamp recency to [0, 1] with linear decay over 30 days."""
