@@ -54,6 +54,15 @@ class TimelineFactsTest(unittest.TestCase):
 
         self.assertFalse((self.memory_root / "timeline_facts.jsonl").exists())
 
+    def test_finalize_turn_does_not_write_fact_for_date_question(self) -> None:
+        session_id = "sess_question"
+        self.manager.record_user_message(session_id, "你记得我2026年7月3日要做什么吗？")
+        self.manager.record_assistant_message(session_id, "你那天要提交项目报告。")
+
+        self.manager.finalize_turn(session_id)
+
+        self.assertFalse((self.memory_root / "timeline_facts.jsonl").exists())
+
     def test_date_query_retrieves_timeline_fact_and_dedupes_same_source_summary(self) -> None:
         source_message_id = "msg_plan"
         self._append_jsonl(

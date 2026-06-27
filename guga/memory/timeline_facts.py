@@ -107,10 +107,20 @@ class TimelineFactStore:
         }
 
     def _looks_like_time_bound_plan(self, text: str) -> bool:
+        if self._looks_like_retrieval_question(text):
+            return False
         if extract_semantic_time(text) is None:
             return False
         lower = text.lower()
         return any(keyword in lower for keyword in _PLAN_KEYWORDS)
+
+    def _looks_like_retrieval_question(self, text: str) -> bool:
+        lower = text.lower()
+        if any(token in lower for token in ("你记得", "还记得", "remember", "recall")):
+            return True
+        if any(token in text for token in ("？", "?")) and any(token in text for token in ("什么", "吗", "是不是", "是否")):
+            return True
+        return False
 
     def _compact_object(self, text: str) -> str:
         compact = re.sub(r"请你记住[。.!！]*", "", text).strip(" ，。.!！")
