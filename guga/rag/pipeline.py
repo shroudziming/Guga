@@ -64,6 +64,7 @@ class RagPipeline:
             - memory_root/archival_memory.jsonl
             - memory_root/event_summaries.jsonl
             - memory_root/session_memories.jsonl
+            - memory_root/timeline_facts.jsonl
             - memory_root/sessions/**/*.jsonl (legacy fallback user messages)
             - documents_dir/**/*.txt|md|json|jsonl
 
@@ -151,7 +152,12 @@ class RagPipeline:
         """Collect chunked memory texts from archival and session user messages."""
         chunks: list[DocumentChunk] = []
         session_memory_file = memory_root / "session_memories.jsonl"
-        for jsonl_file in (memory_root / "archival_memory.jsonl", memory_root / "event_summaries.jsonl", session_memory_file):
+        for jsonl_file in (
+            memory_root / "archival_memory.jsonl",
+            memory_root / "event_summaries.jsonl",
+            session_memory_file,
+            memory_root / "timeline_facts.jsonl",
+        ):
             if jsonl_file.exists():
                 for line in jsonl_file.read_text(encoding="utf-8").splitlines():
                     line = line.strip()
