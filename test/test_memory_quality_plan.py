@@ -162,10 +162,29 @@ class MemoryQualityPlanTest(unittest.TestCase):
                     "status": "active",
                 },
             )
+            _append_jsonl(
+                memory_root / "archival_memory.jsonl",
+                {
+                    "id": "mem_wrong_day_strong",
+                    "type": "episodic",
+                    "summary": "2026-05-09那天的对话 那天的对话 那天的对话",
+                    "raw_excerpt": "2026-05-09那天的对话",
+                    "created_at": "2026-05-10T12:00:00+08:00",
+                    "last_recalled_at": "2099-01-01T00:00:00+00:00",
+                    "memory_strength": 1,
+                    "source_session_id": "sess_wrong",
+                    "source_message_ids": ["msg_wrong"],
+                    "importance": 1.0,
+                    "confidence": 1.0,
+                    "status": "active",
+                },
+            )
 
             context = manager.prepare_context("2026-05-09那天的对话", session_id="sess_probe")
+            hit_ids = [hit.id for hit in context.hits]
 
             self.assertEqual(context.hits[0].id, "evt_daily_20260509")
+            self.assertNotIn("mem_wrong_day_strong", hit_ids)
 
     def test_recent_and_last_session_time_references_are_prioritized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,6 +222,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
             )
             last_context = manager.prepare_context("上次我们聊了什么", session_id="sess_now")
             self.assertEqual(last_context.hits[0].id, "evt_daily_20260510")
+            self.assertEqual([hit.id for hit in last_context.hits], ["evt_daily_20260510"])
 
             manager.record_user_message("sess_now", "我们先聊蝴蝶刀")
             manager.record_assistant_message("sess_now", "刚才你说什么：蝴蝶刀练习安排")
@@ -210,6 +230,37 @@ class MemoryQualityPlanTest(unittest.TestCase):
             recent_context = manager.prepare_context("刚才你说什么", session_id="sess_now")
 
             self.assertTrue(recent_context.hits[0].summary.startswith("assistant:"))
+
+    def test_portrait_query_uses_profile_without_episodic_noise(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_root = Path(tmp)
+            (memory_root / "profile.json").write_text(
+                json.dumps({"portrait_summary": "- 用户自称叔本明。\n- 用户想练蝴蝶刀。"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            _append_jsonl(
+                memory_root / "archival_memory.jsonl",
+                {
+                    "id": "mem_noisy_identity",
+                    "type": "episodic",
+                    "summary": "我是谁 我是谁 我是谁",
+                    "raw_excerpt": "我是谁",
+                    "created_at": "2099-01-01T00:00:00+08:00",
+                    "last_recalled_at": "2099-01-01T00:00:00+08:00",
+                    "memory_strength": 1,
+                    "source_session_id": "sess_old",
+                    "source_message_ids": ["msg_old"],
+                    "importance": 1.0,
+                    "confidence": 1.0,
+                    "status": "active",
+                },
+            )
+            manager = MemoryManager(memory_root=memory_root, top_k=4, recency_weight=0.0, enable_semantic=False)
+
+            context = manager.prepare_context("你觉得我是谁？", session_id="sess_probe")
+
+            self.assertEqual(context.hits, [])
+            self.assertIn("叔本明", context.user_portrait)
 
     def test_portrait_summary_ignores_one_off_bug_feedback(self) -> None:
         summarizer = MemoryBankSummarizer()
