@@ -27,6 +27,7 @@ from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_re
 from guga.memory.portrait import UserPortraitStore
 from guga.memory.profile_store import ProfileStore
 from guga.memory.summarizer import MemoryBankSummarizer
+from guga.memory.timeline_facts import TimelineFactStore
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
@@ -140,8 +141,10 @@ class MemoryManager:
         self.memory_root.mkdir(parents=True, exist_ok=True)
         self.archival_file = self.memory_root / "archival_memory.jsonl"
         self.session_memory_file = self.memory_root / "session_memories.jsonl"
+        self.timeline_fact_file = self.memory_root / "timeline_facts.jsonl"
         self.profile_store = ProfileStore(self.memory_root / "profile.json")
         self.event_summary_store = EventSummaryStore(self.memory_root / "event_summaries.jsonl")
+        self.timeline_fact_store = TimelineFactStore(self.timeline_fact_file)
         self.portrait_store = UserPortraitStore(self.memory_root / "profile.json", self.memory_root / "personality_insights.jsonl")
         self.summarizer = MemoryBankSummarizer(model=model)
         self.session_store = _SessionStore(self.memory_root / "sessions")
@@ -217,6 +220,7 @@ class MemoryManager:
             time_hints=time_hints,
             session_id=session_id,
         )
+        merged_memory_hits = self._dedupe_timeline_fact_overlaps(merged_memory_hits, query_plan)
         self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text, current_turn_ids=current_turn_ids)
         document_hits = self._to_document_hits(semantic_document_hits)
         user_portrait = str(self.portrait_store.load().get("portrait_summary", "")).strip()
@@ -447,6 +451,21 @@ class MemoryManager:
             elapsed_ms = int((perf_counter() - started) * 1000)
             self._debug(session_id, f"writeback status=no_archival_write latency_ms={elapsed_ms}")
 
+        if user_text:
+            fact_payload = self.timeline_fact_store.append_from_turn(
+                user_text=user_text,
+                session_id=session_id,
+                source_message_ids=[state.get("user_message_id", "")],
+                created_at=str(session_memory_payload.get("created_at", "")) if session_memory_payload else "",
+            )
+            if fact_payload and self.rag_pipeline is not None:
+                try:
+                    self.rag_pipeline.add_memory_record(fact_payload)
+                except Exception as exc:
+                    self._debug(session_id, f"index_update status=timeline_fact_failed reason={exc}")
+            if fact_payload:
+                self._debug(session_id, f"timeline_fact_added fact_id={fact_payload.get('id', '')} day={fact_payload.get('semantic_day', '')}")
+
         if session_memory_payload and self.rag_pipeline is not None:
             try:
                 self.rag_pipeline.add_memory_record(session_memory_payload)
@@ -583,6 +602,24 @@ class MemoryManager:
         merged.sort(key=lambda item: item.score, reverse=True)
         return self._filter_memory_hits(merged)
 
+    def _dedupe_timeline_fact_overlaps(self, hits: list[MemoryHit], query_plan: _QueryPlan) -> list[MemoryHit]:
+        if query_plan.route != "date_window":
+            return hits
+
+        fact_message_ids: set[str] = set()
+        for hit in hits:
+            if hit.memory_type == "timeline_fact":
+                fact_message_ids.update(hit.source_message_ids)
+        if not fact_message_ids:
+            return hits
+
+        deduped: list[MemoryHit] = []
+        for hit in hits:
+            if hit.memory_type == "event_summary" and fact_message_ids.intersection(hit.source_message_ids):
+                continue
+            deduped.append(hit)
+        return deduped
+
     def _record_from_semantic_hit(self, key: str, hit: RetrievalHit) -> dict:
         return {
             "id": key,
@@ -691,7 +728,7 @@ class MemoryManager:
         recalled_ids = {
             hit.id
             for hit in hits
-            if hit.id.startswith(("mem_", "evt_", "turn_"))
+            if hit.id.startswith(("mem_", "evt_", "turn_", "fact_"))
             and not hit.is_current_turn
             and not self._is_current_turn_hit(hit, current_turn_ids)
             and hit.score >= self.reinforce_min_score
@@ -701,7 +738,8 @@ class MemoryManager:
         archival_changed = reinforce_jsonl_records(self.archival_file, recalled_ids)
         event_changed = reinforce_jsonl_records(self.event_summary_store.file_path, recalled_ids)
         session_changed = reinforce_jsonl_records(self.session_memory_file, recalled_ids)
-        changed = archival_changed + event_changed + session_changed
+        fact_changed = reinforce_jsonl_records(self.timeline_fact_file, recalled_ids)
+        changed = archival_changed + event_changed + session_changed + fact_changed
         if changed:
             self._debug(session_id, f"memory_update recalled_ids={changed} action=reinforce")
 
@@ -732,7 +770,7 @@ class MemoryManager:
     def _load_archival_records(self) -> list[dict]:
         """Load and normalize active archival memory records from JSONL file."""
         records: list[dict] = []
-        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file):
+        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.timeline_fact_file):
             if not path.exists():
                 continue
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -931,6 +969,9 @@ class MemoryManager:
             if record_day == day:
                 adjusted = max(adjusted, 0.45)
                 rule = "date_match"
+                if item.get("type") == "timeline_fact":
+                    adjusted += 0.25
+                    rule = "date_match_timeline_fact"
                 if item.get("type") == "event_summary":
                     adjusted += 0.2
                     rule = "date_match_event_summary"
@@ -994,7 +1035,7 @@ class MemoryManager:
     def _apply_decay_policy(self, session_id: str) -> None:
         total_checked = 0
         total_decayed = 0
-        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file):
+        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.timeline_fact_file):
             stats = refresh_jsonl_retention(path, decay_threshold=self.decay_threshold)
             total_checked += stats["checked"]
             total_decayed += stats["decayed"]
