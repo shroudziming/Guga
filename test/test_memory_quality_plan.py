@@ -78,6 +78,51 @@ class MemoryQualityPlanTest(unittest.TestCase):
 
             self.assertEqual(context.hits, [])
 
+    def test_debug_report_includes_score_components(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logs: list[str] = []
+            memory_root = Path(tmp)
+            manager = MemoryManager(
+                memory_root=memory_root,
+                top_k=4,
+                recency_weight=0.2,
+                enable_semantic=False,
+                debug=True,
+                debug_sink=logs.append,
+            )
+            _append_jsonl(
+                memory_root / "event_summaries.jsonl",
+                {
+                    "id": "evt_daily_20260509",
+                    "type": "event_summary",
+                    "scope": "daily",
+                    "day": "2026-05-09",
+                    "summary": "当天讨论了导师安排。",
+                    "raw_excerpt": "导师安排",
+                    "created_at": "2026-05-09T12:00:00+08:00",
+                    "last_recalled_at": "2099-01-01T00:00:00+00:00",
+                    "memory_strength": 1,
+                    "source_session_id": "sess_may9",
+                    "source_message_ids": ["msg_may9"],
+                    "importance": 0.75,
+                    "confidence": 0.8,
+                    "status": "active",
+                },
+            )
+
+            manager.prepare_context("2026-05-09那天的导师安排", session_id="sess_probe")
+
+            retrieve_done = next(line for line in logs if "retrieve_done" in line)
+            memory_raw = retrieve_done.split("memory_raw=", 1)[1].rsplit(" latency_ms=", 1)[0]
+            payload = json.loads(memory_raw)
+            components = payload[0]["score_components"]
+            self.assertIn("lexical_overlap", components)
+            self.assertIn("recency_bonus", components)
+            self.assertIn("importance_bonus", components)
+            self.assertIn("confidence_bonus", components)
+            self.assertIn("temporal_adjustment", components)
+            self.assertIn("final_score", components)
+
     def test_semantic_and_lexical_hits_are_fused_by_max_score(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
