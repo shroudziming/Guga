@@ -106,8 +106,8 @@ class MemoryBankSummarizer:
             "- 不要输出泛泛标签，例如“用户表达了个人偏好”。必须写出具体偏好。\n"
             "- 不要使用不确定推测，例如“可能”“似乎”“看起来”“也许”。\n\n"
             "示例：\n"
-            "输入 user: 我最近在看国产悬疑剧《毛骗》。\n"
-            "输出 - stable_interest: 用户对国产悬疑剧感兴趣。\n"
+            "输入 user: 我最近在读科幻小说《沙丘》。\n"
+            "输出 - stable_interest: 用户对科幻小说感兴趣。\n"
             "输入 user: 你刚才没有输出，有 bug。\n"
             "输出 空字符串。\n"
             "输入 user: 我在2026年7月5日要整理周报。\n"
@@ -146,13 +146,13 @@ class MemoryBankSummarizer:
             "- 长期目标：反复出现或明确长期持续的目标。\n"
             "- 持久背景：职业、学习方向、长期项目等。\n\n"
             "不要写：\n"
-            "- “用户此前提到想练蝴蝶刀。”\n"
+            "- “用户此前提到喜欢古典音乐。”\n"
             "应写：\n"
-            "- “用户对蝴蝶刀等技巧类事物感兴趣。”\n\n"
+            "- “用户喜欢古典音乐。”\n\n"
             "不要写：\n"
             "- “用户可能是个化名或自称，带点幽默感。”\n"
             "应写：\n"
-            "- “用户自称叔本明。”\n\n"
+            "- “用户使用该自称。”\n\n"
             "不要写：\n"
             "- “用户在2026年7月5日要整理周报。”\n"
             "因为这是时间事实，不是稳定画像。\n\n"
@@ -304,26 +304,19 @@ class MemoryBankSummarizer:
         line = raw.strip().lstrip("- ").strip()
         if not line:
             return ""
-        label = ""
         match = re.match(r"^(stable|temporary)[_\-\s]*(identity|interest|preference|context|goal|state|trait)?[:：]\s*(.+)$", line, flags=re.IGNORECASE)
-        if match:
-            kind = match.group(1).lower()
-            subtype = (match.group(2) or "").lower()
-            line = match.group(3).strip()
-            label = "temporary_state" if kind == "temporary" else f"stable_{subtype or 'observation'}"
+        if not match:
+            return ""
+        kind = match.group(1).lower()
+        subtype = (match.group(2) or "").lower()
+        label = "temporary_state" if kind == "temporary" else f"stable_{subtype}"
+        allowed_labels = {"stable_identity", "stable_interest", "stable_preference", "stable_context", "temporary_state"}
+        if label not in allowed_labels:
+            return ""
+        line = match.group(3).strip()
         line = self._normalize_global_portrait_line(line)
         if not line:
             return ""
-        if "蝴蝶刀" in line:
-            label = "stable_interest"
-        elif "自称" in line or "叫" in line or "姓名" in line:
-            label = "stable_identity"
-        elif any(token in line for token in ("喜欢", "偏好", "感兴趣", "兴趣")):
-            label = label if label.startswith("stable_") else "stable_interest"
-        elif any(token in line for token in ("焦虑", "压力", "难过", "开心", "困惑", "失落")):
-            label = "temporary_state"
-        elif not label:
-            label = "stable_observation"
         return f"{label}: {line}"
 
     def _is_daily_personality_noise(self, text: str) -> bool:
@@ -360,23 +353,13 @@ class MemoryBankSummarizer:
         interest_match = re.match(r"has an interest in\s+(.+)$", line, flags=re.IGNORECASE)
         if interest_match:
             topic = interest_match.group(1).strip().rstrip(".")
-            translations = {"butterfly": "蝴蝶", "butterflies": "蝴蝶"}
-            topic = translations.get(topic.lower(), topic)
             return f"用户对{topic}感兴趣。"
-        if "蝴蝶刀" in line and any(token in line for token in ("想练", "练习", "感兴趣", "兴趣")):
-            return "用户对蝴蝶刀等技巧类事物感兴趣。"
-        if "自称" in line and "叔本明" in line:
-            return "用户自称叔本明。"
-        if "称呼为" in line and "叔本明" in line:
-            return "用户自称叔本明。"
-        if "用户昵称" in line and "叔本明" in line:
-            return "用户自称叔本明。"
-        if re.search(r"姓名[:：]\s*叔本明", line):
-            return "用户自称叔本明。"
-        if line.strip("。") == "对蝴蝶感兴趣":
-            return "用户对蝴蝶感兴趣。"
-        if "悬疑题材" in line and ("网剧" in line or "电视剧" in line):
-            return "用户对悬疑题材的网剧或电视剧感兴趣。"
+        nickname_match = re.search(r"(?:用户)?昵称[为是叫“\"]+([^”，。；;\"”]+)", line)
+        if nickname_match:
+            return f"用户昵称为{nickname_match.group(1).strip()}。"
+        name_match = re.search(r"(?:姓名|名字)[:：]\s*([^，。；;]+)", line)
+        if name_match:
+            return f"用户姓名为{name_match.group(1).strip()}。"
         line = re.sub(r"^(?:stable|temporary|evidence)[_\-\s]*(?:identity|interest|preference|context|goal|state)?[:：]\s*", "", line, flags=re.IGNORECASE)
         line = re.sub(r"^(?:稳定|临时|证据)[:：]\s*", "", line)
         line = re.sub(r"用户(?:此前|曾经|之前)?(?:提到|表示|说过|描述|谈到|透露)[:：]?", "用户", line)
@@ -391,9 +374,10 @@ class MemoryBankSummarizer:
             line = f"用户{line}"
         if line.startswith("喜欢用"):
             line = f"用户偏好{line[2:]}"
+        line = re.sub(r"[，,]?\s*曾(?:经)?[^，。；;]*(?:但|，)?[^，。；;]*(?:未提供|没有提供)[^，。；;]*", "", line)
+        line = re.sub(r"用户想练(.+)", r"用户对\1有练习兴趣", line)
+        line = re.sub(r"^对(.+感兴趣)$", r"用户对\1", line)
         line = re.sub(r"\s+", " ", line).strip(" -，,。；;")
-        if line == "对蝴蝶感兴趣":
-            return "用户对蝴蝶感兴趣。"
         return line
 
     def _is_global_portrait_noise(self, text: str) -> bool:
