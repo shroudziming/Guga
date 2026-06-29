@@ -8,11 +8,34 @@ from pathlib import Path
 from guga.memory.manager import MemoryManager
 
 
+class SummaryModel:
+    def generate_reply(self, messages, gen):
+        _ = gen
+        prompt = messages[-1]["content"]
+        if "Extract one long-term memory candidate" in prompt:
+            return (
+                '{"should_archive": true, "topic": "profile", '
+                '"summary": "用户叫小明，在深圳工作", '
+                '"importance": 0.8, "confidence": 0.9}'
+            )
+        if "用户画像候选提取器" in prompt:
+            return "- stable_context: 用户在深圳工作。"
+        if "用户画像整理器" in prompt:
+            return "- 用户在深圳工作。"
+        return "- 用户叫小明，在深圳工作。"
+
+
 class MemoryManagerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.memory_root = Path(self.tmp.name)
-        self.manager = MemoryManager(memory_root=self.memory_root, top_k=2, recency_weight=0.2, enable_semantic=False)
+        self.manager = MemoryManager(
+            memory_root=self.memory_root,
+            model=SummaryModel(),
+            top_k=2,
+            recency_weight=0.2,
+            enable_semantic=False,
+        )
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

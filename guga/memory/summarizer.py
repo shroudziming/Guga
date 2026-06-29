@@ -9,6 +9,10 @@ from typing import Any
 from guga.types import GenerationConfig
 
 
+class SummaryGenerationError(RuntimeError):
+    """Raised when required LLM-backed memory summarization cannot complete."""
+
+
 class MemoryBankSummarizer:
     """Generate MemoryBank daily/global summaries with optional LLM backing."""
 
@@ -24,10 +28,6 @@ class MemoryBankSummarizer:
         self.use_llm = bool(use_llm and model is not None and hasattr(model, "generate_reply"))
 
     def extract_archival_memory(self, user_text: str, assistant_text: str = "") -> dict:
-        fallback = self._fallback_archival_memory(user_text)
-        if not self.use_llm:
-            return fallback
-
         prompt = (
             "Extract one long-term memory candidate from this chat turn for a MemoryBank-style AI companion.\n"
             "Return strict JSON only, without markdown. Schema:\n"
@@ -44,49 +44,42 @@ class MemoryBankSummarizer:
             f"User: {user_text}\n"
             f"Assistant: {assistant_text}"
         )
-        raw = self._generate(prompt, fallback=json.dumps(fallback, ensure_ascii=False))
+        raw = self._generate(prompt)
         parsed = self._parse_json_object(raw)
         if not parsed:
-            return fallback
+            raise SummaryGenerationError("LLM archival memory extraction returned invalid JSON.")
 
-        should_archive = bool(parsed.get("should_archive", fallback["should_archive"]))
-        summary = str(parsed.get("summary") or fallback["summary"]).strip()
-        topic = str(parsed.get("topic") or fallback["topic"]).strip() or "general"
+        should_archive = bool(parsed.get("should_archive", False))
+        summary = str(parsed.get("summary") or "").strip()
+        if should_archive and not summary:
+            raise SummaryGenerationError("LLM archival memory extraction omitted required summary.")
+        topic = str(parsed.get("topic") or "general").strip() or "general"
         return {
             "should_archive": should_archive,
             "topic": topic[:64],
             "summary": summary[:500],
-            "importance": self._clamp_float(parsed.get("importance"), fallback["importance"]),
-            "confidence": self._clamp_float(parsed.get("confidence"), fallback["confidence"]),
+            "importance": self._clamp_float(parsed.get("importance"), 0.7),
+            "confidence": self._clamp_float(parsed.get("confidence"), 0.7),
         }
 
     def summarize_daily_events(self, dialogue: str) -> str:
-        fallback = self._fallback_event_summary(dialogue)
-        if not self.use_llm:
-            return fallback
         prompt = (
             "Summarize the events and key information in the following dialogue. "
             "Return concise factual bullet points. Avoid unsupported inference.\n\n"
             f"{dialogue}"
         )
-        return self._generate(prompt, fallback=fallback)
+        return self._generate(prompt)
 
     def summarize_global_events(self, daily_summaries: Sequence[str]) -> str:
         joined = "\n".join(f"- {item}" for item in daily_summaries if item.strip())
-        fallback = self._dedupe_lines(joined, limit=8)
-        if not self.use_llm:
-            return fallback
         prompt = (
             "Summarize these daily event summaries into a concise global event summary. "
             "Preserve stable recurring facts and avoid duplicates.\n\n"
             f"{joined}"
         )
-        return self._generate(prompt, fallback=fallback)
+        return self._generate(prompt)
 
     def summarize_daily_personality(self, dialogue: str) -> str:
-        fallback = self._fallback_personality(dialogue)
-        if not self.use_llm:
-            return fallback
         prompt = (
             "你是用户画像候选提取器。请只基于 user messages 提取 memory-worthy user profile observations。\n\n"
             "参考实践：像 Mem0 一样只抽取用户明确表达的事实/偏好；像 Graphiti 一样不要从弱证据推断偏好、习惯或长期特质。\n\n"
@@ -115,13 +108,10 @@ class MemoryBankSummarizer:
             "Dialogue:\n"
             f"{dialogue}"
         )
-        return self._filter_daily_personality_text(self._generate(prompt, fallback=fallback))
+        return self._filter_daily_personality_text(self._generate(prompt))
 
     def summarize_global_portrait(self, daily_personalities: Sequence[str]) -> str:
         joined = "\n".join(f"- {item}" for item in daily_personalities if item.strip())
-        fallback = self._fallback_global_portrait(daily_personalities)
-        if not self.use_llm:
-            return fallback
         prompt = (
             "你是用户画像整理器。你的任务是把 daily personality insights 汇总成最终 profile.portrait_summary。\n\n"
             "目标：\n"
@@ -160,11 +150,11 @@ class MemoryBankSummarizer:
             f"{joined}\n\n"
             "只输出最终 portrait_summary，不要输出其他内容。"
         )
-        return self._filter_global_portrait_text(self._generate(prompt, fallback=fallback))
+        return self._filter_global_portrait_text(self._generate(prompt))
 
-    def _generate(self, prompt: str, fallback: str) -> str:
-        if self.model is None:
-            return fallback
+    def _generate(self, prompt: str) -> str:
+        if not self.use_llm:
+            raise SummaryGenerationError("LLM summary generation is required, but no generate_reply model is available.")
         messages = [
             {"role": "system", "content": "You are a precise memory summarizer. Output only the requested summary."},
             {"role": "user", "content": prompt},
@@ -174,10 +164,9 @@ class MemoryBankSummarizer:
                 messages,
                 GenerationConfig(max_new_tokens=self.max_new_tokens, temperature=0.1, top_p=0.9),
             )
-        except Exception:
-            return fallback
-        text = str(text).strip()
-        return text or fallback
+        except Exception as exc:
+            raise SummaryGenerationError(f"LLM summary generation failed: {exc}") from exc
+        return str(text).strip()
 
     def _parse_json_object(self, text: str) -> dict:
         candidate = text.strip()
@@ -192,37 +181,6 @@ class MemoryBankSummarizer:
         except json.JSONDecodeError:
             return {}
         return parsed if isinstance(parsed, dict) else {}
-
-    def _fallback_archival_memory(self, user_text: str) -> dict:
-        text = user_text.strip()
-        lower = text.lower()
-        stable_triggers = (
-            "我叫",
-            "我是",
-            "我在",
-            "工作",
-            "喜欢",
-            "不喜欢",
-            "焦虑",
-            "压力",
-            "my name is",
-            "i am ",
-            "i'm ",
-            "i work",
-            "like",
-            "dislike",
-            "prefer",
-            "stress",
-            "anxious",
-        )
-        should_archive = len(text) >= 12 or any(token in lower for token in stable_triggers)
-        return {
-            "should_archive": should_archive,
-            "topic": "general",
-            "summary": f"用户提到：{text}",
-            "importance": 0.7,
-            "confidence": 0.7,
-        }
 
     def _clamp_float(self, value: object, fallback: float) -> float:
         try:
@@ -240,54 +198,6 @@ class MemoryBankSummarizer:
         except ValueError:
             return default
         return max(minimum, value)
-
-    def _fallback_event_summary(self, dialogue: str) -> str:
-        lines = [line.strip() for line in dialogue.splitlines() if line.strip()]
-        user_lines = [line for line in lines if line.lower().startswith("user:") or line.startswith("用户:")]
-        selected = user_lines or lines
-        return self._dedupe_lines("\n".join(selected), limit=6)
-
-    def _fallback_personality(self, dialogue: str) -> str:
-        if self._is_profile_noise(dialogue):
-            return ""
-        lower = dialogue.lower()
-        traits: list[str] = []
-        if any(token in lower for token in ("不喜欢", "dislike", "don't like", "讨厌")):
-            traits.append("stable_preference: 用户表达了明确的负向偏好或互动边界。")
-        if any(token in lower for token in ("喜欢", "like", "prefer", "偏好")):
-            traits.append("stable_preference: 用户表达了个人偏好。")
-        if any(token in lower for token in ("焦虑", "压力", "stress", "anxious", "sad", "难过")):
-            traits.append("temporary_state: 用户近期可能存在压力或情绪波动。")
-        if any(token in lower for token in ("工作", "work", "job")):
-            traits.append("stable_context: 用户谈到了工作或职业背景。")
-        identity_excerpt = self._extract_identity_excerpt(dialogue)
-        if identity_excerpt:
-            traits.append(f"stable_identity: 用户提供了身份相关信息：{identity_excerpt}")
-        if not traits:
-            return ""
-        return "\n".join(f"- {item}" for item in traits)
-
-    def _extract_identity_excerpt(self, dialogue: str) -> str:
-        for raw in dialogue.splitlines():
-            line = raw.strip()
-            if line.lower().startswith("user:"):
-                line = line[5:].strip()
-            elif line.startswith("用户:"):
-                line = line[3:].strip()
-            lower = line.lower()
-            if any(token in lower for token in ("我叫", "我是", "my name is", "i am ", "i'm ")):
-                return line[:120]
-        return ""
-
-    def _fallback_global_portrait(self, daily_personalities: Sequence[str]) -> str:
-        stable_lines: list[str] = []
-        for item in daily_personalities:
-            for raw in item.splitlines():
-                line = self._normalize_global_portrait_line(raw)
-                if not line or self._is_global_portrait_noise(line):
-                    continue
-                stable_lines.append(line)
-        return self._dedupe_lines("\n".join(stable_lines), limit=8)
 
     def _filter_daily_personality_text(self, text: str) -> str:
         lines: list[str] = []

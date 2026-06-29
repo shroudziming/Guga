@@ -11,6 +11,23 @@ from guga.memory.summarizer import MemoryBankSummarizer
 from guga.memory.time_utils import extract_semantic_time
 
 
+class SummaryModel:
+    def generate_reply(self, messages, gen):
+        _ = gen
+        prompt = messages[-1]["content"]
+        if "Extract one long-term memory candidate" in prompt:
+            return (
+                '{"should_archive": true, "topic": "schedule", '
+                '"summary": "用户在2026年6月20日要和导师见面", '
+                '"importance": 0.8, "confidence": 0.9}'
+            )
+        if "用户画像候选提取器" in prompt:
+            return ""
+        if "用户画像整理器" in prompt:
+            return ""
+        return "- 用户在2026年6月20日要和导师见面。"
+
+
 class MemoryTimeUtilsTest(unittest.TestCase):
     def test_extract_semantic_time_uses_reference_time_for_relative_weekday(self) -> None:
         result = extract_semantic_time("我下周三要和导师见面", reference_time="2026-06-12T17:09:37+08:00")
@@ -24,7 +41,7 @@ class MemoryTimeUtilsTest(unittest.TestCase):
     def test_archival_memory_keeps_transaction_time_and_semantic_valid_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, enable_semantic=False)
+            manager = MemoryManager(memory_root=memory_root, model=SummaryModel(), enable_semantic=False)
 
             manager.record_user_message("sess_time", "真实测试：我在2026年6月20日要和导师见面，请你记住。")
             manager.record_assistant_message("sess_time", "记住了")
@@ -44,7 +61,7 @@ class MemoryTimeUtilsTest(unittest.TestCase):
                 day="2026-06-12",
                 dialogue="user: 我在2026年6月20日要和导师见面",
                 source_message_ids=["msg_time"],
-                summarizer=MemoryBankSummarizer(),
+                summarizer=MemoryBankSummarizer(model=SummaryModel()),
             )
 
             self.assertEqual(payload["day"], "2026-06-12")

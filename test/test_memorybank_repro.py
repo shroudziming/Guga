@@ -11,6 +11,55 @@ from guga.memory.forgetting import retention_score
 from guga.memory.manager import MemoryManager
 
 
+class SummaryModel:
+    def generate_reply(self, messages, gen):
+        _ = gen
+        prompt = messages[-1]["content"]
+        if "Extract one long-term memory candidate" in prompt:
+            return json.dumps(
+                {
+                    "should_archive": True,
+                    "topic": "profile",
+                    "summary": "用户提到深圳工作和不喜欢说教式安慰",
+                    "importance": 0.8,
+                    "confidence": 0.9,
+                },
+                ensure_ascii=False,
+            )
+        if "用户画像候选提取器" in prompt:
+            if "叔本明" in prompt:
+                return "- stable_identity: 用户自称叔本明。"
+            return "\n".join(
+                [
+                    "- stable_context: 用户谈到了工作或职业背景。",
+                    "- stable_preference: 用户表达了明确的负向偏好或互动边界。",
+                ]
+            )
+        if "用户画像整理器" in prompt:
+            if "叔本明" in prompt:
+                return "- 用户自称叔本明。"
+            return "\n".join(
+                [
+                    "- 用户谈到了工作或职业背景。",
+                    "- 用户表达了明确的负向偏好或互动边界。",
+                ]
+            )
+        if "Summarize the events" in prompt:
+            lines = []
+            if "深圳工作" in prompt or "深圳" in prompt:
+                lines.append("- 用户提到深圳工作。")
+            if "不喜欢说教式安慰" in prompt:
+                lines.append("- 用户不喜欢说教式安慰。")
+            if "我是叔本明" in prompt:
+                lines.append("- 用户说我是叔本明。")
+            if "我是谁" in prompt:
+                lines.append("- 用户询问我是谁。")
+            return "\n".join(lines) or "- LLM generated summary"
+        if "global event summary" in prompt:
+            return prompt.split("summary.\n\n", 1)[-1].strip() or "- LLM generated summary"
+        return "- LLM generated summary"
+
+
 class MemoryBankReproTest(unittest.TestCase):
     def test_finalize_turn_uses_llm_archival_extraction_when_model_available(self) -> None:
         class FakeModel:
@@ -209,7 +258,7 @@ class MemoryBankReproTest(unittest.TestCase):
     def test_finalize_turn_writes_memorybank_layers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, enable_semantic=False, top_k=4)
+            manager = MemoryManager(memory_root=memory_root, model=SummaryModel(), enable_semantic=False, top_k=4)
             manager.record_user_message("sess_layers", "我叫小明，我在深圳工作，也不喜欢说教式安慰")
             manager.record_assistant_message("sess_layers", "记住了")
             manager.finalize_turn("sess_layers")
@@ -257,7 +306,7 @@ class MemoryBankReproTest(unittest.TestCase):
     def test_daily_summary_aggregates_sessions_from_same_day(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, enable_semantic=False, top_k=4)
+            manager = MemoryManager(memory_root=memory_root, model=SummaryModel(), enable_semantic=False, top_k=4)
             manager.record_user_message("sess_a", "我是叔本明")
             manager.record_assistant_message("sess_a", "记住了")
             manager.finalize_turn("sess_a")

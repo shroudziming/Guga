@@ -16,6 +16,26 @@ def _append_jsonl(path: Path, payload: dict) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+class PromptSummaryModel:
+    def generate_reply(self, messages, gen):
+        _ = gen
+        prompt = messages[-1]["content"]
+        if "用户画像候选提取器" in prompt:
+            if "你刚才没有输出" in prompt:
+                return ""
+            return "- stable_interest: 用户对蝴蝶刀感兴趣。"
+        if "用户画像整理器" in prompt:
+            return "\n".join(
+                [
+                    "- 用户对蝴蝶刀有练习兴趣。",
+                    "- temporary_state: 用户近期可能存在压力或情绪波动。",
+                ]
+            )
+        if "Extract one long-term memory candidate" in prompt:
+            return '{"should_archive": true, "topic": "general", "summary": "LLM summary", "importance": 0.7, "confidence": 0.8}'
+        return "- LLM generated summary"
+
+
 class MemoryQualityPlanTest(unittest.TestCase):
     def test_current_turn_is_weakened_and_not_reinforced(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -308,7 +328,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
             self.assertIn("叔本明", context.user_portrait)
 
     def test_portrait_summary_ignores_one_off_bug_feedback(self) -> None:
-        summarizer = MemoryBankSummarizer()
+        summarizer = MemoryBankSummarizer(model=PromptSummaryModel())
 
         daily = summarizer.summarize_daily_personality("user: 你刚才没有输出，有 bug")
         global_portrait = summarizer.summarize_global_portrait(
@@ -325,7 +345,21 @@ class MemoryQualityPlanTest(unittest.TestCase):
         self.assertIn("蝴蝶刀", global_portrait)
 
     def test_portrait_summary_strips_evidence_language_and_labels(self) -> None:
-        summarizer = MemoryBankSummarizer()
+        class GlobalDirtyModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return "\n".join(
+                    [
+                        "- **Stable Traits:**",
+                        "- Named 叔本明 (Shu Benming), self-referred.",
+                        "- stable_identity: 用户此前提到自己叫叔本明，可能是个化名。",
+                        "- stable_interest: 用户此前提到想练蝴蝶刀。",
+                        "- temporary: 用户在2026年7月5日要整理周报。",
+                        "- 对即将与导师见面感到期待和些许不确定。",
+                    ]
+                )
+
+        summarizer = MemoryBankSummarizer(model=GlobalDirtyModel())
 
         global_portrait = summarizer.summarize_global_portrait(
             [
@@ -413,6 +447,44 @@ class MemoryQualityPlanTest(unittest.TestCase):
         result = summarizer.summarize_daily_personality("user: 我是叔本明，我想练蝴蝶刀。")
 
         self.assertEqual(result, "")
+
+    def test_summary_requires_llm_model(self) -> None:
+        summarizer = MemoryBankSummarizer()
+
+        with self.assertRaises(RuntimeError):
+            summarizer.summarize_daily_events("user: hello")
+
+    def test_summary_raises_when_llm_api_fails(self) -> None:
+        class FailingModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                raise RuntimeError("api unavailable")
+
+        summarizer = MemoryBankSummarizer(model=FailingModel())
+
+        with self.assertRaises(RuntimeError):
+            summarizer.summarize_daily_personality("user: 我喜欢科幻小说。")
+
+    def test_summary_empty_llm_output_does_not_fallback(self) -> None:
+        class EmptyModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return "   "
+
+        summarizer = MemoryBankSummarizer(model=EmptyModel())
+
+        self.assertEqual(summarizer.summarize_global_events(["- user: hello"]), "")
+
+    def test_archival_extraction_requires_parseable_llm_json(self) -> None:
+        class InvalidJsonModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return "not json"
+
+        summarizer = MemoryBankSummarizer(model=InvalidJsonModel())
+
+        with self.assertRaises(RuntimeError):
+            summarizer.extract_archival_memory("我叫小明")
 
 
 if __name__ == "__main__":

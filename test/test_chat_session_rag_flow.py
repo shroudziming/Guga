@@ -17,6 +17,19 @@ class FakeChatModel:
 
     def generate_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> str:
         _ = gen
+        prompt = messages[-1]["content"]
+        if "Extract one long-term memory candidate" in prompt:
+            return (
+                '{"should_archive": true, "topic": "work", '
+                '"summary": "用户在杭州工作，做后端开发", '
+                '"importance": 0.8, "confidence": 0.9}'
+            )
+        if "用户画像候选提取器" in prompt:
+            return "- stable_context: 用户在杭州工作，做后端开发。"
+        if "用户画像整理器" in prompt:
+            return "- 用户在杭州工作，做后端开发。"
+        if "Summarize" in prompt or "summary" in prompt:
+            return "- 用户在杭州工作，做后端开发。"
         system_prompt = messages[0]["content"]
         if self.capture_prompt is not None:
             self.capture_prompt(system_prompt)
@@ -30,12 +43,12 @@ class ChatSessionRagFlowTest(unittest.TestCase):
             logs: list[str] = []
             prompts: list[str] = []
 
-            manager = MemoryManager(memory_root=memory_root, debug=True, debug_sink=logs.append, top_k=2)
+            model = FakeChatModel(capture_prompt=prompts.append)
+            manager = MemoryManager(memory_root=memory_root, model=model, debug=True, debug_sink=logs.append, top_k=2)
             manager.record_user_message("seed_session", "我在杭州工作，做后端开发")
             manager.record_assistant_message("seed_session", "收到")
             manager.finalize_turn("seed_session")
 
-            model = FakeChatModel(capture_prompt=prompts.append)
             session = ChatSession(
                 model=model,
                 system_prompt="你是陪伴助手",
