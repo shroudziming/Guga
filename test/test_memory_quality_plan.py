@@ -431,6 +431,28 @@ class MemoryQualityPlanTest(unittest.TestCase):
         self.assertNotIn("2026年7月5日", result)
         self.assertNotIn("此前提到", result)
 
+    def test_daily_personality_filters_generic_schedule_without_hardcoded_examples(self) -> None:
+        class ScheduleModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return "\n".join(
+                    [
+                        "- stable_context: 用户明天下午要去医院复查。",
+                        "- stable_context: 用户下周需要参加小组讨论。",
+                        "- stable_preference: 用户偏好提前规划学习节奏。",
+                        "- stable_interest: 用户对科幻小说感兴趣。",
+                    ]
+                )
+
+        summarizer = MemoryBankSummarizer(model=ScheduleModel(), use_llm=True)
+
+        result = summarizer.summarize_daily_personality("user: 我明天下午要去医院复查，最近也在读科幻小说。")
+
+        self.assertNotIn("医院复查", result)
+        self.assertNotIn("小组讨论", result)
+        self.assertIn("规划学习节奏", result)
+        self.assertIn("科幻小说", result)
+
     def test_daily_personality_does_not_infer_labels_from_keywords(self) -> None:
         class UnlabeledModel:
             def generate_reply(self, messages, gen):

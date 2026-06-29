@@ -233,15 +233,55 @@ class MemoryBankSummarizer:
         payload = re.sub(r"^(?:stable|temporary)[_\-\s]*(?:identity|interest|preference|context|goal|state|trait|observation)?[:：]\s*", "", text, flags=re.IGNORECASE)
         if self._is_profile_noise(payload):
             return True
-        if re.search(r"\d{4}(?:[-/.]\d{1,2}[-/.]\d{1,2}|年\d{1,2}月\d{1,2}(?:日|号)?)", payload):
+        if self._is_schedule_or_time_fact(payload):
             return True
         generic_terms = ("用户表达了个人偏好", "表达了个人偏好", "用户表达了偏好", "用户有偏好")
         if any(token in payload for token in generic_terms):
             return True
-        schedule_terms = ("整理周报", "提交项目", "和导师开会", "要做什么", "deadline", "日程", "安排")
-        if any(token in payload.lower() for token in schedule_terms):
-            return True
         return False
+
+    def _is_schedule_or_time_fact(self, text: str) -> bool:
+        lower = text.lower()
+        absolute_date = re.search(
+            r"(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}(?:日|号)?|\d{1,2}月\d{1,2}(?:日|号)?)",
+            text,
+        )
+        if absolute_date:
+            return True
+
+        relative_time = re.search(
+            r"(?:今天|明天|后天|昨天|前天|今晚|明早|明晚|今早|本周|这周|下周|上周|本月|下月|"
+            r"周[一二三四五六日天]|星期[一二三四五六日天]|上午|下午|晚上|早上|中午|凌晨|"
+            r"\b(?:today|tomorrow|yesterday|tonight|next week|last week|this week)\b)",
+            lower,
+        )
+        if not relative_time:
+            return False
+
+        schedule_cues = (
+            "要",
+            "需要",
+            "打算",
+            "计划",
+            "准备",
+            "将",
+            "会去",
+            "去",
+            "参加",
+            "开会",
+            "见面",
+            "提交",
+            "完成",
+            "复查",
+            "考试",
+            "面试",
+            "deadline",
+            "due",
+            "appointment",
+            "meeting",
+            "submit",
+        )
+        return any(cue in lower for cue in schedule_cues)
 
     def _filter_global_portrait_text(self, text: str) -> str:
         lines = []
