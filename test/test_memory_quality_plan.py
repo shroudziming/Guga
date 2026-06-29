@@ -324,6 +324,79 @@ class MemoryQualityPlanTest(unittest.TestCase):
         self.assertNotIn("temporary", global_portrait.lower())
         self.assertIn("蝴蝶刀", global_portrait)
 
+    def test_portrait_summary_strips_evidence_language_and_labels(self) -> None:
+        summarizer = MemoryBankSummarizer()
+
+        global_portrait = summarizer.summarize_global_portrait(
+            [
+                "- **Stable Traits:**",
+                "- Named 叔本明 (Shu Benming), self-referred.",
+                "- stable_identity: 用户此前提到自己叫叔本明，可能是个化名。",
+                "- stable_interest: 用户此前提到想练蝴蝶刀。",
+                "- temporary: 用户在2026年7月5日要整理周报。",
+                "- 对即将与导师见面感到期待和些许不确定。",
+            ]
+        )
+
+        self.assertIn("叔本明", global_portrait)
+        self.assertIn("蝴蝶刀", global_portrait)
+        self.assertNotIn("Stable Traits", global_portrait)
+        self.assertNotIn("Named", global_portrait)
+        self.assertNotIn("Has an interest", global_portrait)
+        self.assertNotIn("stable_identity", global_portrait)
+        self.assertNotIn("stable_interest", global_portrait)
+        self.assertNotIn("temporary", global_portrait)
+        self.assertNotIn("此前提到", global_portrait)
+        self.assertNotIn("可能", global_portrait)
+        self.assertNotIn("化名", global_portrait)
+        self.assertNotIn("2026年7月5日", global_portrait)
+        self.assertNotIn("即将", global_portrait)
+
+    def test_daily_personality_prompt_uses_user_messages_only(self) -> None:
+        class CaptureModel:
+            def __init__(self) -> None:
+                self.prompt = ""
+
+            def generate_reply(self, messages, gen):
+                self.prompt = messages[-1]["content"]
+                return "- stable_interest: 用户对蝴蝶刀感兴趣。"
+
+        model = CaptureModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True)
+
+        result = summarizer.summarize_daily_personality(
+            "user: 我最近想练蝴蝶刀。\nassistant: 你看起来很有毅力，也喜欢冒险。"
+        )
+
+        self.assertIn("只基于 user messages", model.prompt)
+        self.assertIn("不要从 assistant 的复述", model.prompt)
+        self.assertIn("时间事实", model.prompt)
+        self.assertIn("蝴蝶刀", result)
+
+    def test_daily_personality_filters_dirty_llm_output(self) -> None:
+        class DirtyModel:
+            def generate_reply(self, messages, gen):
+                return "\n".join(
+                    [
+                        "- stable_preference: 用户表达了个人偏好。",
+                        "- stable_trait: 用户反馈你没有输出，有 bug。",
+                        "- stable_goal: 用户在2026年7月5日整理周报。",
+                        "- stable_interest: 用户此前提到想练蝴蝶刀。",
+                        "- temporary_state: 用户近期有点焦虑。",
+                    ]
+                )
+
+        summarizer = MemoryBankSummarizer(model=DirtyModel(), use_llm=True)
+
+        result = summarizer.summarize_daily_personality("user: 我想练蝴蝶刀，最近有点焦虑。")
+
+        self.assertIn("蝴蝶刀", result)
+        self.assertIn("焦虑", result)
+        self.assertNotIn("表达了个人偏好", result)
+        self.assertNotIn("bug", result.lower())
+        self.assertNotIn("2026年7月5日", result)
+        self.assertNotIn("此前提到", result)
+
 
 if __name__ == "__main__":
     unittest.main()
