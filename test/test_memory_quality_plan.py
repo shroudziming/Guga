@@ -397,6 +397,23 @@ class MemoryQualityPlanTest(unittest.TestCase):
         self.assertNotIn("2026年7月5日", result)
         self.assertNotIn("此前提到", result)
 
+    def test_daily_personality_does_not_infer_labels_from_keywords(self) -> None:
+        class UnlabeledModel:
+            def generate_reply(self, messages, gen):
+                return "\n".join(
+                    [
+                        "- 用户自称叔本明。",
+                        "- 用户想练蝴蝶刀。",
+                        "- 用户有点焦虑。",
+                    ]
+                )
+
+        summarizer = MemoryBankSummarizer(model=UnlabeledModel(), use_llm=True)
+
+        result = summarizer.summarize_daily_personality("user: 我是叔本明，我想练蝴蝶刀。")
+
+        self.assertEqual(result, "")
+
 
 if __name__ == "__main__":
     unittest.main()
