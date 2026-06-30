@@ -349,22 +349,12 @@ class MemoryManager:
         message_id = self.session_store.append_message(session_id=session_id, role="user", content=text, source=source)
         turn_payload = self._build_session_memory(session_id=session_id, message_id=message_id, text=text)
         self._append_jsonl(self.session_memory_file, turn_payload)
-        fact_payload = self.timeline_fact_store.append_from_turn(
-            user_text=text,
-            session_id=session_id,
-            source_message_ids=[message_id],
-            created_at=str(turn_payload.get("created_at", "")),
-        )
         with self._turn_state_lock:
             state = self._turn_state.setdefault(session_id, {})
             state["user_text"] = text
             state["user_message_id"] = message_id
             state["session_memory_id"] = turn_payload["id"]
-            if fact_payload:
-                state["timeline_fact_id"] = str(fact_payload.get("id", ""))
         self._debug(session_id, f"ingest role=user message_id={message_id}")
-        if fact_payload:
-            self._debug(session_id, f"timeline_fact_added fact_id={fact_payload.get('id', '')} day={fact_payload.get('semantic_day', '')}")
         return message_id
 
     def record_assistant_message(self, session_id: str, text: str, source: str = "chat") -> str:
@@ -433,9 +423,14 @@ class MemoryManager:
         user_text = state.get("user_text", "").strip()
         assistant_text = state.get("assistant_text", "").strip()
         session_memory_payload = self._load_memory_by_id(self.session_memory_file, state.get("session_memory_id", ""))
-        memory_candidate = self.summarizer.extract_archival_memory(user_text=user_text, assistant_text=assistant_text) if user_text else {}
+        route_candidates = self.summarizer.route_memory_candidates(user_text=user_text, assistant_text=assistant_text) if user_text else []
+        if route_candidates:
+            targets = [str(item.get("target", "")) for item in route_candidates if str(item.get("target", ""))]
+            discarded = [str(item.get("label", "")) for item in route_candidates if item.get("target") == "discard"]
+            self._debug(session_id, f"memory_route targets={targets} discarded={discarded}")
+        memory_candidate = self.summarizer.extract_archival_memory_from_routes(route_candidates) if user_text else {}
         should_archive = bool(memory_candidate.get("should_archive")) if memory_candidate else False
-        if user_text and (should_archive or self._should_archive(user_text)):
+        if user_text and should_archive:
             now = now_beijing_iso()
             payload = apply_temporal_fields(
                 {
@@ -476,7 +471,17 @@ class MemoryManager:
             elapsed_ms = int((perf_counter() - started) * 1000)
             self._debug(session_id, f"writeback status=no_archival_write latency_ms={elapsed_ms}")
 
-        fact_payload = self._load_memory_by_id(self.timeline_fact_file, state.get("timeline_fact_id", ""))
+        fact_payload = {}
+        if user_text:
+            fact_payload = self.timeline_fact_store.append_from_route_items(
+                user_text=user_text,
+                route_items=route_candidates,
+                session_id=session_id,
+                source_message_ids=[state.get("user_message_id", "")],
+                created_at=str(session_memory_payload.get("created_at", "")),
+            )
+            if fact_payload:
+                self._debug(session_id, f"timeline_fact_added fact_id={fact_payload.get('id', '')} day={fact_payload.get('semantic_day', '')}")
         if fact_payload and self.rag_pipeline is not None:
             try:
                 self.rag_pipeline.add_memory_record(fact_payload)
@@ -776,13 +781,6 @@ class MemoryManager:
             )
         rows.sort(key=lambda item: item.score, reverse=True)
         return rows[: self.document_top_k]
-
-    def _should_archive(self, user_text: str) -> bool:
-        """Heuristic writeback policy deciding whether user text becomes memory."""
-        if len(user_text) >= 12:
-            return True
-        trigger_keywords = ["喜欢", "不喜欢", "工作", "焦虑", "压力", "我是", "我叫"]
-        return any(keyword in user_text for keyword in trigger_keywords)
 
     def _load_archival_records(self) -> list[dict]:
         """Load and normalize active archival memory records from JSONL file."""

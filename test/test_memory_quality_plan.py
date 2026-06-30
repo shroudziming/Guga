@@ -20,10 +20,13 @@ class PromptSummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
-        if "用户画像候选提取器" in prompt:
+        if "Memory route classifier" in prompt:
             if "你刚才没有输出" in prompt:
-                return ""
-            return "- stable_interest: 用户对蝴蝶刀感兴趣。"
+                return json.dumps([{"target": "discard", "label": "system_feedback", "content": "", "confidence": 0.9}], ensure_ascii=False)
+            return json.dumps(
+                [{"target": "personality_insight", "label": "stable_interest", "content": "用户对蝴蝶刀感兴趣。"}],
+                ensure_ascii=False,
+            )
         if "用户画像整理器" in prompt:
             return "\n".join(
                 [
@@ -393,7 +396,10 @@ class MemoryQualityPlanTest(unittest.TestCase):
 
             def generate_reply(self, messages, gen):
                 self.prompt = messages[-1]["content"]
-                return "- stable_interest: 用户对蝴蝶刀感兴趣。"
+                return json.dumps(
+                    [{"target": "personality_insight", "label": "stable_interest", "content": "用户对蝴蝶刀感兴趣。"}],
+                    ensure_ascii=False,
+                )
 
         model = CaptureModel()
         summarizer = MemoryBankSummarizer(model=model, use_llm=True)
@@ -402,22 +408,24 @@ class MemoryQualityPlanTest(unittest.TestCase):
             "user: 我最近想练蝴蝶刀。\nassistant: 你看起来很有毅力，也喜欢冒险。"
         )
 
-        self.assertIn("只基于 user messages", model.prompt)
-        self.assertIn("不要从 assistant 的复述", model.prompt)
-        self.assertIn("时间事实", model.prompt)
+        self.assertIn("Memory route classifier", model.prompt)
+        self.assertIn("Do not route assistant guesses", model.prompt)
+        self.assertIn("timeline_fact", model.prompt)
         self.assertIn("蝴蝶刀", result)
 
     def test_daily_personality_filters_dirty_llm_output(self) -> None:
         class DirtyModel:
             def generate_reply(self, messages, gen):
-                return "\n".join(
+                _ = messages, gen
+                return json.dumps(
                     [
-                        "- stable_preference: 用户表达了个人偏好。",
-                        "- stable_trait: 用户反馈你没有输出，有 bug。",
-                        "- stable_goal: 用户在2026年7月5日整理周报。",
-                        "- stable_interest: 用户此前提到想练蝴蝶刀。",
-                        "- temporary_state: 用户近期有点焦虑。",
-                    ]
+                        {"target": "discard", "label": "one_off", "content": "用户表达了个人偏好。"},
+                        {"target": "discard", "label": "system_feedback", "content": "用户反馈你没有输出，有 bug。"},
+                        {"target": "timeline_fact", "label": "time_bound_plan", "content": "用户在2026年7月5日整理周报。"},
+                        {"target": "personality_insight", "label": "stable_interest", "content": "用户此前提到想练蝴蝶刀。"},
+                        {"target": "personality_insight", "label": "temporary_state", "content": "用户近期有点焦虑。"},
+                    ],
+                    ensure_ascii=False,
                 )
 
         summarizer = MemoryBankSummarizer(model=DirtyModel(), use_llm=True)
@@ -435,13 +443,14 @@ class MemoryQualityPlanTest(unittest.TestCase):
         class ScheduleModel:
             def generate_reply(self, messages, gen):
                 _ = messages, gen
-                return "\n".join(
+                return json.dumps(
                     [
-                        "- stable_context: 用户明天下午要去医院复查。",
-                        "- stable_context: 用户下周需要参加小组讨论。",
-                        "- stable_preference: 用户偏好提前规划学习节奏。",
-                        "- stable_interest: 用户对科幻小说感兴趣。",
-                    ]
+                        {"target": "timeline_fact", "label": "time_bound_plan", "content": "用户明天下午要去医院复查。"},
+                        {"target": "timeline_fact", "label": "time_bound_plan", "content": "用户下周需要参加小组讨论。"},
+                        {"target": "personality_insight", "label": "stable_preference", "content": "用户偏好提前规划学习节奏。"},
+                        {"target": "personality_insight", "label": "stable_interest", "content": "用户对科幻小说感兴趣。"},
+                    ],
+                    ensure_ascii=False,
                 )
 
         summarizer = MemoryBankSummarizer(model=ScheduleModel(), use_llm=True)
@@ -453,15 +462,124 @@ class MemoryQualityPlanTest(unittest.TestCase):
         self.assertIn("规划学习节奏", result)
         self.assertIn("科幻小说", result)
 
+    def test_daily_personality_uses_llm_route_targets(self) -> None:
+        class RouteModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return json.dumps(
+                    [
+                        {
+                            "target": "timeline_fact",
+                            "label": "time_bound_plan",
+                            "content": "用户明天下午要去医院复查。",
+                            "confidence": 0.9,
+                        },
+                        {
+                            "target": "personality_insight",
+                            "label": "stable_preference",
+                            "content": "用户偏好提前规划学习节奏。",
+                            "confidence": 0.8,
+                        },
+                        {
+                            "target": "discard",
+                            "label": "system_feedback",
+                            "content": "用户反馈助手没有输出。",
+                            "confidence": 0.9,
+                        },
+                    ],
+                    ensure_ascii=False,
+                )
+
+        summarizer = MemoryBankSummarizer(model=RouteModel(), use_llm=True)
+
+        result = summarizer.summarize_daily_personality("user: 我明天下午要去医院复查，也喜欢提前规划学习。")
+
+        self.assertIn("stable_preference", result)
+        self.assertIn("规划学习节奏", result)
+        self.assertNotIn("医院复查", result)
+        self.assertNotIn("没有输出", result)
+
+    def test_memory_route_discards_invalid_target_and_label(self) -> None:
+        class InvalidRouteModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return json.dumps(
+                    [
+                        {"target": "unknown", "label": "stable_interest", "content": "bad target"},
+                        {"target": "personality_insight", "label": "stable_trait", "content": "bad label"},
+                        {
+                            "target": "personality_insight",
+                            "label": "stable_interest",
+                            "content": "用户对科幻小说感兴趣。",
+                        },
+                    ],
+                    ensure_ascii=False,
+                )
+
+        summarizer = MemoryBankSummarizer(model=InvalidRouteModel(), use_llm=True)
+
+        routed = summarizer.route_memory_candidates(user_text="我喜欢科幻小说。")
+
+        self.assertEqual(len(routed), 1)
+        self.assertEqual(routed[0]["target"], "personality_insight")
+        self.assertEqual(routed[0]["label"], "stable_interest")
+
+    def test_memory_route_retries_empty_llm_output_without_fallback(self) -> None:
+        class EmptyThenValidRouteModel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                self.calls += 1
+                if self.calls == 1:
+                    return ""
+                return json.dumps(
+                    [{"target": "personality_insight", "label": "stable_interest", "content": "用户对科幻小说感兴趣。"}],
+                    ensure_ascii=False,
+                )
+
+        model = EmptyThenValidRouteModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True)
+
+        routed = summarizer.route_memory_candidates(user_text="我最近在读科幻小说《沙丘》。")
+
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(routed[0]["target"], "personality_insight")
+
+    def test_archival_writeback_respects_llm_discard_route_without_keyword_fallback(self) -> None:
+        class DiscardRouteModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                prompt = messages[-1]["content"]
+                if "用户画像候选提取器" in prompt or "用户画像整理器" in prompt:
+                    return ""
+                return json.dumps(
+                    [{"target": "discard", "label": "one_off", "content": "", "confidence": 0.9}],
+                    ensure_ascii=False,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_root = Path(tmp)
+            manager = MemoryManager(memory_root=memory_root, model=DiscardRouteModel(), enable_semantic=False)
+            manager.record_user_message("sess_discard", "我喜欢猫")
+            manager.record_assistant_message("sess_discard", "知道了")
+
+            manager.finalize_turn("sess_discard")
+
+            self.assertFalse((memory_root / "archival_memory.jsonl").exists())
+
     def test_daily_personality_does_not_infer_labels_from_keywords(self) -> None:
         class UnlabeledModel:
             def generate_reply(self, messages, gen):
-                return "\n".join(
+                _ = messages, gen
+                return json.dumps(
                     [
-                        "- 用户自称叔本明。",
-                        "- 用户想练蝴蝶刀。",
-                        "- 用户有点焦虑。",
-                    ]
+                        {"target": "personality_insight", "label": "stable_trait", "content": "用户自称叔本明。"},
+                        {"target": "unknown", "label": "stable_interest", "content": "用户想练蝴蝶刀。"},
+                        {"target": "discard", "label": "one_off", "content": "用户有点焦虑。"},
+                    ],
+                    ensure_ascii=False,
                 )
 
         summarizer = MemoryBankSummarizer(model=UnlabeledModel(), use_llm=True)

@@ -15,25 +15,29 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
-        if "Extract one long-term memory candidate" in prompt:
-            return json.dumps(
-                {
-                    "should_archive": True,
-                    "topic": "profile",
-                    "summary": "用户提到深圳工作和不喜欢说教式安慰",
-                    "importance": 0.8,
-                    "confidence": 0.9,
-                },
-                ensure_ascii=False,
-            )
-        if "用户画像候选提取器" in prompt:
+        if "Memory route classifier" in prompt:
             if "叔本明" in prompt:
-                return "- stable_identity: 用户自称叔本明。"
-            return "\n".join(
+                return json.dumps(
+                    [
+                        {"target": "archival_memory", "label": "stable_identity", "content": "用户自称叔本明。", "topic": "identity"},
+                        {"target": "personality_insight", "label": "stable_identity", "content": "用户自称叔本明。"},
+                    ],
+                    ensure_ascii=False,
+                )
+            return json.dumps(
                 [
-                    "- stable_context: 用户谈到了工作或职业背景。",
-                    "- stable_preference: 用户表达了明确的负向偏好或互动边界。",
-                ]
+                    {
+                        "target": "archival_memory",
+                        "label": "stable_context",
+                        "content": "用户提到深圳工作和不喜欢说教式安慰",
+                        "topic": "profile",
+                        "importance": 0.8,
+                        "confidence": 0.9,
+                    },
+                    {"target": "personality_insight", "label": "stable_context", "content": "用户谈到了工作或职业背景。"},
+                    {"target": "personality_insight", "label": "stable_preference", "content": "用户表达了明确的负向偏好或互动边界。"},
+                ],
+                ensure_ascii=False,
             )
         if "用户画像整理器" in prompt:
             if "叔本明" in prompt:
@@ -65,15 +69,18 @@ class MemoryBankReproTest(unittest.TestCase):
         class FakeModel:
             def generate_reply(self, messages, gen):
                 prompt = messages[-1]["content"]
-                if "Extract one long-term memory candidate" in prompt:
+                if "Memory route classifier" in prompt:
                     return json.dumps(
-                        {
-                            "should_archive": True,
-                            "topic": "work",
-                            "summary": "The user works as a backend engineer in Hangzhou.",
-                            "importance": 0.9,
-                            "confidence": 0.8,
-                        }
+                        [
+                            {
+                                "target": "archival_memory",
+                                "label": "stable_context",
+                                "content": "The user works as a backend engineer in Hangzhou.",
+                                "topic": "work",
+                                "importance": 0.9,
+                                "confidence": 0.8,
+                            }
+                        ]
                     )
                 return "- LLM generated summary"
 

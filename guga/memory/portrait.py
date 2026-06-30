@@ -81,27 +81,9 @@ class UserPortraitStore:
         return profile
 
     def update_from_user_text(self, user_text: str) -> dict:
-        """Backward-compatible rule update; prefer refresh_daily/global methods."""
-        text = user_text.strip()
-        if not text:
-            return self.load()
-
-        profile = self.load()
-        profile.setdefault("schema_version", 2)
-        profile.setdefault("stable_facts", [])
-        profile.setdefault("preferences", [])
-        profile.setdefault("temporary_states", [])
-
-        lower = text.lower()
-        self._maybe_add(profile["stable_facts"], text, ["我叫", "我是", "我在", "工作", "my name is", "i work", "i am ", "i'm "], lower)
-        self._maybe_add(profile["preferences"], text, ["喜欢", "不喜欢", "讨厌", "偏好", "like", "dislike", "prefer"], lower)
-        self._maybe_add(profile["temporary_states"], text, ["焦虑", "压力", "难过", "开心", "最近", "stress", "anxious", "sad", "recently"], lower)
-
-        profile["updated_at"] = now_iso()
-        profile["time_source"] = "transaction_time"
-        profile["portrait_summary"] = self._build_summary(profile)
-        self.save(profile)
-        return profile
+        """Backward-compatible no-op; profile updates must use LLM daily/global refresh."""
+        _ = user_text
+        return self.load()
 
     def save(self, profile: dict) -> None:
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -142,13 +124,6 @@ class UserPortraitStore:
                 rows[index] = payload
                 return
         rows.append(payload)
-
-    def _maybe_add(self, values: list[str], text: str, triggers: list[str], lower_text: str) -> None:
-        if not any(trigger in lower_text for trigger in triggers):
-            return
-        if text not in values:
-            values.append(text)
-        del values[:-8]
 
     def _build_summary(self, profile: dict) -> str:
         parts: list[str] = []

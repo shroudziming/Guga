@@ -13,6 +13,21 @@ class SummaryGenerationError(RuntimeError):
     """Raised when required LLM-backed memory summarization cannot complete."""
 
 
+_ALLOWED_ROUTE_TARGETS = {"personality_insight", "timeline_fact", "archival_memory", "event_summary", "discard"}
+_ALLOWED_ROUTE_LABELS = {
+    "stable_identity",
+    "stable_interest",
+    "stable_preference",
+    "stable_context",
+    "temporary_state",
+    "time_bound_plan",
+    "system_feedback",
+    "one_off",
+    "none",
+}
+_PERSONALITY_LABELS = {"stable_identity", "stable_interest", "stable_preference", "stable_context", "temporary_state"}
+
+
 class MemoryBankSummarizer:
     """Generate MemoryBank daily/global summaries with optional LLM backing."""
 
@@ -28,39 +43,60 @@ class MemoryBankSummarizer:
         self.use_llm = bool(use_llm and model is not None and hasattr(model, "generate_reply"))
 
     def extract_archival_memory(self, user_text: str, assistant_text: str = "") -> dict:
+        return self.extract_archival_memory_from_routes(
+            self.route_memory_candidates(user_text=user_text, assistant_text=assistant_text)
+        )
+
+    def extract_archival_memory_from_routes(self, route_candidates: Sequence[dict]) -> dict:
+        for item in route_candidates:
+            if item.get("target") != "archival_memory":
+                continue
+            summary = str(item.get("content", "")).strip()
+            if not summary:
+                raise SummaryGenerationError("LLM archival memory route omitted required content.")
+            return {
+                "should_archive": True,
+                "topic": str(item.get("topic") or "general").strip()[:64] or "general",
+                "summary": summary[:500],
+                "importance": self._clamp_float(item.get("importance"), 0.7),
+                "confidence": self._clamp_float(item.get("confidence"), 0.7),
+            }
+        return {"should_archive": False, "topic": "general", "summary": "", "importance": 0.0, "confidence": 0.0}
+
+    def route_memory_candidates(self, user_text: str = "", assistant_text: str = "", dialogue: str = "") -> list[dict]:
+        source_text = dialogue.strip() or f"user: {user_text.strip()}\nassistant: {assistant_text.strip()}".strip()
         prompt = (
-            "Extract one long-term memory candidate from this chat turn for a MemoryBank-style AI companion.\n"
-            "Return strict JSON only, without markdown. Schema:\n"
+            "Memory route classifier for a MemoryBank-style AI companion.\n"
+            "Return strict JSON array only, without markdown. Each item schema:\n"
             "{"
-            "\"should_archive\": boolean, "
+            "\"target\": \"personality_insight|timeline_fact|archival_memory|event_summary|discard\", "
+            "\"label\": \"stable_identity|stable_interest|stable_preference|stable_context|temporary_state|time_bound_plan|system_feedback|one_off|none\", "
+            "\"content\": string, "
             "\"topic\": string, "
-            "\"summary\": string, "
             "\"importance\": number, "
-            "\"confidence\": number"
-            "}\n"
-            "Rules: archive stable facts, preferences, recurring goals, work/school/family context, and notable emotional states. "
-            "Do not archive trivial greetings, one-off commands, or unsupported inference. "
-            "Use the same language as the user. Keep summary concise and factual.\n\n"
-            f"User: {user_text}\n"
-            f"Assistant: {assistant_text}"
+            "\"confidence\": number, "
+            "\"reason\": string"
+            "}\n\n"
+            "Target meanings:\n"
+            "- personality_insight: stable identity, durable preference, recurring interest, stable context, or user-stated temporary state.\n"
+            "- timeline_fact: time-bound plan, appointment, deadline, schedule, task, meeting, or dated event.\n"
+            "- archival_memory: durable episodic memory worth recalling, but not a cleaner personality insight or timeline fact.\n"
+            "- event_summary: conversation topic/event summary that should not enter user portrait.\n"
+            "- discard: greetings, one-off questions, assistant echoes, system/model/bug feedback, unsupported inference, or no memory value.\n\n"
+            "Routing rules:\n"
+            "- Choose by meaning, not keywords.\n"
+            "- Do not route assistant guesses or compliments into user memory.\n"
+            "- Route bug feedback, missing output, token limits, model/system feedback, and debug comments to discard with label system_feedback.\n"
+            "- Route dated or relative-time plans to timeline_fact, not personality_insight.\n"
+            "- Use the user's main language for content. Keep content clean, factual, and free of evidence/source wording.\n"
+            "- If nothing is worth storing, return [].\n\n"
+            "Input:\n"
+            f"{source_text}"
         )
         raw = self._generate(prompt)
-        parsed = self._parse_json_object(raw)
-        if not parsed:
-            raise SummaryGenerationError("LLM archival memory extraction returned invalid JSON.")
-
-        should_archive = bool(parsed.get("should_archive", False))
-        summary = str(parsed.get("summary") or "").strip()
-        if should_archive and not summary:
-            raise SummaryGenerationError("LLM archival memory extraction omitted required summary.")
-        topic = str(parsed.get("topic") or "general").strip() or "general"
-        return {
-            "should_archive": should_archive,
-            "topic": topic[:64],
-            "summary": summary[:500],
-            "importance": self._clamp_float(parsed.get("importance"), 0.7),
-            "confidence": self._clamp_float(parsed.get("confidence"), 0.7),
-        }
+        if not raw.strip():
+            raw = self._generate(prompt + "\n\nYou returned empty text. Return a valid JSON array now; use [] if no item applies.")
+        return self._parse_route_candidates(raw)
 
     def summarize_daily_events(self, dialogue: str) -> str:
         prompt = (
@@ -80,35 +116,18 @@ class MemoryBankSummarizer:
         return self._generate(prompt)
 
     def summarize_daily_personality(self, dialogue: str) -> str:
-        prompt = (
-            "你是用户画像候选提取器。请只基于 user messages 提取 memory-worthy user profile observations。\n\n"
-            "参考实践：像 Mem0 一样只抽取用户明确表达的事实/偏好；像 Graphiti 一样不要从弱证据推断偏好、习惯或长期特质。\n\n"
-            "输出格式：\n"
-            "- 每行一个 bullet。\n"
-            "- 必须使用用户主要语言。\n"
-            "- 每行以 stable_identity、stable_interest、stable_preference、stable_context、temporary_state 之一开头。\n"
-            "- 如果没有足够画像信息，返回空字符串。\n\n"
-            "stable 只允许：身份/自称、长期偏好、反复兴趣、长期目标、职业/学习/家庭等持久背景。\n"
-            "temporary_state 只允许：用户自己表达的短期情绪、状态或互动需求。\n\n"
-            "禁止：\n"
-            "- 不要从 assistant 的复述、建议、道歉、夸奖或猜测中抽取用户画像。\n"
-            "- 不要把时间事实、日程、deadline、某天要做什么写入 personality_insights；这些属于 timeline_facts。\n"
-            "- 不要把 event summary、对话主题、一次性问题写成用户画像。\n"
-            "- 不要把 bug 反馈、系统反馈、输出问题、模型问题、测试记忆机制写成用户画像。\n"
-            "- 不要输出证据语言，例如“此前提到”“用户表示”“从对话看出”“证据显示”。\n"
-            "- 不要输出泛泛标签，例如“用户表达了个人偏好”。必须写出具体偏好。\n"
-            "- 不要使用不确定推测，例如“可能”“似乎”“看起来”“也许”。\n\n"
-            "示例：\n"
-            "输入 user: 我最近在读科幻小说《沙丘》。\n"
-            "输出 - stable_interest: 用户对科幻小说感兴趣。\n"
-            "输入 user: 你刚才没有输出，有 bug。\n"
-            "输出 空字符串。\n"
-            "输入 user: 我在2026年7月5日要整理周报。\n"
-            "输出 空字符串。\n\n"
-            "Dialogue:\n"
-            f"{dialogue}"
-        )
-        return self._filter_daily_personality_text(self._generate(prompt))
+        lines: list[str] = []
+        for item in self.route_memory_candidates(dialogue=dialogue):
+            if item.get("target") != "personality_insight":
+                continue
+            label = str(item.get("label", ""))
+            if label not in _PERSONALITY_LABELS:
+                continue
+            content = self._normalize_global_portrait_line(str(item.get("content", "")))
+            if not content:
+                continue
+            lines.append(f"{label}: {content}")
+        return self._dedupe_lines("\n".join(lines), limit=8)
 
     def summarize_global_portrait(self, daily_personalities: Sequence[str]) -> str:
         joined = "\n".join(f"- {item}" for item in daily_personalities if item.strip())
@@ -182,6 +201,48 @@ class MemoryBankSummarizer:
             return {}
         return parsed if isinstance(parsed, dict) else {}
 
+    def _parse_json_array(self, text: str) -> list:
+        candidate = text.strip()
+        if candidate.startswith("```"):
+            candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
+            candidate = re.sub(r"\s*```$", "", candidate)
+        if not candidate.startswith("["):
+            start = candidate.find("[")
+            end = candidate.rfind("]")
+            candidate = candidate[start : end + 1] if start >= 0 and end >= start else candidate
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError as exc:
+            raise SummaryGenerationError("LLM memory route returned invalid JSON array.") from exc
+        if not isinstance(parsed, list):
+            raise SummaryGenerationError("LLM memory route must return a JSON array.")
+        return parsed
+
+    def _parse_route_candidates(self, text: str) -> list[dict]:
+        candidates: list[dict] = []
+        for raw in self._parse_json_array(text):
+            if not isinstance(raw, dict):
+                continue
+            target = str(raw.get("target", "")).strip().lower()
+            label = str(raw.get("label", "none")).strip().lower() or "none"
+            if target not in _ALLOWED_ROUTE_TARGETS or label not in _ALLOWED_ROUTE_LABELS:
+                continue
+            content = str(raw.get("content", "")).strip()
+            if target != "discard" and not content:
+                continue
+            candidates.append(
+                {
+                    "target": target,
+                    "label": label,
+                    "content": content,
+                    "topic": str(raw.get("topic", "")).strip(),
+                    "importance": self._clamp_float(raw.get("importance"), 0.7),
+                    "confidence": self._clamp_float(raw.get("confidence"), 0.7),
+                    "reason": str(raw.get("reason", "")).strip(),
+                }
+            )
+        return candidates
+
     def _clamp_float(self, value: object, fallback: float) -> float:
         try:
             number = float(value)
@@ -198,90 +259,6 @@ class MemoryBankSummarizer:
         except ValueError:
             return default
         return max(minimum, value)
-
-    def _filter_daily_personality_text(self, text: str) -> str:
-        lines: list[str] = []
-        for raw in text.splitlines():
-            line = self._normalize_daily_personality_line(raw)
-            if not line:
-                continue
-            if self._is_daily_personality_noise(line):
-                continue
-            lines.append(line)
-        return self._dedupe_lines("\n".join(lines), limit=8)
-
-    def _normalize_daily_personality_line(self, raw: str) -> str:
-        line = raw.strip().lstrip("- ").strip()
-        if not line:
-            return ""
-        match = re.match(r"^(stable|temporary)[_\-\s]*(identity|interest|preference|context|goal|state|trait)?[:：]\s*(.+)$", line, flags=re.IGNORECASE)
-        if not match:
-            return ""
-        kind = match.group(1).lower()
-        subtype = (match.group(2) or "").lower()
-        label = "temporary_state" if kind == "temporary" else f"stable_{subtype}"
-        allowed_labels = {"stable_identity", "stable_interest", "stable_preference", "stable_context", "temporary_state"}
-        if label not in allowed_labels:
-            return ""
-        line = match.group(3).strip()
-        line = self._normalize_global_portrait_line(line)
-        if not line:
-            return ""
-        return f"{label}: {line}"
-
-    def _is_daily_personality_noise(self, text: str) -> bool:
-        payload = re.sub(r"^(?:stable|temporary)[_\-\s]*(?:identity|interest|preference|context|goal|state|trait|observation)?[:：]\s*", "", text, flags=re.IGNORECASE)
-        if self._is_profile_noise(payload):
-            return True
-        if self._is_schedule_or_time_fact(payload):
-            return True
-        generic_terms = ("用户表达了个人偏好", "表达了个人偏好", "用户表达了偏好", "用户有偏好")
-        if any(token in payload for token in generic_terms):
-            return True
-        return False
-
-    def _is_schedule_or_time_fact(self, text: str) -> bool:
-        lower = text.lower()
-        absolute_date = re.search(
-            r"(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}年\d{1,2}月\d{1,2}(?:日|号)?|\d{1,2}月\d{1,2}(?:日|号)?)",
-            text,
-        )
-        if absolute_date:
-            return True
-
-        relative_time = re.search(
-            r"(?:今天|明天|后天|昨天|前天|今晚|明早|明晚|今早|本周|这周|下周|上周|本月|下月|"
-            r"周[一二三四五六日天]|星期[一二三四五六日天]|上午|下午|晚上|早上|中午|凌晨|"
-            r"\b(?:today|tomorrow|yesterday|tonight|next week|last week|this week)\b)",
-            lower,
-        )
-        if not relative_time:
-            return False
-
-        schedule_cues = (
-            "要",
-            "需要",
-            "打算",
-            "计划",
-            "准备",
-            "将",
-            "会去",
-            "去",
-            "参加",
-            "开会",
-            "见面",
-            "提交",
-            "完成",
-            "复查",
-            "考试",
-            "面试",
-            "deadline",
-            "due",
-            "appointment",
-            "meeting",
-            "submit",
-        )
-        return any(cue in lower for cue in schedule_cues)
 
     def _filter_global_portrait_text(self, text: str) -> str:
         lines = []

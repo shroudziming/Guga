@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from time import perf_counter, sleep
 import unittest
@@ -18,14 +19,26 @@ class FakeChatModel:
     def generate_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> str:
         _ = gen
         prompt = messages[-1]["content"]
-        if "Extract one long-term memory candidate" in prompt:
-            return (
-                '{"should_archive": true, "topic": "work", '
-                '"summary": "用户在杭州工作，做后端开发", '
-                '"importance": 0.8, "confidence": 0.9}'
+        if "Memory route classifier" in prompt:
+            return json.dumps(
+                [
+                    {
+                        "target": "archival_memory",
+                        "label": "stable_context",
+                        "content": "用户在杭州工作，做后端开发",
+                        "topic": "work",
+                        "importance": 0.8,
+                        "confidence": 0.9,
+                    },
+                    {
+                        "target": "personality_insight",
+                        "label": "stable_context",
+                        "content": "用户在杭州工作，做后端开发。",
+                        "confidence": 0.9,
+                    },
+                ],
+                ensure_ascii=False,
             )
-        if "用户画像候选提取器" in prompt:
-            return "- stable_context: 用户在杭州工作，做后端开发。"
         if "用户画像整理器" in prompt:
             return "- 用户在杭州工作，做后端开发。"
         if "Summarize" in prompt or "summary" in prompt:
@@ -83,12 +96,19 @@ class ChatSessionRagFlowTest(unittest.TestCase):
         class SlowMemoryModel(FakeChatModel):
             def generate_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> str:
                 prompt = messages[-1]["content"]
-                if "Extract one long-term memory candidate" in prompt:
+                if "Memory route classifier" in prompt:
                     sleep(1.0)
-                    return (
-                        '{"should_archive": true, "topic": "work", '
-                        '"summary": "The user works on backend systems.", '
-                        '"importance": 0.8, "confidence": 0.9}'
+                    return json.dumps(
+                        [
+                            {
+                                "target": "archival_memory",
+                                "label": "stable_context",
+                                "content": "The user works on backend systems.",
+                                "topic": "work",
+                                "importance": 0.8,
+                                "confidence": 0.9,
+                            }
+                        ]
                     )
                 return super().generate_reply(messages, gen)
 

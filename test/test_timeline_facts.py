@@ -12,6 +12,22 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
+        if "Memory route" in prompt or "memory route" in prompt:
+            if "你记得" in prompt or "还记得" in prompt:
+                return json.dumps([{"target": "discard", "label": "one_off", "content": "", "confidence": 0.8}], ensure_ascii=False)
+            if "复查" in prompt or "提交项目报告" in prompt or "导师开会" in prompt:
+                return json.dumps(
+                    [
+                        {
+                            "target": "timeline_fact",
+                            "label": "time_bound_plan",
+                            "content": "用户提到一个时间相关事项。",
+                            "confidence": 0.9,
+                        }
+                    ],
+                    ensure_ascii=False,
+                )
+            return json.dumps([{"target": "discard", "label": "one_off", "content": "", "confidence": 0.8}], ensure_ascii=False)
         if "Extract one long-term memory candidate" in prompt:
             return (
                 '{"should_archive": true, "topic": "timeline", '
@@ -68,8 +84,28 @@ class TimelineFactsTest(unittest.TestCase):
         self.assertTrue(fact["source_message_ids"])
         self.assertIn("提交项目报告", fact["semantic_text"])
 
-    def test_time_bound_plan_is_retrievable_before_background_finalize(self) -> None:
+    def test_record_user_message_does_not_write_timeline_fact_before_finalize(self) -> None:
+        self.manager.record_user_message("sess_ingest_only", "我在2026年7月3日要提交项目报告，请你记住。")
+
+        self.assertFalse((self.memory_root / "timeline_facts.jsonl").exists())
+
+    def test_finalize_turn_writes_timeline_fact_from_llm_route_without_keyword_cue(self) -> None:
+        session_id = "sess_route_fact"
+        self.manager.record_user_message(session_id, "我下周二复查。")
+        self.manager.record_assistant_message(session_id, "我记住了。")
+
+        self.manager.finalize_turn(session_id)
+
+        fact_file = self.memory_root / "timeline_facts.jsonl"
+        self.assertTrue(fact_file.exists())
+        fact = json.loads(fact_file.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(fact["type"], "timeline_fact")
+        self.assertIn("复查", fact["semantic_text"])
+
+    def test_time_bound_plan_is_retrievable_after_finalize(self) -> None:
         self.manager.record_user_message("sess_ingest", "我在2026年7月4日要和导师开会，请你记住。")
+        self.manager.record_assistant_message("sess_ingest", "我记住了。")
+        self.manager.finalize_turn("sess_ingest")
 
         context = self.manager.prepare_context("你记得我2026年7月4日要做什么吗？", session_id="sess_other")
 

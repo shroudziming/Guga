@@ -15,14 +15,26 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
-        if "Extract one long-term memory candidate" in prompt:
-            return (
-                '{"should_archive": true, "topic": "schedule", '
-                '"summary": "用户在2026年6月20日要和导师见面", '
-                '"importance": 0.8, "confidence": 0.9}'
+        if "Memory route classifier" in prompt:
+            return json.dumps(
+                [
+                    {
+                        "target": "archival_memory",
+                        "label": "time_bound_plan",
+                        "content": "用户在2026年6月20日要和导师见面",
+                        "topic": "schedule",
+                        "importance": 0.8,
+                        "confidence": 0.9,
+                    },
+                    {
+                        "target": "timeline_fact",
+                        "label": "time_bound_plan",
+                        "content": "用户在2026年6月20日要和导师见面",
+                        "confidence": 0.9,
+                    },
+                ],
+                ensure_ascii=False,
             )
-        if "用户画像候选提取器" in prompt:
-            return ""
         if "用户画像整理器" in prompt:
             return ""
         return "- 用户在2026年6月20日要和导师见面。"

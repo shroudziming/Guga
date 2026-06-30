@@ -12,14 +12,21 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
-        if "Extract one long-term memory candidate" in prompt:
-            return (
-                '{"should_archive": true, "topic": "profile", '
-                '"summary": "用户叫小明，在深圳工作", '
-                '"importance": 0.8, "confidence": 0.9}'
+        if "Memory route classifier" in prompt:
+            return json.dumps(
+                [
+                    {
+                        "target": "archival_memory",
+                        "label": "stable_context",
+                        "content": "用户叫小明，在深圳工作",
+                        "topic": "profile",
+                        "importance": 0.8,
+                        "confidence": 0.9,
+                    },
+                    {"target": "personality_insight", "label": "stable_context", "content": "用户在深圳工作。"},
+                ],
+                ensure_ascii=False,
             )
-        if "用户画像候选提取器" in prompt:
-            return "- stable_context: 用户在深圳工作。"
         if "用户画像整理器" in prompt:
             return "- 用户在深圳工作。"
         return "- 用户叫小明，在深圳工作。"
