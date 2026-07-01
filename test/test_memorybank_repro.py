@@ -306,9 +306,9 @@ class MemoryBankReproTest(unittest.TestCase):
 
             context = manager.prepare_context("你记得我在深圳工作的事吗", session_id="sess_probe")
             prompt = manager.compose_system_prompt("你是助手", context)
-            self.assertIn("[User Portrait]", prompt)
-            self.assertIn("[Relevant Event Summaries]", prompt)
             self.assertIn("[Relevant Conversation Memories]", prompt)
+            self.assertNotIn("[User Portrait]", prompt)
+            self.assertNotIn("[Relevant Event Summaries]", prompt)
 
     def test_daily_summary_aggregates_sessions_from_same_day(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

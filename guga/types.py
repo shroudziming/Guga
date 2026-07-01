@@ -52,9 +52,30 @@ class DocumentHit:
 
 
 @dataclass
+class ConversationEvidenceMessage:
+    message_id: str
+    role: str
+    content: str
+    created_at: str = ""
+
+
+@dataclass
+class ConversationEvidenceGroup:
+    session_id: str
+    summary_id: str
+    summary_text: str
+    summary_score: float
+    created_at: str = ""
+    messages: list[ConversationEvidenceMessage] = field(default_factory=list)
+
+
+@dataclass
 class MemoryContext:
     archival_memories: list[str] = field(default_factory=list)
     hits: list[MemoryHit] = field(default_factory=list)
     document_hits: list[DocumentHit] = field(default_factory=list)
     event_summaries: list[MemoryHit] = field(default_factory=list)
     user_portrait: str = ""
+    query_route: str = "hybrid"
+    query_reason: str = ""
+    conversation_evidence_groups: list[ConversationEvidenceGroup] = field(default_factory=list)

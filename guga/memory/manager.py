@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -34,7 +34,7 @@ from guga.memory.timeline_facts import TimelineFactStore
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
-from guga.types import DocumentHit, MemoryContext, MemoryHit
+from guga.types import ConversationEvidenceGroup, ConversationEvidenceMessage, DocumentHit, MemoryContext, MemoryHit
 from guga.utils.paths import memory_data_dir, rag_documents_dir
 
 
@@ -239,7 +239,8 @@ class MemoryManager:
         self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text, current_turn_ids=current_turn_ids)
         document_hits = self._to_document_hits(semantic_document_hits)
         user_portrait = str(self.portrait_store.load().get("portrait_summary", "")).strip()
-        event_summary_hits = [hit for hit in merged_memory_hits if hit.memory_type == "event_summary"]
+        event_summary_hits = self._select_event_summary_hits(merged_memory_hits, query_plan)
+        conversation_evidence_groups = self._build_conversation_evidence_groups(event_summary_hits)
 
         elapsed_ms = int((perf_counter() - started) * 1000)
         memory_hit_ids = [hit.id for hit in merged_memory_hits]
@@ -279,6 +280,9 @@ class MemoryManager:
             document_hits=document_hits,
             event_summaries=event_summary_hits,
             user_portrait=user_portrait,
+            query_route=query_plan.route,
+            query_reason=query_plan.reason,
+            conversation_evidence_groups=conversation_evidence_groups,
         )
 
     def compose_system_prompt(self, base_prompt: str, memory_context: MemoryContext) -> str:
@@ -292,53 +296,143 @@ class MemoryManager:
             A single system prompt string consumed by the chat model.
         """
         sections = ["[Base Persona]", base_prompt]
-        sections.append("\n[User Portrait]")
-        if memory_context.user_portrait:
-            sections.append(memory_context.user_portrait)
-        else:
-            sections.append("- 当前还没有稳定用户画像。")
+        prompt_mode = self._prompt_mode(memory_context)
 
-        sections.append("\n[Relevant Memory]")
-        sections.append("\n[Relevant Event Summaries]")
-        if memory_context.event_summaries:
-            for hit in memory_context.event_summaries:
-                source_message = hit.source_message_ids[0] if hit.source_message_ids else ""
-                source_ref = f"{hit.source_session_id}/{source_message}".strip("/")
-                sections.append(
-                    f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | S={hit.memory_strength} | src={source_ref}) {hit.summary}"
-                )
-        else:
-            sections.append("- 当前未检索到相关事件摘要。")
+        if prompt_mode == "profile":
+            sections.append("\n[User Portrait]")
+            sections.append(memory_context.user_portrait or "- 当前还没有稳定用户画像。")
 
-        sections.append("\n[Relevant Conversation Memories]")
-        if memory_context.hits:
-            has_conversation_memory = False
-            for hit in memory_context.hits:
-                if hit.memory_type == "event_summary":
-                    continue
-                has_conversation_memory = True
-                source_message = hit.source_message_ids[0] if hit.source_message_ids else ""
-                source_ref = f"{hit.source_session_id}/{source_message}".strip("/")
-                sections.append(
-                    f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | S={hit.memory_strength} | src={source_ref}) {hit.summary}"
-                )
-            if not has_conversation_memory:
-                sections.append("- 当前未检索到可靠历史记忆。")
-        else:
-            sections.append("- 当前未检索到可靠历史记忆。")
+        if prompt_mode == "history":
+            self._append_historical_context(sections, memory_context)
 
-        sections.append("\n[Relevant Documents]")
+        conversation_hits = self._prompt_conversation_hits(memory_context)
+        if conversation_hits:
+            sections.append("\n[Relevant Conversation Memories]")
+            for hit in conversation_hits:
+                sections.append(self._format_memory_hit(hit))
+
         if memory_context.document_hits:
+            sections.append("\n[Relevant Documents]")
             for hit in memory_context.document_hits:
                 source_ref = hit.source_id or hit.source_path
                 sections.append(f"- ({hit.chunk_id} | score={hit.score:.2f} | src={source_ref}) {hit.text}")
-        else:
-            sections.append("- 当前未检索到相关文档片段。")
 
-        sections.append("\n[Current Rule]")
-        sections.append("请仅在相关时自然使用记忆和文档，不要机械复述。")
-        sections.append("若未命中相关信息，请直接说明没有找到相关历史信息，不要编造。")
+        if prompt_mode in {"history", "document"}:
+            sections.append("\n[Current Rule]")
+            sections.append("请仅依据上面的历史或文档证据回答；如果证据不足，请说明没有找到可靠信息，不要编造。")
         return "\n".join(sections)
+
+    def _prompt_mode(self, memory_context: MemoryContext) -> str:
+        if memory_context.query_route == "portrait":
+            return "profile"
+        if memory_context.query_route in {"date_window", "last_session", "recent_turn"}:
+            return "history"
+        if memory_context.document_hits:
+            return "document"
+        return "general"
+
+    def _append_historical_context(self, sections: list[str], memory_context: MemoryContext) -> None:
+        if memory_context.conversation_evidence_groups:
+            sections.append("\n[Historical Conversation Context]")
+            for group in memory_context.conversation_evidence_groups:
+                timestamp = self._format_beijing_minute(group.created_at)
+                sections.append(f"- 在 {timestamp}的 {group.session_id} 对话中：")
+                sections.append(f"  摘要：{group.summary_text}")
+                if group.messages:
+                    sections.append("  相关原文：")
+                    for message in group.messages:
+                        role = message.role.capitalize() if message.role else "Message"
+                        sections.append(f"  {role}({message.message_id}): {message.content}")
+            return
+
+        if memory_context.event_summaries:
+            sections.append("\n[Historical Conversation Context]")
+            for hit in memory_context.event_summaries:
+                timestamp = self._format_beijing_minute(hit.created_at)
+                session_ref = hit.source_session_id or "unknown_session"
+                sections.append(f"- 在 {timestamp}的 {session_ref} 对话中：")
+                sections.append(f"  摘要：{hit.summary}")
+
+    def _prompt_conversation_hits(self, memory_context: MemoryContext) -> list[MemoryHit]:
+        evidence_message_ids = {
+            message.message_id
+            for group in memory_context.conversation_evidence_groups
+            for message in group.messages
+        }
+        return [
+            hit
+            for hit in memory_context.hits
+            if hit.memory_type != "event_summary" and not hit.is_current_turn
+            and not evidence_message_ids.intersection(hit.source_message_ids)
+        ]
+
+    def _format_memory_hit(self, hit: MemoryHit) -> str:
+        source_message = hit.source_message_ids[0] if hit.source_message_ids else ""
+        source_ref = f"{hit.source_session_id}/{source_message}".strip("/")
+        return f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | S={hit.memory_strength} | src={source_ref}) {hit.summary}"
+
+    def _select_event_summary_hits(self, hits: list[MemoryHit], query_plan: _QueryPlan) -> list[MemoryHit]:
+        if query_plan.route not in {"date_window", "last_session", "recent_turn"}:
+            return []
+        summaries = [hit for hit in hits if hit.memory_type == "event_summary"]
+        specific = [hit for hit in summaries if hit.id != "evt_global"]
+        if specific:
+            return specific
+        return [hit for hit in summaries if hit.id == "evt_global"][:1]
+
+    def _build_conversation_evidence_groups(self, event_summary_hits: list[MemoryHit]) -> list[ConversationEvidenceGroup]:
+        groups: list[ConversationEvidenceGroup] = []
+        for hit in event_summary_hits:
+            if not hit.source_session_id:
+                continue
+            messages = self._load_evidence_messages(hit.source_session_id, hit.source_message_ids)
+            groups.append(
+                ConversationEvidenceGroup(
+                    session_id=hit.source_session_id,
+                    summary_id=hit.id,
+                    summary_text=hit.summary,
+                    summary_score=hit.score,
+                    created_at=hit.created_at,
+                    messages=messages,
+                )
+            )
+        return groups
+
+    def _load_evidence_messages(self, session_id: str, source_message_ids: list[str]) -> list[ConversationEvidenceMessage]:
+        if not session_id or not source_message_ids:
+            return []
+        session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
+        rows = self._read_session_rows(session_file)
+        row_by_id = {str(row.get("id", "")): row for row in rows}
+        messages: list[ConversationEvidenceMessage] = []
+        for message_id in source_message_ids:
+            row = row_by_id.get(str(message_id))
+            if not row:
+                continue
+            content = str(row.get("content", "")).strip()
+            if not content:
+                continue
+            messages.append(
+                ConversationEvidenceMessage(
+                    message_id=str(row.get("id", "")),
+                    role=str(row.get("role", "")) or "message",
+                    content=content,
+                    created_at=str(row.get("created_at", "")),
+                )
+            )
+        return messages
+
+    def _format_beijing_minute(self, value: str) -> str:
+        if not value:
+            return "未知时间"
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return value
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        beijing = parsed.astimezone(timezone(timedelta(hours=8)))
+        return beijing.strftime("%Y-%m-%d %H:%M 北京时间")
 
     def record_user_message(self, session_id: str, text: str, source: str = "chat") -> str:
         """Persist current user message and cache it in per-turn state.

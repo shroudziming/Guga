@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from guga.memory.manager import MemoryManager
+from guga.types import DocumentHit, MemoryContext
 
 
 class SummaryModel:
@@ -93,17 +94,113 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertIn("用户提到", context.archival_memories[0])
 
         prompt = self.manager.compose_system_prompt("你是一个助手", context)
-        self.assertIn("[Relevant Memory]", prompt)
-        self.assertIn("[Relevant Documents]", prompt)
+        self.assertIn("[Relevant Conversation Memories]", prompt)
+        self.assertNotIn("[Relevant Documents]", prompt)
         self.assertIn("mem_new", prompt)
         self.assertIn("src=sess_new/msg_new", prompt)
 
     def test_compose_prompt_explicitly_handles_no_hit(self) -> None:
         context = self.manager.prepare_context("完全不相关问题", session_id="sess_none")
         prompt = self.manager.compose_system_prompt("你是一个助手", context)
-        self.assertIn("当前未检索到可靠历史记忆", prompt)
-        self.assertIn("当前未检索到相关文档片段", prompt)
-        self.assertIn("不要编造", prompt)
+        self.assertNotIn("当前未检索到可靠历史记忆", prompt)
+        self.assertNotIn("当前未检索到相关文档片段", prompt)
+        self.assertNotIn("[Current Rule]", prompt)
+
+    def test_general_prompt_does_not_render_event_doc_or_current_turn_noise(self) -> None:
+        self.manager.record_user_message("sess_social", "你撒个娇看看")
+
+        context = self.manager.prepare_context("你撒个娇看看", session_id="sess_social")
+        prompt = self.manager.compose_system_prompt("你是一个助手", context)
+
+        self.assertIn("[Base Persona]", prompt)
+        self.assertNotIn("[Relevant Event Summaries]", prompt)
+        self.assertNotIn("[Historical Conversation Context]", prompt)
+        self.assertNotIn("[Relevant Documents]", prompt)
+        self.assertNotIn("你撒个娇看看", prompt)
+
+    def test_history_prompt_renders_summary_and_source_messages(self) -> None:
+        session_id = "sess_history"
+        user_id = self.manager.record_user_message(session_id, "我之前问你推荐过一部悬疑网剧。")
+        assistant_id = self.manager.record_assistant_message(session_id, "我推荐过《隐秘的角落》。")
+        event = {
+            "id": "evt_daily_20260628",
+            "type": "event_summary",
+            "scope": "daily",
+            "day": "2026-06-28",
+            "summary": "用户询问并获得悬疑网剧推荐。",
+            "raw_excerpt": "用户问悬疑网剧，助手推荐《隐秘的角落》。",
+            "created_at": "2026-06-28T01:35:00+08:00",
+            "source_session_id": session_id,
+            "source_message_ids": [user_id, assistant_id],
+            "memory_strength": 1,
+            "importance": 0.8,
+            "confidence": 0.9,
+            "status": "active",
+        }
+        (self.memory_root / "event_summaries.jsonl").write_text(
+            json.dumps(event, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        context = self.manager.prepare_context("上次我们聊了什么", session_id="sess_now")
+        prompt = self.manager.compose_system_prompt("你是一个助手", context)
+
+        self.assertIn("[Historical Conversation Context]", prompt)
+        self.assertIn("在 2026-06-28 01:35 北京时间的 sess_history 对话中", prompt)
+        self.assertIn("摘要：用户询问并获得悬疑网剧推荐。", prompt)
+        self.assertIn(f"User({user_id}): 我之前问你推荐过一部悬疑网剧。", prompt)
+        self.assertIn(f"Assistant({assistant_id}): 我推荐过《隐秘的角落》。", prompt)
+        self.assertNotIn("[Relevant Event Summaries]", prompt)
+
+    def test_profile_prompt_renders_portrait_without_event_summary(self) -> None:
+        (self.memory_root / "profile.json").write_text(
+            json.dumps({"portrait_summary": "- 用户自称叔本明。"}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        event = {
+            "id": "evt_daily_20260628",
+            "type": "event_summary",
+            "scope": "daily",
+            "day": "2026-06-28",
+            "summary": "一次普通闲聊摘要。",
+            "created_at": "2026-06-28T01:35:00+08:00",
+            "source_session_id": "sess_old",
+            "source_message_ids": [],
+            "status": "active",
+        }
+        (self.memory_root / "event_summaries.jsonl").write_text(
+            json.dumps(event, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        context = self.manager.prepare_context("你觉得我是谁？", session_id="sess_now")
+        prompt = self.manager.compose_system_prompt("你是一个助手", context)
+
+        self.assertIn("[User Portrait]", prompt)
+        self.assertIn("叔本明", prompt)
+        self.assertNotIn("一次普通闲聊摘要", prompt)
+        self.assertNotIn("[Historical Conversation Context]", prompt)
+
+    def test_document_section_only_renders_when_document_hits_exist(self) -> None:
+        context = MemoryContext(
+            document_hits=[
+                DocumentHit(
+                    chunk_id="doc_1",
+                    text="文档片段内容",
+                    score=0.77,
+                    source_id="source_doc",
+                    source_path="notes.md",
+                )
+            ],
+            query_route="hybrid",
+            query_reason="default_hybrid",
+        )
+
+        prompt = self.manager.compose_system_prompt("你是一个助手", context)
+
+        self.assertIn("[Relevant Documents]", prompt)
+        self.assertIn("doc_1", prompt)
+        self.assertIn("文档片段内容", prompt)
 
     def test_finalize_turn_writes_archival_and_session_schema(self) -> None:
         session_id = "sess_schema"
