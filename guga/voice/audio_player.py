@@ -4,6 +4,7 @@ import queue
 import tempfile
 import threading
 import wave
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -119,6 +120,13 @@ class WavAudioPlayer:
             else:
                 _ = item
                 self._queue.task_done()
+
+
+def audio_player_from_env(env: Mapping[str, str]) -> NullAudioPlayer | WavAudioPlayer:
+    raw = env.get("GUGA_TTS_PLAY_AUDIO", "1").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return NullAudioPlayer()
+    return WavAudioPlayer()
 
 
 class _BytesReader:

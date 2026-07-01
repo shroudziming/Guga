@@ -15,7 +15,7 @@ from guga.models import create_chat_model
 from guga.persona import PersonaManager
 from guga.utils.debug_reporter import FileDebugSink
 from guga.utils.paths import debug_reports_dir, personas_dir
-from guga.voice import GptSoVitsConfig, GptSoVitsHttpClient, VoiceChatRunner, WavAudioPlayer
+from guga.voice import GptSoVitsConfig, GptSoVitsHttpClient, VoiceChatRunner, audio_player_from_env
 
 
 def _load_env_file() -> None:
@@ -93,7 +93,7 @@ def main() -> None:
 
         cancel_event = Event()
         print("小咕嘎> ", end="", flush=True)
-        player = WavAudioPlayer()
+        player = audio_player_from_env(os.environ)
         runner = VoiceChatRunner(
             session=session,
             tts_client=tts_client,

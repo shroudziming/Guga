@@ -85,9 +85,12 @@ class VoiceChatRunner:
                     sequence_id += 1
                     self._enqueue_sentence(sequence_id, sentence)
 
-            for sentence in self.sentence_buffer.flush():
-                sequence_id += 1
-                self._enqueue_sentence(sequence_id, sentence)
+            if not cancel_event.is_set():
+                for sentence in self.sentence_buffer.flush():
+                    sequence_id += 1
+                    self._enqueue_sentence(sequence_id, sentence)
+            else:
+                self.sentence_buffer.flush()
         except BaseException:
             cancel_event.set()
             self.audio_player.stop(clear=True)

@@ -5,7 +5,7 @@ import time
 import unittest
 from collections.abc import Iterator
 
-from guga.voice.audio_player import AudioData
+from guga.voice.audio_player import AudioData, NullAudioPlayer, audio_player_from_env
 from guga.voice.metrics import VoiceMetrics
 from guga.voice.runner import VoiceChatRunner
 from guga.voice.sentence_buffer import TextSentenceBuffer
@@ -60,6 +60,14 @@ class FakeSession:
             if cancel_event is not None and cancel_event.is_set():
                 return
             yield chunk
+
+
+class CancelAfterOneChunkSession:
+    def reply_stream(self, user_input: str, cancel_event: threading.Event | None = None) -> Iterator[str]:
+        _ = user_input
+        yield "未完成"
+        if cancel_event is not None:
+            cancel_event.set()
 
 
 class FakeTtsClient:
@@ -138,6 +146,13 @@ class GptSoVitsHttpClientTest(unittest.TestCase):
         self.assertFalse(requests[0]["payload"]["streaming_mode"])
 
 
+class AudioPlayerFactoryTest(unittest.TestCase):
+    def test_can_disable_real_audio_playback_from_env(self) -> None:
+        player = audio_player_from_env({"GUGA_TTS_PLAY_AUDIO": "0"})
+
+        self.assertIsInstance(player, NullAudioPlayer)
+
+
 class VoiceChatRunnerTest(unittest.TestCase):
     def test_streams_text_and_synthesizes_sentences_in_order(self) -> None:
         session = FakeSession(["你好，", "我是咕嘎。", "今天继续。"])
@@ -183,6 +198,24 @@ class VoiceChatRunnerTest(unittest.TestCase):
         self.assertEqual([chunk for chunk, _ in printed], ["第一句。", "第二句。"])
         self.assertLess(printed[-1][1] - started, 0.15)
         self.assertEqual(summary.sentences, 2)
+
+    def test_cancel_does_not_flush_partial_sentence_to_tts(self) -> None:
+        cancel_event = threading.Event()
+        tts = FakeTtsClient()
+        printed: list[str] = []
+
+        runner = VoiceChatRunner(
+            session=CancelAfterOneChunkSession(),
+            tts_client=tts,
+            audio_player=FakeAudioPlayer(),
+            text_sink=printed.append,
+        )
+
+        summary = runner.run_turn("hi", cancel_event=cancel_event)
+
+        self.assertEqual(printed, ["未完成"])
+        self.assertEqual(tts.requests, [])
+        self.assertEqual(summary.sentences, 0)
 
 
 if __name__ == "__main__":

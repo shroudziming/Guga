@@ -1,6 +1,6 @@
 """Voice adapter layer for streaming Guga replies into local TTS."""
 
-from guga.voice.audio_player import AudioData, NullAudioPlayer, WavAudioPlayer
+from guga.voice.audio_player import AudioData, NullAudioPlayer, WavAudioPlayer, audio_player_from_env
 from guga.voice.metrics import VoiceMetrics, VoiceMetricsSummary
 from guga.voice.runner import VoiceChatRunner
 from guga.voice.sentence_buffer import TextSentenceBuffer
@@ -16,4 +16,5 @@ __all__ = [
     "VoiceMetrics",
     "VoiceMetricsSummary",
     "WavAudioPlayer",
+    "audio_player_from_env",
 ]
