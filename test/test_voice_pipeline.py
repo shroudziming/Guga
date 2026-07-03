@@ -10,6 +10,7 @@ from guga.voice.audio_player import AudioData, NullAudioPlayer, audio_player_fro
 from guga.voice.metrics import VoiceMetrics
 from guga.voice.runner import VoiceChatRunner
 from guga.voice.sentence_buffer import TextSentenceBuffer, sentence_buffer_from_env
+from guga.voice.text_filter import SpokenTextFilter
 from guga.voice.tool_mode import configure_voice_tool_mode
 from guga.voice.tts_client import GptSoVitsConfig, GptSoVitsHttpClient, prewarm_tts_client
 
@@ -34,6 +35,19 @@ class SentenceBufferTest(unittest.TestCase):
         buffer = sentence_buffer_from_env({})
 
         self.assertEqual(buffer.feed("一二三四五六七八九十一二三四五六七八"), ["一二三四五六七八九十一二三四五六"])
+
+
+class SpokenTextFilterTest(unittest.TestCase):
+    def test_removes_parenthesized_text(self) -> None:
+        text_filter = SpokenTextFilter()
+
+        self.assertEqual(text_filter.feed("咕嘎！（眼睛放光）汉堡。"), "咕嘎！汉堡。")
+
+    def test_tracks_parenthesized_text_across_chunks(self) -> None:
+        text_filter = SpokenTextFilter()
+
+        self.assertEqual(text_filter.feed("咕嘎（眼睛"), "咕嘎")
+        self.assertEqual(text_filter.feed("放光）好吃。"), "好吃。")
 
 
 class VoiceMetricsTest(unittest.TestCase):
@@ -296,6 +310,41 @@ class VoiceChatRunnerTest(unittest.TestCase):
         self.assertEqual(printed, ["未完成"])
         self.assertEqual(tts.requests, [])
         self.assertEqual(summary.sentences, 0)
+
+    def test_excludes_parenthesized_actions_from_tts_but_keeps_display_text(self) -> None:
+        session = FakeSession(["咕嘎！（眼睛放光，蹦跶了两下）", "汉堡。", "(挥手)继续。"])
+        tts = FakeTtsClient()
+        printed: list[str] = []
+
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=tts,
+            audio_player=FakeAudioPlayer(),
+            text_sink=printed.append,
+        )
+
+        summary = runner.run_turn("hi")
+
+        self.assertEqual(printed, ["咕嘎！（眼睛放光，蹦跶了两下）", "汉堡。", "(挥手)继续。"])
+        self.assertEqual(tts.requests, ["咕嘎！", "汉堡。", "继续。"])
+        self.assertEqual(summary.sentences, 3)
+
+    def test_excludes_parenthesized_actions_across_chunks_from_tts(self) -> None:
+        session = FakeSession(["咕嘎（眼睛", "放光）好吃。"])
+        tts = FakeTtsClient()
+        printed: list[str] = []
+
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=tts,
+            audio_player=FakeAudioPlayer(),
+            text_sink=printed.append,
+        )
+
+        runner.run_turn("hi")
+
+        self.assertEqual(printed, ["咕嘎（眼睛", "放光）好吃。"])
+        self.assertEqual(tts.requests, ["咕嘎好吃。"])
 
 
 if __name__ == "__main__":

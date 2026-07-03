@@ -9,6 +9,7 @@ from typing import Protocol
 from guga.voice.audio_player import AudioData
 from guga.voice.metrics import VoiceMetrics, VoiceMetricsSummary
 from guga.voice.sentence_buffer import TextSentenceBuffer
+from guga.voice.text_filter import SpokenTextFilter
 from guga.voice.tts_client import TtsClient
 
 
@@ -55,6 +56,7 @@ class VoiceChatRunner:
         self.audio_player = audio_player
         self.text_sink = text_sink
         self.sentence_buffer = sentence_buffer or TextSentenceBuffer()
+        self.spoken_text_filter = SpokenTextFilter()
         self.metrics = metrics or VoiceMetrics()
         self.raise_tts_errors = raise_tts_errors
         self._queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=max_queue_size)
@@ -81,7 +83,8 @@ class VoiceChatRunner:
                     break
                 self.metrics.text_chunk_received()
                 self.text_sink(chunk)
-                for sentence in self.sentence_buffer.feed(chunk):
+                spoken_chunk = self.spoken_text_filter.feed(chunk)
+                for sentence in self.sentence_buffer.feed(spoken_chunk):
                     sequence_id += 1
                     self._enqueue_sentence(sequence_id, sentence)
 

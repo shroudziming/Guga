@@ -4,6 +4,7 @@ from guga.voice.audio_player import AudioData, NullAudioPlayer, WavAudioPlayer, 
 from guga.voice.metrics import VoiceMetrics, VoiceMetricsSummary
 from guga.voice.runner import VoiceChatRunner
 from guga.voice.sentence_buffer import TextSentenceBuffer, sentence_buffer_from_env
+from guga.voice.text_filter import SpokenTextFilter
 from guga.voice.tts_client import GptSoVitsConfig, GptSoVitsHttpClient, TtsPrewarmResult, prewarm_tts_client
 from guga.voice.tool_mode import configure_voice_tool_mode
 
@@ -13,6 +14,7 @@ __all__ = [
     "GptSoVitsHttpClient",
     "NullAudioPlayer",
     "TextSentenceBuffer",
+    "SpokenTextFilter",
     "VoiceChatRunner",
     "VoiceMetrics",
     "VoiceMetricsSummary",
