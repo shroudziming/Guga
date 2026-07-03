@@ -50,6 +50,9 @@ Write-Host "[Guga Voice] prewarm=$env:GUGA_TTS_PREWARM"
 Write-Host "[Guga Voice] media_type=$env:GUGA_TTS_MEDIA_TYPE"
 Write-Host "[Guga Voice] streaming_mode=$env:GUGA_TTS_STREAMING_MODE"
 Write-Host "[Guga Voice] tools=$env:GUGA_VOICE_WITH_TOOLS"
+if ($WithTools) {
+    Write-Host "[Guga Voice] tools note: speech starts before tools only when the model streams content before tool_calls"
+}
 Write-Host ""
 
 python src\voice_cli_chat.py

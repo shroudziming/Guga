@@ -6,8 +6,9 @@ from collections.abc import MutableMapping
 def configure_voice_tool_mode(env: MutableMapping[str, str]) -> bool:
     """Configure ChatSession tool use for latency-sensitive voice chat.
 
-    Voice chat defaults to true text streaming. Guga's current tool-capable path
-    is non-streaming, so it is only kept when explicitly requested.
+    Voice chat defaults to tools off for the lowest first-audio latency. When
+    explicitly enabled, streaming depends on the chat model's tool-stream API
+    support and on whether the upstream model emits text before tool calls.
     """
 
     if _env_bool(env.get("GUGA_VOICE_WITH_TOOLS", "")):

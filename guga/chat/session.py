@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from guga.chat.history import ChatHistory
 from guga.memory import MemoryManager
-from guga.tools import ToolRegistry, default_tool_registry, encode_tool_result
+from guga.tools import ToolRegistry, ToolStreamText, ToolStreamToolCalls, default_tool_registry, encode_tool_result
 from guga.types import GenerationConfig
 
 if TYPE_CHECKING:
@@ -149,10 +149,16 @@ class ChatSession:
         if self._can_use_tools():
             generate_started = perf_counter()
             self._debug("model_generate_start")
-            answer = self._generate_reply_with_optional_tools(messages)
-            chunks.append(answer)
-            if answer:
-                yield answer
+            stream_tools_fn = getattr(self.model, "generate_reply_with_tools_stream", None)
+            if callable(stream_tools_fn):
+                for chunk in self._generate_reply_with_optional_tools_stream(messages, cancel_event=cancel_event):
+                    chunks.append(chunk)
+                    yield chunk
+            else:
+                answer = self._generate_reply_with_optional_tools(messages)
+                chunks.append(answer)
+                if answer:
+                    yield answer
             generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
             self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
         elif callable(stream_fn):
@@ -262,6 +268,68 @@ class ChatSession:
 
         self._debug("tool_call_max_rounds_exceeded")
         return self.model.generate_reply(tool_messages, gen)
+
+    def _generate_reply_with_optional_tools_stream(
+        self,
+        messages: list[dict],
+        cancel_event: Event | None = None,
+    ) -> Iterator[str]:
+        tool_messages = [dict(message) for message in messages]
+        tools = self.tool_registry.openai_tools()
+        generate_stream_with_tools = getattr(self.model, "generate_reply_with_tools_stream")
+
+        for round_index in range(self.max_tool_rounds):
+            round_chunks: list[str] = []
+            tool_calls = []
+
+            for event in generate_stream_with_tools(tool_messages, self.generation, tools, cancel_event=cancel_event):
+                if isinstance(event, ToolStreamText):
+                    if event.content:
+                        round_chunks.append(event.content)
+                        yield event.content
+                    continue
+                if isinstance(event, ToolStreamToolCalls):
+                    tool_calls = event.tool_calls
+
+            if not tool_calls:
+                return
+
+            assistant_message = {
+                "role": "assistant",
+                "content": "".join(round_chunks),
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            }
+            tool_messages.append(assistant_message)
+            for call in tool_calls:
+                result = self.tool_registry.execute(call)
+                self._debug(
+                    "tool_call "
+                    f"round={round_index + 1} name={call.name} ok={bool(result.get('ok'))} "
+                    f"args={json.dumps(call.arguments, ensure_ascii=False)}"
+                )
+                tool_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                        "content": encode_tool_result(result),
+                    }
+                )
+
+        self._debug("tool_call_max_rounds_exceeded")
+        fallback = self.model.generate_reply(tool_messages, self.generation)
+        if fallback:
+            yield fallback
 
     def _can_use_tools(self) -> bool:
         return (

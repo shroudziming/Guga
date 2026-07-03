@@ -27,6 +27,16 @@ class ToolModelResponse:
 
 
 @dataclass(frozen=True)
+class ToolStreamText:
+    content: str
+
+
+@dataclass(frozen=True)
+class ToolStreamToolCalls:
+    tool_calls: list[ToolCall]
+
+
+@dataclass(frozen=True)
 class ToolSpec:
     name: str
     description: str
