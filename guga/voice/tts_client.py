@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -17,6 +18,14 @@ class TtsClient(Protocol):
 
 
 PostJson = Callable[[str, dict[str, Any], float], bytes]
+
+
+@dataclass(frozen=True)
+class TtsPrewarmResult:
+    ok: bool
+    status: str
+    elapsed_seconds: float = 0.0
+    error: str = ""
 
 
 @dataclass(frozen=True)
@@ -97,6 +106,28 @@ class GptSoVitsHttpClient:
         }
 
 
+def prewarm_tts_client(tts_client: TtsClient, env: dict[str, str] | os._Environ[str]) -> TtsPrewarmResult:
+    if not _env_bool_value(env.get("GUGA_TTS_PREWARM", "1")):
+        return TtsPrewarmResult(ok=False, status="disabled")
+
+    text = env.get("GUGA_TTS_PREWARM_TEXT", "嗯。").strip() or "嗯。"
+    started = time.perf_counter()
+    try:
+        tts_client.synthesize(text)
+    except Exception as exc:
+        return TtsPrewarmResult(
+            ok=False,
+            status="failed",
+            elapsed_seconds=time.perf_counter() - started,
+            error=str(exc),
+        )
+    return TtsPrewarmResult(
+        ok=True,
+        status="ok",
+        elapsed_seconds=time.perf_counter() - started,
+    )
+
+
 def _post_json(url: str, payload: dict[str, Any], timeout_seconds: float) -> bytes:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(
@@ -119,7 +150,11 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
         return default
-    return raw in {"1", "true", "yes", "on"}
+    return _env_bool_value(raw)
+
+
+def _env_bool_value(raw: str) -> bool:
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:

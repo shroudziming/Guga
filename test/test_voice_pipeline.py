@@ -7,10 +7,10 @@ from collections.abc import Iterator
 
 from guga.voice.audio_player import AudioData, NullAudioPlayer, audio_player_from_env
 from guga.voice.metrics import VoiceMetrics
-from guga.voice.runner import VoiceChatRunner
+from guga.voice.runner import VoiceChatRunner, voice_preface_text_from_env
 from guga.voice.sentence_buffer import TextSentenceBuffer, sentence_buffer_from_env
 from guga.voice.tool_mode import configure_voice_tool_mode
-from guga.voice.tts_client import GptSoVitsConfig, GptSoVitsHttpClient
+from guga.voice.tts_client import GptSoVitsConfig, GptSoVitsHttpClient, prewarm_tts_client
 
 
 class SentenceBufferTest(unittest.TestCase):
@@ -32,7 +32,7 @@ class SentenceBufferTest(unittest.TestCase):
     def test_voice_env_defaults_to_short_latency_split(self) -> None:
         buffer = sentence_buffer_from_env({})
 
-        self.assertEqual(buffer.feed("一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三"), ["一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二"])
+        self.assertEqual(buffer.feed("一二三四五六七八九十一二三四五六七八"), ["一二三四五六七八九十一二三四五六"])
 
 
 class VoiceMetricsTest(unittest.TestCase):
@@ -151,6 +151,23 @@ class GptSoVitsHttpClientTest(unittest.TestCase):
         self.assertTrue(requests[0]["payload"]["parallel_infer"])
         self.assertFalse(requests[0]["payload"]["streaming_mode"])
 
+    def test_prewarm_synthesizes_short_text_by_default(self) -> None:
+        tts = FakeTtsClient()
+
+        result = prewarm_tts_client(tts, {})
+
+        self.assertTrue(result.ok)
+        self.assertEqual(tts.requests, ["嗯。"])
+
+    def test_prewarm_can_be_disabled(self) -> None:
+        tts = FakeTtsClient()
+
+        result = prewarm_tts_client(tts, {"GUGA_TTS_PREWARM": "0"})
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "disabled")
+        self.assertEqual(tts.requests, [])
+
 
 class AudioPlayerFactoryTest(unittest.TestCase):
     def test_can_disable_real_audio_playback_from_env(self) -> None:
@@ -178,6 +195,15 @@ class VoiceToolModeTest(unittest.TestCase):
 
 
 class VoiceChatRunnerTest(unittest.TestCase):
+    def test_preface_text_defaults_to_short_thinking_filler(self) -> None:
+        self.assertEqual(voice_preface_text_from_env({}), "嗯，我想一下。")
+
+    def test_preface_text_can_be_disabled(self) -> None:
+        self.assertEqual(voice_preface_text_from_env({"GUGA_VOICE_PREFACE": "0"}), "")
+
+    def test_preface_text_can_be_overridden(self) -> None:
+        self.assertEqual(voice_preface_text_from_env({"GUGA_VOICE_PREFACE_TEXT": "我看看。"}), "我看看。")
+
     def test_streams_text_and_synthesizes_sentences_in_order(self) -> None:
         session = FakeSession(["你好，", "我是咕嘎。", "今天继续。"])
         tts = FakeTtsClient()
@@ -240,6 +266,27 @@ class VoiceChatRunnerTest(unittest.TestCase):
         self.assertEqual(printed, ["未完成"])
         self.assertEqual(tts.requests, [])
         self.assertEqual(summary.sentences, 0)
+
+    def test_preface_audio_is_spoken_before_model_text_without_printing_it(self) -> None:
+        session = FakeSession(["真正回答。"])
+        tts = FakeTtsClient()
+        player = FakeAudioPlayer()
+        printed: list[str] = []
+
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=tts,
+            audio_player=player,
+            text_sink=printed.append,
+            preface_text="嗯，我想一下。",
+        )
+
+        summary = runner.run_turn("hi")
+
+        self.assertEqual(printed, ["真正回答。"])
+        self.assertEqual(tts.requests, ["嗯，我想一下。", "真正回答。"])
+        self.assertEqual(player.items, [b"audio:\xe5\x97\xaf\xef\xbc\x8c\xe6\x88\x91\xe6\x83\xb3\xe4\xb8\x80\xe4\xb8\x8b\xe3\x80\x82", b"audio:\xe7\x9c\x9f\xe6\xad\xa3\xe5\x9b\x9e\xe7\xad\x94\xe3\x80\x82"])
+        self.assertEqual(summary.sentences, 2)
 
 
 if __name__ == "__main__":

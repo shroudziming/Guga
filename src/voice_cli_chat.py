@@ -21,7 +21,9 @@ from guga.voice import (
     VoiceChatRunner,
     audio_player_from_env,
     configure_voice_tool_mode,
+    prewarm_tts_client,
     sentence_buffer_from_env,
+    voice_preface_text_from_env,
 )
 
 
@@ -77,6 +79,7 @@ def main() -> None:
     )
 
     tts_client = GptSoVitsHttpClient(tts_config)
+    _prewarm_tts(tts_client)
 
     while True:
         user_text = input("你> ").strip()
@@ -110,6 +113,7 @@ def main() -> None:
             text_sink=lambda chunk: print(chunk, end="", flush=True),
             sentence_buffer=sentence_buffer_from_env(os.environ),
             raise_tts_errors=False,
+            preface_text=voice_preface_text_from_env(os.environ),
         )
 
         try:
@@ -136,6 +140,17 @@ def _print_metrics(summary) -> None:
         f"tts={summary.tts_seconds:.2f}s "
         f"total={total}\n"
     )
+
+
+def _prewarm_tts(tts_client) -> None:
+    result = prewarm_tts_client(tts_client, os.environ)
+    if result.status == "disabled":
+        print("[voice] tts_prewarm=disabled\n")
+        return
+    if result.ok:
+        print(f"[voice] tts_prewarm=ok elapsed={result.elapsed_seconds:.2f}s\n")
+        return
+    print(f"[voice] tts_prewarm=failed elapsed={result.elapsed_seconds:.2f}s error={result.error}\n")
 
 
 def _format_ms(value: int | None) -> str:

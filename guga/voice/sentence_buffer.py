@@ -58,7 +58,7 @@ class TextSentenceBuffer:
 
 
 def sentence_buffer_from_env(env: Mapping[str, str]) -> TextSentenceBuffer:
-    return TextSentenceBuffer(max_chars=_env_int(env.get("GUGA_TTS_SENTENCE_MAX_CHARS", ""), 32))
+    return TextSentenceBuffer(max_chars=_env_int(env.get("GUGA_TTS_SENTENCE_MAX_CHARS", ""), 16))
 
 
 def _env_int(raw: str, default: int) -> int:
