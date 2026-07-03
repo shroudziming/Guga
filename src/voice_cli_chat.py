@@ -15,7 +15,13 @@ from guga.models import create_chat_model
 from guga.persona import PersonaManager
 from guga.utils.debug_reporter import FileDebugSink
 from guga.utils.paths import debug_reports_dir, personas_dir
-from guga.voice import GptSoVitsConfig, GptSoVitsHttpClient, VoiceChatRunner, audio_player_from_env
+from guga.voice import (
+    GptSoVitsConfig,
+    GptSoVitsHttpClient,
+    VoiceChatRunner,
+    audio_player_from_env,
+    configure_voice_tool_mode,
+)
 
 
 def _load_env_file() -> None:
@@ -41,6 +47,7 @@ def main() -> None:
     cache_dir = os.environ.get("Guga_CACHE_DIR", str(DEFAULT_CACHE_DIR))
     persona_name = os.environ.get("Guga_PERSONA", "default")
     debug_enabled = os.environ.get("Guga_DEBUG", "1") != "0"
+    tools_enabled = configure_voice_tool_mode(os.environ)
 
     tts_config = GptSoVitsConfig.from_env()
 
@@ -49,6 +56,7 @@ def main() -> None:
     print("提示: 生成中按 Ctrl+C 可停止输出和后续语音")
     print(f"model={model_id}")
     print(f"persona={persona_name}")
+    print(f"voice_tools={'on' if tools_enabled else 'off'}")
     print(f"tts_endpoint={tts_config.endpoint}")
     print(f"tts_ref_audio={tts_config.ref_audio_path}\n")
     if debug_enabled:

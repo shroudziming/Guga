@@ -9,6 +9,7 @@ from guga.voice.audio_player import AudioData, NullAudioPlayer, audio_player_fro
 from guga.voice.metrics import VoiceMetrics
 from guga.voice.runner import VoiceChatRunner
 from guga.voice.sentence_buffer import TextSentenceBuffer
+from guga.voice.tool_mode import configure_voice_tool_mode
 from guga.voice.tts_client import GptSoVitsConfig, GptSoVitsHttpClient
 
 
@@ -151,6 +152,24 @@ class AudioPlayerFactoryTest(unittest.TestCase):
         player = audio_player_from_env({"GUGA_TTS_PLAY_AUDIO": "0"})
 
         self.assertIsInstance(player, NullAudioPlayer)
+
+
+class VoiceToolModeTest(unittest.TestCase):
+    def test_voice_chat_disables_tool_path_by_default(self) -> None:
+        env: dict[str, str] = {}
+
+        enabled = configure_voice_tool_mode(env)
+
+        self.assertFalse(enabled)
+        self.assertEqual(env["Guga_MAX_TOOL_ROUNDS"], "0")
+
+    def test_voice_chat_can_keep_tools_when_explicitly_enabled(self) -> None:
+        env = {"GUGA_VOICE_WITH_TOOLS": "1", "Guga_MAX_TOOL_ROUNDS": "2"}
+
+        enabled = configure_voice_tool_mode(env)
+
+        self.assertTrue(enabled)
+        self.assertEqual(env["Guga_MAX_TOOL_ROUNDS"], "2")
 
 
 class VoiceChatRunnerTest(unittest.TestCase):

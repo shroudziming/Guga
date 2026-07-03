@@ -5,6 +5,7 @@ from guga.voice.metrics import VoiceMetrics, VoiceMetricsSummary
 from guga.voice.runner import VoiceChatRunner
 from guga.voice.sentence_buffer import TextSentenceBuffer
 from guga.voice.tts_client import GptSoVitsConfig, GptSoVitsHttpClient
+from guga.voice.tool_mode import configure_voice_tool_mode
 
 __all__ = [
     "AudioData",
@@ -17,4 +18,5 @@ __all__ = [
     "VoiceMetricsSummary",
     "WavAudioPlayer",
     "audio_player_from_env",
+    "configure_voice_tool_mode",
 ]
