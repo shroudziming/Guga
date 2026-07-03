@@ -23,7 +23,6 @@ from guga.voice import (
     configure_voice_tool_mode,
     prewarm_tts_client,
     sentence_buffer_from_env,
-    voice_preface_text_from_env,
 )
 
 
@@ -113,7 +112,6 @@ def main() -> None:
             text_sink=lambda chunk: print(chunk, end="", flush=True),
             sentence_buffer=sentence_buffer_from_env(os.environ),
             raise_tts_errors=False,
-            preface_text=voice_preface_text_from_env(os.environ),
         )
 
         try:

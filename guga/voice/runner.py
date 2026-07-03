@@ -3,7 +3,6 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -50,7 +49,6 @@ class VoiceChatRunner:
         metrics: VoiceMetrics | None = None,
         max_queue_size: int = 8,
         raise_tts_errors: bool = True,
-        preface_text: str = "",
     ) -> None:
         self.session = session
         self.tts_client = tts_client
@@ -59,7 +57,6 @@ class VoiceChatRunner:
         self.sentence_buffer = sentence_buffer or TextSentenceBuffer()
         self.metrics = metrics or VoiceMetrics()
         self.raise_tts_errors = raise_tts_errors
-        self.preface_text = preface_text.strip()
         self._queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=max_queue_size)
         self._errors: list[BaseException] = []
 
@@ -77,10 +74,6 @@ class VoiceChatRunner:
         worker.start()
 
         sequence_id = 0
-        if self.preface_text and not cancel_event.is_set():
-            sequence_id += 1
-            self._enqueue_sentence(sequence_id, self.preface_text)
-
         stream = self.session.reply_stream(user_input, cancel_event=cancel_event)
         try:
             for chunk in stream:
@@ -146,13 +139,3 @@ class VoiceChatRunner:
                 cancel_event.set()
             finally:
                 self._queue.task_done()
-
-
-def voice_preface_text_from_env(env: Mapping[str, str]) -> str:
-    if not _env_bool_value(env.get("GUGA_VOICE_PREFACE", "1")):
-        return ""
-    return env.get("GUGA_VOICE_PREFACE_TEXT", "嗯，我想一下。").strip() or "嗯，我想一下。"
-
-
-def _env_bool_value(raw: str) -> bool:
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
