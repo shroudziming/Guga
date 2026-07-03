@@ -40,8 +40,9 @@ class GptSoVitsConfig:
     batch_threshold: float = 0.75
     split_bucket: bool = True
     parallel_infer: bool = True
-    streaming_mode: bool = False
+    streaming_mode: bool | int = False
     media_type: str = "wav"
+    raw_sample_rate: int = 32000
     timeout_seconds: float = 120.0
 
     @classmethod
@@ -57,8 +58,9 @@ class GptSoVitsConfig:
             batch_threshold=_env_float("GUGA_TTS_BATCH_THRESHOLD", 0.75),
             split_bucket=_env_bool("GUGA_TTS_SPLIT_BUCKET", True),
             parallel_infer=_env_bool("GUGA_TTS_PARALLEL_INFER", True),
-            streaming_mode=_env_bool("GUGA_TTS_STREAMING_MODE", False),
+            streaming_mode=_env_streaming_mode("GUGA_TTS_STREAMING_MODE", False),
             media_type=os.environ.get("GUGA_TTS_MEDIA_TYPE", "wav"),
+            raw_sample_rate=_env_int("GUGA_TTS_RAW_SAMPLE_RATE", 32000),
             timeout_seconds=_env_float("GUGA_TTS_TIMEOUT_SECONDS", 120.0),
         )
 
@@ -80,6 +82,8 @@ class GptSoVitsHttpClient:
         data = self._post_json(self.config.endpoint, payload, self.config.timeout_seconds)
         if self.config.media_type.lower() == "wav":
             return AudioData.from_wav_bytes(data)
+        if self.config.media_type.lower() == "raw":
+            return AudioData.from_pcm16_mono(data, sample_rate=self.config.raw_sample_rate)
         return AudioData(
             data=data,
             sample_rate=0,
@@ -165,6 +169,17 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _env_streaming_mode(name: str, default: bool | int) -> bool | int:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "2", "3"}:
+        return int(raw)
+    if raw == "0":
+        return False
+    return raw in {"true", "yes", "on"}
 
 
 def _env_float(name: str, default: float) -> float:

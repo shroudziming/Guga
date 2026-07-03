@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import queue
 import tempfile
 import threading
@@ -34,6 +35,16 @@ class AudioData:
             duration_seconds=duration,
             media_type="wav",
         )
+
+    @classmethod
+    def from_pcm16_mono(cls, data: bytes, *, sample_rate: int) -> "AudioData":
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(data)
+        return cls.from_wav_bytes(buffer.getvalue())
 
 
 class NullAudioPlayer:

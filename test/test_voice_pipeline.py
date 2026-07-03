@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 import unittest
@@ -113,6 +114,20 @@ class FakeAudioPlayer:
 
 
 class GptSoVitsHttpClientTest(unittest.TestCase):
+    def test_reads_integer_streaming_mode_from_env(self) -> None:
+        previous = os.environ.get("GUGA_TTS_STREAMING_MODE")
+        try:
+            os.environ["GUGA_TTS_STREAMING_MODE"] = "3"
+
+            config = GptSoVitsConfig.from_env()
+
+            self.assertEqual(config.streaming_mode, 3)
+        finally:
+            if previous is None:
+                os.environ.pop("GUGA_TTS_STREAMING_MODE", None)
+            else:
+                os.environ["GUGA_TTS_STREAMING_MODE"] = previous
+
     def test_posts_non_streaming_parallel_tts_request(self) -> None:
         requests: list[dict] = []
 
@@ -150,6 +165,30 @@ class GptSoVitsHttpClientTest(unittest.TestCase):
         self.assertEqual(requests[0]["payload"]["prompt_text"], "参考文本")
         self.assertTrue(requests[0]["payload"]["parallel_infer"])
         self.assertFalse(requests[0]["payload"]["streaming_mode"])
+
+    def test_wraps_raw_pcm_response_as_wav_audio(self) -> None:
+        raw_pcm = b"\x00\x00\x00\x00" * 3200
+
+        def fake_post(url: str, payload: dict, timeout_seconds: float) -> bytes:
+            _ = url, payload, timeout_seconds
+            return raw_pcm
+
+        client = GptSoVitsHttpClient(
+            GptSoVitsConfig(
+                endpoint="http://127.0.0.1:9880/tts",
+                ref_audio_path="D:/voice/ref.wav",
+                prompt_text="参考文本",
+                media_type="raw",
+            ),
+            post_json=fake_post,
+        )
+
+        audio = client.synthesize("你好。")
+
+        self.assertEqual(audio.media_type, "wav")
+        self.assertEqual(audio.sample_rate, 32000)
+        self.assertEqual(audio.channels, 1)
+        self.assertAlmostEqual(audio.duration_seconds, 0.2, places=2)
 
     def test_prewarm_synthesizes_short_text_by_default(self) -> None:
         tts = FakeTtsClient()
