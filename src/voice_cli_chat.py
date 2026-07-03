@@ -21,6 +21,7 @@ from guga.voice import (
     VoiceChatRunner,
     audio_player_from_env,
     configure_voice_tool_mode,
+    sentence_buffer_from_env,
 )
 
 
@@ -107,6 +108,7 @@ def main() -> None:
             tts_client=tts_client,
             audio_player=player,
             text_sink=lambda chunk: print(chunk, end="", flush=True),
+            sentence_buffer=sentence_buffer_from_env(os.environ),
             raise_tts_errors=False,
         )
 
@@ -126,12 +128,18 @@ def _print_metrics(summary) -> None:
     print(
         "[voice] "
         f"sentences={summary.sentences} "
+        f"first_text={_format_ms(summary.first_text_ms)} "
+        f"first_sentence={_format_ms(summary.first_sentence_ms)} "
         f"first_audio={first_audio} "
         f"rtf={average_rtf} "
         f"audio={summary.audio_seconds:.2f}s "
         f"tts={summary.tts_seconds:.2f}s "
         f"total={total}\n"
     )
+
+
+def _format_ms(value: int | None) -> str:
+    return "n/a" if value is None else f"{value}ms"
 
 
 if __name__ == "__main__":

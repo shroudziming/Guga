@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from guga.voice.audio_player import AudioData, NullAudioPlayer, audio_player_from_env
 from guga.voice.metrics import VoiceMetrics
 from guga.voice.runner import VoiceChatRunner
-from guga.voice.sentence_buffer import TextSentenceBuffer
+from guga.voice.sentence_buffer import TextSentenceBuffer, sentence_buffer_from_env
 from guga.voice.tool_mode import configure_voice_tool_mode
 from guga.voice.tts_client import GptSoVitsConfig, GptSoVitsHttpClient
 
@@ -28,6 +28,11 @@ class SentenceBufferTest(unittest.TestCase):
 
         self.assertEqual(buffer.feed("一二三四五六七八"), ["一二三四五六"])
         self.assertEqual(buffer.flush(), ["七八"])
+
+    def test_voice_env_defaults_to_short_latency_split(self) -> None:
+        buffer = sentence_buffer_from_env({})
+
+        self.assertEqual(buffer.feed("一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二三"), ["一二三四五六七八九十一二三四五六七八九十一二三四五六七八九十一二"])
 
 
 class VoiceMetricsTest(unittest.TestCase):

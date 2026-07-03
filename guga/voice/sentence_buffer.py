@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 
 class TextSentenceBuffer:
     """Collect streaming text chunks and emit complete short sentences."""
@@ -53,3 +55,17 @@ class TextSentenceBuffer:
         indexes = [self._buffer.find(char) for char in self.boundaries]
         indexes = [index for index in indexes if index >= 0]
         return min(indexes) if indexes else -1
+
+
+def sentence_buffer_from_env(env: Mapping[str, str]) -> TextSentenceBuffer:
+    return TextSentenceBuffer(max_chars=_env_int(env.get("GUGA_TTS_SENTENCE_MAX_CHARS", ""), 32))
+
+
+def _env_int(raw: str, default: int) -> int:
+    if not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return min(200, max(8, value))
