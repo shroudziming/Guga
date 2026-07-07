@@ -31,6 +31,20 @@ class SentenceBufferTest(unittest.TestCase):
         self.assertEqual(buffer.feed("一二三四五六七八"), ["一二三四五六"])
         self.assertEqual(buffer.flush(), ["七八"])
 
+    def test_reports_split_reasons_for_debugging(self) -> None:
+        buffer = TextSentenceBuffer(max_chars=6)
+
+        boundary_segments = buffer.feed_segments("咕咕嘎嘎！是你")
+        max_segments = buffer.feed_segments("是你我刚刚看到")
+        flush_segments = buffer.flush_segments()
+
+        self.assertEqual([segment.text for segment in boundary_segments], ["咕咕嘎嘎！"])
+        self.assertEqual(boundary_segments[0].split_reason, "boundary:！")
+        self.assertEqual([segment.text for segment in max_segments], ["是你是你我刚"])
+        self.assertEqual(max_segments[0].split_reason, "max_chars:6")
+        self.assertEqual([segment.text for segment in flush_segments], ["刚看到"])
+        self.assertEqual(flush_segments[0].split_reason, "flush")
+
     def test_voice_env_defaults_to_short_latency_split(self) -> None:
         buffer = sentence_buffer_from_env({})
 
@@ -89,6 +103,14 @@ class CancelAfterOneChunkSession:
         yield "未完成"
         if cancel_event is not None:
             cancel_event.set()
+
+
+class DebugFakeSession(FakeSession):
+    def __init__(self, chunks: list[str], logs: list[str]) -> None:
+        super().__init__(chunks)
+        self.debug = True
+        self.debug_sink = logs.append
+        self.session_id = "debug_session"
 
 
 class FakeTtsClient:
@@ -345,6 +367,33 @@ class VoiceChatRunnerTest(unittest.TestCase):
 
         self.assertEqual(printed, ["咕嘎（眼睛", "放光）好吃。"])
         self.assertEqual(tts.requests, ["咕嘎好吃。"])
+
+    def test_debug_logs_voice_playback_split_points(self) -> None:
+        logs: list[str] = []
+        session = DebugFakeSession(
+            ["咕咕嘎嘎！是你是你！我刚刚看到你来就好开心呀！（摇摇摆摆跑过来）要陪我玩吗？"],
+            logs,
+        )
+        tts = FakeTtsClient()
+
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=tts,
+            audio_player=FakeAudioPlayer(),
+            text_sink=lambda chunk: None,
+            sentence_buffer=TextSentenceBuffer(max_chars=16),
+        )
+
+        runner.run_turn("hi")
+
+        playback_logs = [log for log in logs if "voice_playback_start" in log]
+        self.assertEqual(len(playback_logs), 4)
+        self.assertIn("[DEBUG][VoiceChatRunner][debug_session]", playback_logs[0])
+        self.assertIn("sequence_id=1", playback_logs[0])
+        self.assertIn("token_count=5", playback_logs[0])
+        self.assertIn("split_reason=boundary:！", playback_logs[0])
+        self.assertIn('text="咕咕嘎嘎！"', playback_logs[0])
+        self.assertIn('text="要陪我玩吗？"', playback_logs[-1])
 
 
 if __name__ == "__main__":

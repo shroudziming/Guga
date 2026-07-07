@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class TextSegment:
+    text: str
+    split_reason: str
 
 
 class TextSentenceBuffer:
@@ -19,37 +26,44 @@ class TextSentenceBuffer:
         self._buffer = ""
 
     def feed(self, chunk: str) -> list[str]:
+        return [segment.text for segment in self.feed_segments(chunk)]
+
+    def feed_segments(self, chunk: str) -> list[TextSegment]:
         if not chunk:
             return []
 
         self._buffer += chunk
-        sentences: list[str] = []
+        segments: list[TextSegment] = []
 
         while self._buffer:
             boundary_index = self._first_boundary_index()
             if boundary_index >= 0:
                 end = boundary_index + 1
+                boundary = self._buffer[boundary_index]
                 sentence = self._buffer[:end].strip()
                 self._buffer = self._buffer[end:]
                 if sentence:
-                    sentences.append(sentence)
+                    segments.append(TextSegment(text=sentence, split_reason=f"boundary:{boundary}"))
                 continue
 
             if len(self._buffer) >= self.max_chars:
                 sentence = self._buffer[: self.max_chars].strip()
                 self._buffer = self._buffer[self.max_chars :]
                 if sentence:
-                    sentences.append(sentence)
+                    segments.append(TextSegment(text=sentence, split_reason=f"max_chars:{self.max_chars}"))
                 continue
 
             break
 
-        return sentences
+        return segments
 
     def flush(self) -> list[str]:
+        return [segment.text for segment in self.flush_segments()]
+
+    def flush_segments(self) -> list[TextSegment]:
         sentence = self._buffer.strip()
         self._buffer = ""
-        return [sentence] if sentence else []
+        return [TextSegment(text=sentence, split_reason="flush")] if sentence else []
 
     def _first_boundary_index(self) -> int:
         indexes = [self._buffer.find(char) for char in self.boundaries]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -36,6 +37,7 @@ class AudioPlayer(Protocol):
 class _TtsJob:
     sequence_id: int
     text: str
+    split_reason: str
 
 
 class VoiceChatRunner:
@@ -84,14 +86,14 @@ class VoiceChatRunner:
                 self.metrics.text_chunk_received()
                 self.text_sink(chunk)
                 spoken_chunk = self.spoken_text_filter.feed(chunk)
-                for sentence in self.sentence_buffer.feed(spoken_chunk):
+                for segment in self.sentence_buffer.feed_segments(spoken_chunk):
                     sequence_id += 1
-                    self._enqueue_sentence(sequence_id, sentence)
+                    self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
 
             if not cancel_event.is_set():
-                for sentence in self.sentence_buffer.flush():
+                for segment in self.sentence_buffer.flush_segments():
                     sequence_id += 1
-                    self._enqueue_sentence(sequence_id, sentence)
+                    self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
             else:
                 self.sentence_buffer.flush()
         except BaseException:
@@ -111,9 +113,9 @@ class VoiceChatRunner:
 
         return self.metrics.summary()
 
-    def _enqueue_sentence(self, sequence_id: int, sentence: str) -> None:
+    def _enqueue_sentence(self, sequence_id: int, sentence: str, split_reason: str) -> None:
         self.metrics.sentence_queued(sentence)
-        self._queue.put(_TtsJob(sequence_id=sequence_id, text=sentence))
+        self._queue.put(_TtsJob(sequence_id=sequence_id, text=sentence, split_reason=split_reason))
 
     def _tts_worker(self, cancel_event: threading.Event) -> None:
         while True:
@@ -135,6 +137,7 @@ class VoiceChatRunner:
                 )
                 if cancel_event.is_set():
                     continue
+                self._debug_voice_playback_start(job)
                 self.audio_player.enqueue(audio)
                 self.metrics.audio_enqueued(job.sequence_id)
             except BaseException as exc:
@@ -142,3 +145,21 @@ class VoiceChatRunner:
                 cancel_event.set()
             finally:
                 self._queue.task_done()
+
+    def _debug_voice_playback_start(self, job: _TtsJob) -> None:
+        if not bool(getattr(self.session, "debug", False)):
+            return
+        text = json.dumps(job.text, ensure_ascii=False)
+        message = (
+            "voice_playback_start "
+            f"sequence_id={job.sequence_id} "
+            f"token_count={len(job.text)} "
+            f"split_reason={job.split_reason} "
+            f"text={text}"
+        )
+        output = f"[DEBUG][VoiceChatRunner][{getattr(self.session, 'session_id', 'unknown_session')}] {message}"
+        debug_sink = getattr(self.session, "debug_sink", None)
+        if callable(debug_sink):
+            debug_sink(output)
+            return
+        print(output)
