@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from guga.chat import ChatSession
@@ -85,6 +86,43 @@ def ingest_longmemeval_case(case: LongMemEvalCase, manager: MemoryManager) -> di
     return {"sessions": len(case.sessions), "messages": messages}
 
 
+def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager) -> dict[str, int]:
+    messages = 0
+    finalized_turns = 0
+    for session_index, session in enumerate(case.sessions):
+        session_id = f"{case.case_id}_s{session_index}"
+        has_open_user_turn = False
+        for message in session:
+            role = _normalize_role(message.role)
+            if role == "assistant":
+                manager.record_assistant_message(
+                    session_id=session_id,
+                    text=message.content,
+                    source="benchmark:longmemeval",
+                    created_at=message.created_at or None,
+                )
+                if has_open_user_turn:
+                    manager.finalize_turn(session_id)
+                    finalized_turns += 1
+                    has_open_user_turn = False
+            else:
+                if has_open_user_turn:
+                    manager.finalize_turn(session_id)
+                    finalized_turns += 1
+                manager.record_user_message(
+                    session_id=session_id,
+                    text=message.content,
+                    source="benchmark:longmemeval",
+                    created_at=message.created_at or None,
+                )
+                has_open_user_turn = True
+            messages += 1
+        if has_open_user_turn:
+            manager.finalize_turn(session_id)
+            finalized_turns += 1
+    return {"sessions": len(case.sessions), "messages": messages, "finalized_turns": finalized_turns}
+
+
 def run_longmemeval_case(
     case: LongMemEvalCase,
     model,
@@ -92,7 +130,9 @@ def run_longmemeval_case(
     generation: GenerationConfig,
     debug: bool = False,
     enable_semantic: bool = True,
+    ingest_mode: str = "raw",
 ) -> dict[str, Any]:
+    total_started = perf_counter()
     memory_root = workspace.case_memory_root(case.case_id)
     debug_sink = FileDebugSink(workspace.case_debug_reports_dir(case.case_id)) if debug else None
     manager = MemoryManager(
@@ -103,7 +143,14 @@ def run_longmemeval_case(
         documents_dir=workspace.documents_dir,
         enable_semantic=enable_semantic,
     )
-    ingest_stats = ingest_longmemeval_case(case, manager)
+    ingest_started = perf_counter()
+    if ingest_mode == "replay":
+        ingest_stats = ingest_longmemeval_case_replay(case, manager)
+    elif ingest_mode == "raw":
+        ingest_stats = ingest_longmemeval_case(case, manager)
+    else:
+        raise ValueError(f"Unsupported LongMemEval ingest_mode: {ingest_mode}")
+    ingest_latency_ms = int((perf_counter() - ingest_started) * 1000)
     if manager.rag_pipeline is not None:
         manager.rebuild_rag_indexes(session_id=f"{case.case_id}_benchmark")
 
@@ -116,7 +163,10 @@ def run_longmemeval_case(
         debug=debug,
         debug_sink=debug_sink,
     )
+    answer_started = perf_counter()
     prediction = session.reply(case.question, finalize_memory=False).strip()
+    answer_latency_ms = int((perf_counter() - answer_started) * 1000)
+    total_latency_ms = int((perf_counter() - total_started) * 1000)
 
     result = {
         "case_id": case.case_id,
@@ -125,8 +175,14 @@ def run_longmemeval_case(
         "answer": case.answer,
         "prediction": prediction,
         "ingest": ingest_stats,
+        "ingest_mode": ingest_mode,
         "memory_root": str(memory_root),
         "finalize_skipped": True,
+        "timing_ms": {
+            "ingest": ingest_latency_ms,
+            "answer": answer_latency_ms,
+            "total": total_latency_ms,
+        },
     }
     _append_result(workspace.results_file, result)
     return result
@@ -140,6 +196,7 @@ def run_longmemeval_benchmark(
     limit: int | None = None,
     debug: bool = False,
     enable_semantic: bool = True,
+    ingest_mode: str = "raw",
 ) -> list[dict[str, Any]]:
     cases = load_longmemeval_cases(dataset_path)
     if limit is not None:
@@ -155,6 +212,7 @@ def run_longmemeval_benchmark(
                 generation=generation,
                 debug=debug,
                 enable_semantic=enable_semantic,
+                ingest_mode=ingest_mode,
             )
         )
     return results

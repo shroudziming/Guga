@@ -37,6 +37,12 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=None, help="Optional case limit for smoke runs.")
     parser.add_argument("--debug", action="store_true", help="Write benchmark debug reports.")
     parser.add_argument("--no-semantic", action="store_true", help="Disable semantic RAG indexes for a lightweight run.")
+    parser.add_argument(
+        "--ingest-mode",
+        choices=("raw", "replay"),
+        default="raw",
+        help="raw imports history as retrievable memory; replay finalizes each historical turn like daily chat.",
+    )
     args = parser.parse_args()
 
     _load_env_file()
@@ -52,6 +58,7 @@ def main() -> None:
         limit=args.limit,
         debug=args.debug,
         enable_semantic=not args.no_semantic,
+        ingest_mode=args.ingest_mode,
     )
 
     print(f"LongMemEval cases={len(results)}")

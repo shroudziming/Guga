@@ -8,6 +8,7 @@ from pathlib import Path
 from guga.benchmark.longmemeval import (
     LONGMEMEVAL_SYSTEM_PROMPT,
     ingest_longmemeval_case,
+    ingest_longmemeval_case_replay,
     load_longmemeval_cases,
     run_longmemeval_benchmark,
     run_longmemeval_case,
@@ -181,6 +182,68 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             ]
             self.assertEqual(len(rows), 2)
             self.assertIn("assistant: Remember to water the basil every Monday.", rows[1]["summary"])
+
+    def test_replay_ingest_finalizes_turns_into_archival_memory(self) -> None:
+        class ReplayModel:
+            def generate_reply(self, messages, gen):
+                _ = gen
+                prompt = messages[-1]["content"]
+                if "Memory route classifier" in prompt:
+                    return json.dumps(
+                        [
+                            {
+                                "target": "archival_memory",
+                                "label": "stable_context",
+                                "content": "User likes blue notebooks.",
+                                "topic": "preference",
+                                "importance": 0.8,
+                                "confidence": 0.9,
+                            }
+                        ]
+                    )
+                if "Summarize" in prompt or "summary" in prompt:
+                    return "- User likes blue notebooks."
+                if "用户画像整理器" in prompt:
+                    return "- 用户喜欢蓝色笔记本。"
+                return "ok"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "longmemeval.jsonl"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "question_id": "q_replay",
+                        "question": "What does the user like?",
+                        "answer": "blue notebooks",
+                        "sessions": [
+                            [
+                                {"role": "user", "content": "I like blue notebooks."},
+                                {"role": "assistant", "content": "I will remember that."},
+                            ]
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            workspace = benchmark_workspace("longmemeval", root=root, run_id="run_001")
+            case = load_longmemeval_cases(dataset)[0]
+            manager = MemoryManager(
+                memory_root=workspace.case_memory_root(case.case_id),
+                model=ReplayModel(),
+                documents_dir=workspace.documents_dir,
+                enable_semantic=False,
+            )
+
+            stats = ingest_longmemeval_case_replay(case, manager)
+
+            self.assertEqual(stats["sessions"], 1)
+            self.assertEqual(stats["messages"], 2)
+            self.assertEqual(stats["finalized_turns"], 1)
+            archival_rows = (workspace.case_memory_root(case.case_id) / "archival_memory.jsonl").read_text(encoding="utf-8")
+            self.assertIn("User likes blue notebooks.", archival_rows)
 
     def test_run_case_uses_benchmark_system_prompt_instead_of_daily_persona(self) -> None:
         class CaptureModel:
