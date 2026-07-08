@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
 
 
@@ -12,6 +13,49 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
+        if "Low-level memory consolidation" in prompt:
+            if "你记得" in prompt or "还记得" in prompt or "随便聊聊" in prompt:
+                return json.dumps({"timeline_facts": [], "event_summaries": []}, ensure_ascii=False)
+            if "复查" in prompt:
+                obj = "复查"
+                day = ""
+            elif "导师开会" in prompt:
+                obj = "和导师开会"
+                day = "2026-07-04"
+            elif "提交项目报告" in prompt:
+                obj = "提交项目报告"
+                day = "2026-07-03"
+            else:
+                return json.dumps({"timeline_facts": [], "event_summaries": []}, ensure_ascii=False)
+            return json.dumps(
+                {
+                    "timeline_facts": [
+                        {
+                            "action": "upsert",
+                            "subject": "user",
+                            "predicate": "has_time_bound_plan",
+                            "object": obj,
+                            "summary": f"用户在{day or '未来'}有时间相关安排：{obj}",
+                            "semantic_day": day,
+                            "confidence": 0.9,
+                            "source_message_ids": [],
+                        }
+                    ],
+                    "event_summaries": [],
+                },
+                ensure_ascii=False,
+            )
+        if "High-level memory consolidation" in prompt:
+            return json.dumps(
+                {
+                    "decision": "no_high_level_update",
+                    "archival_updates": [],
+                    "profile_updates": [],
+                    "personality_insight_updates": [],
+                    "reason": "Timeline-only update.",
+                },
+                ensure_ascii=False,
+            )
         if "Memory route" in prompt or "memory route" in prompt:
             if "你记得" in prompt or "还记得" in prompt:
                 return json.dumps([{"target": "discard", "label": "one_off", "content": "", "confidence": 0.8}], ensure_ascii=False)
@@ -51,6 +95,7 @@ class TimelineFactsTest(unittest.TestCase):
             top_k=4,
             recency_weight=0.0,
             enable_semantic=False,
+            consolidation_config=MemoryConsolidationConfig(batch_turns=1),
         )
 
     def tearDown(self) -> None:

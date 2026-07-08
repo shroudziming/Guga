@@ -25,11 +25,12 @@ from guga.config import (
     DEFAULT_RAG_EMBEDDING_MODEL,
     DEFAULT_RAG_ENABLE_SEMANTIC,
 )
+from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
 from guga.memory.portrait import UserPortraitStore
 from guga.memory.profile_store import ProfileStore
-from guga.memory.summarizer import MemoryBankSummarizer
+from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
 from guga.memory.timeline_facts import TimelineFactStore
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso
 from guga.rag.pipeline import RagPipeline
@@ -108,6 +109,7 @@ class MemoryManager:
         recency_weight: float = DEFAULT_MEMORY_RECENCY_WEIGHT,
         enable_semantic: bool = DEFAULT_RAG_ENABLE_SEMANTIC,
         documents_dir: Path | None = None,
+        consolidation_config: MemoryConsolidationConfig | None = None,
     ) -> None:
         """Create manager with lexical + optional semantic retrieval capabilities.
 
@@ -161,11 +163,13 @@ class MemoryManager:
         self.archival_file = self.memory_root / "archival_memory.jsonl"
         self.session_memory_file = self.memory_root / "session_memories.jsonl"
         self.timeline_fact_file = self.memory_root / "timeline_facts.jsonl"
+        self.consolidation_state_file = self.memory_root / "consolidation_state.json"
         self.profile_store = ProfileStore(self.memory_root / "profile.json")
         self.event_summary_store = EventSummaryStore(self.memory_root / "event_summaries.jsonl")
         self.timeline_fact_store = TimelineFactStore(self.timeline_fact_file)
         self.portrait_store = UserPortraitStore(self.memory_root / "profile.json", self.memory_root / "personality_insights.jsonl")
         self.summarizer = MemoryBankSummarizer(model=model)
+        self.consolidation_config = (consolidation_config or MemoryConsolidationConfig()).normalized()
         self.session_store = _SessionStore(self.memory_root / "sessions")
         self._turn_state: dict[str, dict[str, str]] = {}
         self._date_context_by_session: dict[str, str] = {}
@@ -540,87 +544,407 @@ class MemoryManager:
         for future in futures:
             future.result(timeout=timeout)
 
+    def flush_session_memory(self, session_id: str) -> dict[str, int]:
+        """Force consolidation for any pending completed turns in a session."""
+        return self._consolidate_pending_turns(session_id=session_id, force=True)
+
     def _pop_turn_state(self, session_id: str) -> dict[str, str]:
         with self._turn_state_lock:
             return dict(self._turn_state.pop(session_id, {}))
 
     def _finalize_turn_state(self, session_id: str, state: dict[str, str]) -> None:
         started = perf_counter()
-        user_text = state.get("user_text", "").strip()
-        assistant_text = state.get("assistant_text", "").strip()
         session_memory_payload = self._load_memory_by_id(self.session_memory_file, state.get("session_memory_id", ""))
-        route_candidates = self.summarizer.route_memory_candidates(user_text=user_text, assistant_text=assistant_text) if user_text else []
-        if route_candidates:
-            targets = [str(item.get("target", "")) for item in route_candidates if str(item.get("target", ""))]
-            discarded = [str(item.get("label", "")) for item in route_candidates if item.get("target") == "discard"]
-            self._debug(session_id, f"memory_route targets={targets} discarded={discarded}")
-        memory_candidate = self.summarizer.extract_archival_memory_from_routes(route_candidates) if user_text else {}
-        should_archive = bool(memory_candidate.get("should_archive")) if memory_candidate else False
-        if user_text and should_archive:
-            now = now_beijing_iso()
-            payload = apply_temporal_fields(
-                {
-                    "id": f"mem_{uuid4().hex[:10]}",
-                    "type": "episodic",
-                    "topic": str(memory_candidate.get("topic") or "general"),
-                    "summary": str(memory_candidate.get("summary") or f"用户提到：{user_text}"),
-                    "raw_excerpt": user_text,
-                    "importance": float(memory_candidate.get("importance", 0.7) or 0.7),
-                    "confidence": float(memory_candidate.get("confidence", 0.7) or 0.7),
-                    "created_at": now,
-                    "last_recalled_at": now,
-                    "memory_strength": 1,
-                    "retention": 1.0,
-                    "source_session_id": session_id,
-                    "source_message_ids": [state.get("user_message_id", "")],
-                    "status": "active",
-                },
-                text=f"{user_text}\n{memory_candidate.get('summary', '')}",
-                reference_time=now,
-            )
-            with self.archival_file.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-            if self.rag_pipeline is not None:
-                try:
-                    self._ensure_semantic_index(session_id)
-                    self.rag_pipeline.add_memory_record(payload)
-                except Exception as exc:
-                    self._debug(session_id, f"index_update status=failed reason={exc}")
-
-            elapsed_ms = int((perf_counter() - started) * 1000)
-            self._debug(
-                session_id,
-                f"writeback status=archival_added memory_id={payload['id']} source_ids={payload['source_message_ids']} latency_ms={elapsed_ms}",
-            )
-        else:
-            elapsed_ms = int((perf_counter() - started) * 1000)
-            self._debug(session_id, f"writeback status=no_archival_write latency_ms={elapsed_ms}")
-
-        fact_payload = {}
-        if user_text:
-            fact_payload = self.timeline_fact_store.append_from_route_items(
-                user_text=user_text,
-                route_items=route_candidates,
-                session_id=session_id,
-                source_message_ids=[state.get("user_message_id", "")],
-                created_at=str(session_memory_payload.get("created_at", "")),
-            )
-            if fact_payload:
-                self._debug(session_id, f"timeline_fact_added fact_id={fact_payload.get('id', '')} day={fact_payload.get('semantic_day', '')}")
-        if fact_payload and self.rag_pipeline is not None:
-            try:
-                self.rag_pipeline.add_memory_record(fact_payload)
-            except Exception as exc:
-                self._debug(session_id, f"index_update status=timeline_fact_failed reason={exc}")
-
         if session_memory_payload and self.rag_pipeline is not None:
             try:
                 self.rag_pipeline.add_memory_record(session_memory_payload)
             except Exception as exc:
                 self._debug(session_id, f"index_update status=session_memory_failed reason={exc}")
-        if user_text:
-            self._refresh_hierarchical_memory(session_id=session_id)
+        if not state.get("user_message_id"):
+            elapsed_ms = int((perf_counter() - started) * 1000)
+            self._debug(session_id, f"writeback status=no_completed_turn latency_ms={elapsed_ms}")
+            return
+
+        pending_count = self._append_pending_turn(session_id=session_id, state=state)
+        elapsed_ms = int((perf_counter() - started) * 1000)
+        self._debug(session_id, f"writeback status=pending_turn_added pending={pending_count} latency_ms={elapsed_ms}")
+        if pending_count >= self.consolidation_config.batch_turns:
+            self._consolidate_pending_turns(session_id=session_id, force=False)
+
+    def _append_pending_turn(self, *, session_id: str, state: dict[str, str]) -> int:
+        if not state.get("user_message_id"):
+            return 0
+        with self._turn_state_lock:
+            payload = self._read_consolidation_state()
+            session_state = self._session_consolidation_state(payload, session_id)
+            session_state["pending_turns"].append(
+                {
+                    "user_message_id": state.get("user_message_id", ""),
+                    "assistant_message_id": state.get("assistant_message_id", ""),
+                    "session_memory_id": state.get("session_memory_id", ""),
+                    "created_at": str(self._load_memory_by_id(self.session_memory_file, state.get("session_memory_id", "")).get("created_at", "")),
+                }
+            )
+            session_state["completed_turns"] = int(session_state.get("completed_turns", 0) or 0) + 1
+            pending_count = len(session_state["pending_turns"])
+            self._write_consolidation_state(payload)
+            return pending_count
+
+    def _consolidate_pending_turns(self, *, session_id: str, force: bool) -> dict[str, int]:
+        with self._turn_state_lock:
+            payload = self._read_consolidation_state()
+            session_state = self._session_consolidation_state(payload, session_id)
+            pending_turns = list(session_state.get("pending_turns", []) or [])
+            if not pending_turns:
+                return {
+                    "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
+                    "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
+                    "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
+                    "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
+                }
+            if not force and len(pending_turns) < self.consolidation_config.batch_turns:
+                return {
+                    "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
+                    "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
+                    "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
+                    "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
+                }
+            if not self.summarizer.use_llm:
+                self._debug(session_id, "consolidation_skipped reason=no_llm_model")
+                return {
+                    "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
+                    "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
+                    "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
+                    "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
+                }
+            batch_seq = int(session_state.get("batch_seq", 0) or 0) + 1
+
+        try:
+            low_packet = self._build_low_level_packet(session_id=session_id, pending_turns=pending_turns)
+            low_result = self.summarizer.consolidate_low_level_memory(
+                low_packet,
+                include_guga_reflection=self.consolidation_config.include_guga_reflection,
+            )
+            high_packet = self._build_high_level_packet(pending_low_level=low_result)
+            high_result = self.summarizer.consolidate_high_level_memory(high_packet)
+            low_counts = self._apply_low_level_consolidation(
+                session_id=session_id,
+                batch_seq=batch_seq,
+                result=low_result,
+                pending_turns=pending_turns,
+            )
+            high_counts = self._apply_high_level_consolidation(
+                session_id=session_id,
+                result=high_result,
+                low_source_message_ids=self._pending_source_message_ids(pending_turns),
+            )
+        except SummaryGenerationError as exc:
+            self._debug(session_id, f"consolidation_failed reason={exc}")
+            return {"consolidation_batches": 0, "low_level_updates": 0, "high_level_updates": 0, "high_level_noops": 0}
+
+        with self._turn_state_lock:
+            payload = self._read_consolidation_state()
+            session_state = self._session_consolidation_state(payload, session_id)
+            session_state["pending_turns"] = []
+            session_state["batch_seq"] = batch_seq
+            session_state["consolidation_batches"] = int(session_state.get("consolidation_batches", 0) or 0) + 1
+            session_state["low_level_updates"] = int(session_state.get("low_level_updates", 0) or 0) + low_counts["low_level_updates"]
+            session_state["high_level_updates"] = int(session_state.get("high_level_updates", 0) or 0) + high_counts["high_level_updates"]
+            session_state["high_level_noops"] = int(session_state.get("high_level_noops", 0) or 0) + high_counts["high_level_noops"]
+            self._write_consolidation_state(payload)
+            self._debug(
+                session_id,
+                f"consolidation_done batch_seq={batch_seq} low_updates={low_counts['low_level_updates']} high_updates={high_counts['high_level_updates']} high_noops={high_counts['high_level_noops']}",
+            )
+            return {
+                "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
+                "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
+                "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
+                "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
+            }
+
+    def consolidation_stats(self, session_id: str) -> dict[str, int]:
+        payload = self._read_consolidation_state()
+        session_state = self._session_consolidation_state(payload, session_id)
+        return {
+            "completed_turns": int(session_state.get("completed_turns", 0) or 0),
+            "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
+            "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
+            "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
+            "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
+        }
+
+    def _build_low_level_packet(self, *, session_id: str, pending_turns: list[dict]) -> dict:
+        new_turns = self._load_pending_turn_messages(session_id=session_id, pending_turns=pending_turns)
+        query = "\n".join(
+            str(turn.get(key, ""))
+            for turn in new_turns
+            for key in ("user_text", "assistant_text")
+            if str(turn.get(key, "")).strip()
+        )
+        packet = {
+            "new_turns": new_turns,
+            "existing_timeline_facts": self.timeline_fact_store.load_active()[-20:],
+            "existing_event_summaries": self.event_summary_store.load_active()[-20:],
+            "retrieved_context": self._consolidation_retrieved_context(query),
+        }
+        return self._trim_packet(packet)
+
+    def _build_high_level_packet(self, pending_low_level: dict | None = None) -> dict:
+        packet = {
+            "timeline_facts": self.timeline_fact_store.load_active()[-50:],
+            "event_summaries": self.event_summary_store.load_active()[-50:],
+            "pending_low_level_updates": pending_low_level or {"timeline_facts": [], "event_summaries": []},
+            "archival_memory": self._read_jsonl_records(self.archival_file)[-50:],
+            "profile": self.portrait_store.load(),
+            "personality_insights": self._read_jsonl_records(self.portrait_store.daily_file_path)[-50:],
+        }
+        return self._trim_packet(packet)
+
+    def _apply_low_level_consolidation(
+        self,
+        *,
+        session_id: str,
+        batch_seq: int,
+        result: dict,
+        pending_turns: list[dict],
+    ) -> dict[str, int]:
+        updates = 0
+        source_message_ids = self._pending_source_message_ids(pending_turns)
+        for item in result.get("timeline_facts", []) or []:
+            if not isinstance(item, dict) or str(item.get("action", "upsert")) != "upsert":
+                continue
+            payload = self.timeline_fact_store.upsert_consolidated_fact(
+                payload=item,
+                session_id=session_id,
+                source_message_ids=source_message_ids,
+                include_guga_reflection=self.consolidation_config.include_guga_reflection,
+            )
+            if payload:
+                updates += 1
+                if self.rag_pipeline is not None:
+                    try:
+                        self.rag_pipeline.add_memory_record(payload)
+                    except Exception as exc:
+                        self._debug(session_id, f"index_update status=timeline_fact_failed reason={exc}")
+        for item in result.get("event_summaries", []) or []:
+            if not isinstance(item, dict) or str(item.get("action", "upsert")) != "upsert":
+                continue
+            payload = self.event_summary_store.upsert_batch_summary(
+                session_id=session_id,
+                batch_seq=batch_seq,
+                payload=item,
+                source_message_ids=source_message_ids,
+                include_guga_reflection=self.consolidation_config.include_guga_reflection,
+            )
+            if payload:
+                updates += 1
+                if self.rag_pipeline is not None:
+                    try:
+                        self.rag_pipeline.add_memory_record(payload)
+                    except Exception as exc:
+                        self._debug(session_id, f"index_update status=event_summary_failed reason={exc}")
+        return {"low_level_updates": updates}
+
+    def _apply_high_level_consolidation(
+        self,
+        *,
+        session_id: str,
+        result: dict,
+        low_source_message_ids: list[str],
+    ) -> dict[str, int]:
+        decision = str(result.get("decision", "no_high_level_update"))
+        if decision == "no_high_level_update":
+            self._debug(session_id, f"high_level_noop reason={result.get('reason', '')}")
+            return {"high_level_updates": 0, "high_level_noops": 1}
+
+        updates = 0
+        if self.consolidation_config.enable_archival_updates:
+            for item in result.get("archival_updates", []) or []:
+                if not isinstance(item, dict):
+                    continue
+                payload = self._build_archival_update(item=item, session_id=session_id, fallback_source_ids=low_source_message_ids)
+                if not payload:
+                    continue
+                self._append_jsonl(self.archival_file, payload)
+                updates += 1
+                if self.rag_pipeline is not None:
+                    try:
+                        self.rag_pipeline.add_memory_record(payload)
+                    except Exception as exc:
+                        self._debug(session_id, f"index_update status=archival_failed reason={exc}")
+        if self.consolidation_config.enable_profile_updates:
+            profile = self.portrait_store.apply_profile_updates(result.get("profile_updates", []) or [])
+            if profile.get("portrait_summary"):
+                updates += 1
+        if self.consolidation_config.enable_personality_updates:
+            written = self.portrait_store.apply_personality_insight_updates(
+                updates=result.get("personality_insight_updates", []) or [],
+                source_session_id=session_id,
+                source_message_ids=low_source_message_ids,
+            )
+            updates += len(written)
+        return {"high_level_updates": updates, "high_level_noops": 0}
+
+    def _build_archival_update(self, *, item: dict, session_id: str, fallback_source_ids: list[str]) -> dict:
+        summary = str(item.get("summary", "")).strip()
+        if not summary:
+            return {}
+        now = now_beijing_iso()
+        source_message_ids = [str(value) for value in (item.get("source_message_ids") or fallback_source_ids) if str(value)]
+        return normalize_memorybank_fields(
+            apply_temporal_fields(
+                {
+                    "id": f"mem_{uuid4().hex[:10]}",
+                    "type": "episodic",
+                    "topic": str(item.get("topic") or "general").strip()[:64] or "general",
+                    "summary": summary[:500],
+                    "raw_excerpt": summary[:500],
+                    "importance": self._clamp_float(item.get("importance"), 0.7),
+                    "confidence": self._clamp_float(item.get("confidence"), 0.7),
+                    "created_at": now,
+                    "last_recalled_at": now,
+                    "memory_strength": 1,
+                    "retention": 1.0,
+                    "source_session_id": session_id,
+                    "source_message_ids": source_message_ids,
+                    "status": "active",
+                },
+                text=summary,
+                reference_time=now,
+            )
+        )
+
+    def _load_pending_turn_messages(self, *, session_id: str, pending_turns: list[dict]) -> list[dict]:
+        rows = self._read_session_rows(self.memory_root / "sessions" / f"{session_id}.jsonl")
+        by_id = {str(row.get("id", "")): row for row in rows}
+        new_turns: list[dict] = []
+        for turn in pending_turns:
+            user = by_id.get(str(turn.get("user_message_id", "")), {})
+            assistant = by_id.get(str(turn.get("assistant_message_id", "")), {})
+            if not user:
+                continue
+            new_turns.append(
+                {
+                    "user_message_id": str(user.get("id", "")),
+                    "assistant_message_id": str(assistant.get("id", "")),
+                    "created_at": str(user.get("created_at", "")),
+                    "user_text": str(user.get("content", "")),
+                    "assistant_text": str(assistant.get("content", "")),
+                }
+            )
+        return new_turns
+
+    def _pending_source_message_ids(self, pending_turns: list[dict]) -> list[str]:
+        ids: list[str] = []
+        for turn in pending_turns:
+            for key in ("user_message_id", "assistant_message_id"):
+                value = str(turn.get(key, "")).strip()
+                if value:
+                    ids.append(value)
+        return ids
+
+    def _consolidation_retrieved_context(self, query: str) -> list[dict]:
+        if not query.strip():
+            return []
+        rows = self._load_archival_records()
+        scored: list[tuple[float, dict]] = []
+        for row in rows:
+            score, _ = self._score_components(row, query)
+            if score > 0:
+                scored.append((score, row))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [
+            {
+                "id": str(row.get("id", "")),
+                "type": str(row.get("type", "")),
+                "summary": str(row.get("summary", "")),
+                "source_message_ids": list(row.get("source_message_ids", []) or []),
+            }
+            for _, row in scored[:10]
+        ]
+
+    def _trim_packet(self, packet: dict) -> dict:
+        text = json.dumps(packet, ensure_ascii=False)
+        if len(text) <= self.consolidation_config.max_packet_chars:
+            return packet
+        trimmed = dict(packet)
+        for key in ("retrieved_context", "existing_event_summaries", "existing_timeline_facts", "personality_insights"):
+            value = trimmed.get(key)
+            if isinstance(value, list) and len(json.dumps(trimmed, ensure_ascii=False)) > self.consolidation_config.max_packet_chars:
+                trimmed[key] = value[-5:]
+        if len(json.dumps(trimmed, ensure_ascii=False)) > self.consolidation_config.max_packet_chars:
+            for turn in trimmed.get("new_turns", []) or []:
+                if isinstance(turn, dict):
+                    turn["user_text"] = str(turn.get("user_text", ""))[-2000:]
+                    turn["assistant_text"] = str(turn.get("assistant_text", ""))[-2000:]
+        return trimmed
+
+    def _read_consolidation_state(self) -> dict:
+        if not self.consolidation_state_file.exists():
+            return {"schema_version": 1, "sessions": {}}
+        try:
+            payload = json.loads(self.consolidation_state_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {"schema_version": 1, "sessions": {}}
+        if not isinstance(payload, dict):
+            return {"schema_version": 1, "sessions": {}}
+        payload.setdefault("schema_version", 1)
+        sessions = payload.get("sessions")
+        if not isinstance(sessions, dict):
+            payload["sessions"] = {}
+        return payload
+
+    def _write_consolidation_state(self, payload: dict) -> None:
+        self.consolidation_state_file.parent.mkdir(parents=True, exist_ok=True)
+        self.consolidation_state_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _session_consolidation_state(self, payload: dict, session_id: str) -> dict:
+        sessions = payload.setdefault("sessions", {})
+        session_state = sessions.setdefault(
+            session_id,
+            {
+                "batch_seq": 0,
+                "pending_turns": [],
+                "completed_turns": 0,
+                "consolidation_batches": 0,
+                "low_level_updates": 0,
+                "high_level_updates": 0,
+                "high_level_noops": 0,
+            },
+        )
+        session_state.setdefault("batch_seq", 0)
+        session_state.setdefault("pending_turns", [])
+        session_state.setdefault("completed_turns", 0)
+        session_state.setdefault("consolidation_batches", 0)
+        session_state.setdefault("low_level_updates", 0)
+        session_state.setdefault("high_level_updates", 0)
+        session_state.setdefault("high_level_noops", 0)
+        session_state["completed_turns"] = int(session_state.get("completed_turns", 0) or 0)
+        return session_state
+
+    def _read_jsonl_records(self, path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        rows: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+        return rows
+
+    def _clamp_float(self, value: object, fallback: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = fallback
+        return max(0.0, min(number, 1.0))
 
     def rebuild_rag_indexes(self, session_id: str = "manual") -> dict[str, int]:
         """Force full rebuild of memory/document vector indexes.
@@ -763,7 +1087,7 @@ class MemoryManager:
 
         deduped: list[MemoryHit] = []
         for hit in hits:
-            if hit.memory_type == "event_summary" and fact_message_ids.intersection(hit.source_message_ids):
+            if hit.memory_type in {"event_summary", "conversation_turn"} and fact_message_ids.intersection(hit.source_message_ids):
                 continue
             deduped.append(hit)
         return deduped
@@ -1159,6 +1483,13 @@ class MemoryManager:
         return adjusted, components
 
     def _record_day(self, item: dict) -> str:
+        if item.get("type") == "timeline_fact":
+            semantic_day = str(item.get("semantic_day", "") or "").strip()
+            if semantic_day:
+                return semantic_day
+            valid_at = str(item.get("valid_at", "") or "").strip()
+            if valid_at:
+                return self._day_bucket(valid_at)
         time_source = str(item.get("time_source", "") or "")
         if time_source.startswith("semantic_"):
             semantic_day = str(item.get("semantic_day", "") or "").strip()

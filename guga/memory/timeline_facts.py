@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from hashlib import sha1
 from pathlib import Path
 from uuid import uuid4
 
@@ -50,6 +51,87 @@ class TimelineFactStore:
                 handle.write(json.dumps(fact, ensure_ascii=False) + "\n")
             return fact
         return {}
+
+    def load_active(self) -> list[dict]:
+        rows: list[dict] = []
+        if not self.file_path.exists():
+            return rows
+        for line in self.file_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict) and payload.get("status", "active") == "active":
+                rows.append(payload)
+        return rows
+
+    def upsert_consolidated_fact(
+        self,
+        *,
+        payload: dict,
+        session_id: str,
+        source_message_ids: list[str],
+        include_guga_reflection: bool,
+    ) -> dict:
+        subject = str(payload.get("subject") or "user").strip() or "user"
+        predicate = str(payload.get("predicate") or "related_to_event").strip() or "related_to_event"
+        obj = str(payload.get("object") or payload.get("summary") or "").strip()
+        summary = str(payload.get("summary") or obj).strip()
+        if not summary:
+            return {}
+        semantic_day = str(payload.get("semantic_day") or "").strip()
+        fact_id = str(payload.get("id") or payload.get("fact_id") or "").strip()
+        if not fact_id:
+            stable_key = "|".join([subject, predicate, obj, semantic_day])
+            fact_id = f"fact_{sha1(stable_key.encode('utf-8')).hexdigest()[:12]}"
+        now = format_beijing(now_beijing())
+        valid_at = f"{semantic_day}T00:00:00+08:00" if semantic_day else ""
+        fact = {
+            "fact_id": fact_id,
+            "id": fact_id,
+            "type": "timeline_fact",
+            "subject": subject,
+            "predicate": predicate,
+            "object": obj or summary[:120],
+            "summary": summary,
+            "semantic_text": summary,
+            "raw_excerpt": summary,
+            "created_at": now,
+            "updated_at": now,
+            "valid_from": valid_at,
+            "valid_to": "",
+            "valid_at": valid_at,
+            "invalid_at": "",
+            "semantic_day": semantic_day,
+            "day": semantic_day,
+            "time_source": "llm_consolidation",
+            "time_granularity": "day" if semantic_day else "",
+            "source_session_id": session_id,
+            "source_message_ids": [item for item in (payload.get("source_message_ids") or source_message_ids) if item],
+            "confidence": self._clamp_float(payload.get("confidence"), 0.85),
+            "importance": self._clamp_float(payload.get("importance"), 0.75),
+            "memory_strength": 1,
+            "retention": 1.0,
+            "status": "active",
+            "extraction_version": "timeline_fact_consolidation_v1",
+        }
+        if include_guga_reflection:
+            fact["guga_assessment"] = str(payload.get("guga_assessment", "")).strip()
+            fact["guga_thought"] = str(payload.get("guga_thought", "")).strip()
+
+        rows = self._read_rows()
+        for index, row in enumerate(rows):
+            if str(row.get("id", "")) == fact_id:
+                fact["created_at"] = str(row.get("created_at") or now)
+                rows[index] = fact
+                self._write_rows(rows)
+                return fact
+        rows.append(fact)
+        self._write_rows(rows)
+        return fact
 
     def extract_from_route_item(
         self,
@@ -136,3 +218,33 @@ class TimelineFactStore:
         if compact.startswith("要"):
             compact = compact[1:].strip()
         return compact or text[:80]
+
+    def _read_rows(self) -> list[dict]:
+        if not self.file_path.exists():
+            return []
+        rows: list[dict] = []
+        for line in self.file_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+        return rows
+
+    def _write_rows(self, rows: list[dict]) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file_path.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + ("\n" if rows else ""),
+            encoding="utf-8",
+        )
+
+    def _clamp_float(self, value: object, fallback: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            number = fallback
+        return max(0.0, min(number, 1.0))

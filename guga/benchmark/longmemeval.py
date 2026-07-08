@@ -7,6 +7,7 @@ from time import perf_counter
 from typing import Any
 
 from guga.chat import ChatSession
+from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
 from guga.benchmark.workspace import BenchmarkWorkspace, safe_case_id
 from guga.types import GenerationConfig
@@ -89,6 +90,11 @@ def ingest_longmemeval_case(case: LongMemEvalCase, manager: MemoryManager) -> di
 def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager) -> dict[str, int]:
     messages = 0
     finalized_turns = 0
+    completed_turns = 0
+    consolidation_batches = 0
+    low_level_updates = 0
+    high_level_updates = 0
+    high_level_noops = 0
     for session_index, session in enumerate(case.sessions):
         session_id = f"{case.case_id}_s{session_index}"
         has_open_user_turn = False
@@ -104,11 +110,13 @@ def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager
                 if has_open_user_turn:
                     manager.finalize_turn(session_id)
                     finalized_turns += 1
+                    completed_turns += 1
                     has_open_user_turn = False
             else:
                 if has_open_user_turn:
                     manager.finalize_turn(session_id)
                     finalized_turns += 1
+                    completed_turns += 1
                 manager.record_user_message(
                     session_id=session_id,
                     text=message.content,
@@ -120,7 +128,22 @@ def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager
         if has_open_user_turn:
             manager.finalize_turn(session_id)
             finalized_turns += 1
-    return {"sessions": len(case.sessions), "messages": messages, "finalized_turns": finalized_turns}
+            completed_turns += 1
+        stats = manager.flush_session_memory(session_id)
+        consolidation_batches += stats.get("consolidation_batches", 0)
+        low_level_updates += stats.get("low_level_updates", 0)
+        high_level_updates += stats.get("high_level_updates", 0)
+        high_level_noops += stats.get("high_level_noops", 0)
+    return {
+        "sessions": len(case.sessions),
+        "messages": messages,
+        "finalized_turns": finalized_turns,
+        "completed_turns": completed_turns,
+        "consolidation_batches": consolidation_batches,
+        "low_level_updates": low_level_updates,
+        "high_level_updates": high_level_updates,
+        "high_level_noops": high_level_noops,
+    }
 
 
 def run_longmemeval_case(
@@ -131,6 +154,7 @@ def run_longmemeval_case(
     debug: bool = False,
     enable_semantic: bool = True,
     ingest_mode: str = "raw",
+    replay_finalize_every: int = 10,
 ) -> dict[str, Any]:
     total_started = perf_counter()
     memory_root = workspace.case_memory_root(case.case_id)
@@ -142,6 +166,15 @@ def run_longmemeval_case(
         debug_sink=debug_sink,
         documents_dir=workspace.documents_dir,
         enable_semantic=enable_semantic,
+        consolidation_config=MemoryConsolidationConfig(
+            batch_turns=replay_finalize_every,
+            include_guga_reflection=False,
+            enable_archival_updates=True,
+            enable_profile_updates=False,
+            enable_personality_updates=False,
+        )
+        if ingest_mode == "replay"
+        else None,
     )
     ingest_started = perf_counter()
     if ingest_mode == "replay":
@@ -197,6 +230,7 @@ def run_longmemeval_benchmark(
     debug: bool = False,
     enable_semantic: bool = True,
     ingest_mode: str = "raw",
+    replay_finalize_every: int = 10,
 ) -> list[dict[str, Any]]:
     cases = load_longmemeval_cases(dataset_path)
     if limit is not None:
@@ -213,6 +247,7 @@ def run_longmemeval_benchmark(
                 debug=debug,
                 enable_semantic=enable_semantic,
                 ingest_mode=ingest_mode,
+                replay_finalize_every=replay_finalize_every,
             )
         )
     return results

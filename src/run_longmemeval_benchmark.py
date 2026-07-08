@@ -41,7 +41,13 @@ def main() -> None:
         "--ingest-mode",
         choices=("raw", "replay"),
         default="raw",
-        help="raw imports history as retrievable memory; replay finalizes each historical turn like daily chat.",
+        help="raw imports history as retrievable memory; replay records turns and runs batched memory consolidation.",
+    )
+    parser.add_argument(
+        "--replay-finalize-every",
+        type=int,
+        default=10,
+        help="When --ingest-mode replay is used, consolidate memory every N completed turns and at session end.",
     )
     args = parser.parse_args()
 
@@ -59,6 +65,7 @@ def main() -> None:
         debug=args.debug,
         enable_semantic=not args.no_semantic,
         ingest_mode=args.ingest_mode,
+        replay_finalize_every=max(1, args.replay_finalize_every),
     )
 
     print(f"LongMemEval cases={len(results)}")

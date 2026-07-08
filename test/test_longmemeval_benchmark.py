@@ -188,18 +188,37 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             def generate_reply(self, messages, gen):
                 _ = gen
                 prompt = messages[-1]["content"]
-                if "Memory route classifier" in prompt:
+                if "Low-level memory consolidation" in prompt:
                     return json.dumps(
-                        [
-                            {
-                                "target": "archival_memory",
-                                "label": "stable_context",
-                                "content": "User likes blue notebooks.",
-                                "topic": "preference",
-                                "importance": 0.8,
-                                "confidence": 0.9,
-                            }
-                        ]
+                        {
+                            "timeline_facts": [],
+                            "event_summaries": [
+                                {
+                                    "action": "upsert",
+                                    "scope": "batch",
+                                    "summary": "User likes blue notebooks.",
+                                    "source_message_ids": [],
+                                    "confidence": 0.9,
+                                }
+                            ],
+                        }
+                    )
+                if "High-level memory consolidation" in prompt:
+                    return json.dumps(
+                        {
+                            "decision": "update_high_level_memory",
+                            "archival_updates": [
+                                {
+                                    "topic": "preference",
+                                    "summary": "User likes blue notebooks.",
+                                    "importance": 0.8,
+                                    "confidence": 0.9,
+                                }
+                            ],
+                            "profile_updates": [],
+                            "personality_insight_updates": [],
+                            "reason": "preference",
+                        }
                     )
                 if "Summarize" in prompt or "summary" in prompt:
                     return "- User likes blue notebooks."
@@ -242,6 +261,8 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             self.assertEqual(stats["sessions"], 1)
             self.assertEqual(stats["messages"], 2)
             self.assertEqual(stats["finalized_turns"], 1)
+            self.assertEqual(stats["completed_turns"], 1)
+            self.assertEqual(stats["consolidation_batches"], 1)
             archival_rows = (workspace.case_memory_root(case.case_id) / "archival_memory.jsonl").read_text(encoding="utf-8")
             self.assertIn("User likes blue notebooks.", archival_rows)
 

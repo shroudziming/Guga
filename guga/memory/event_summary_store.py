@@ -125,6 +125,53 @@ class EventSummaryStore:
                 rows.append(payload)
         return rows
 
+    def upsert_batch_summary(
+        self,
+        *,
+        session_id: str,
+        batch_seq: int,
+        payload: dict,
+        source_message_ids: list[str],
+        include_guga_reflection: bool,
+    ) -> dict:
+        summary = str(payload.get("summary", "")).strip()
+        if not summary:
+            return {}
+        rows = self._read_rows()
+        row_id = str(payload.get("id") or f"evt_{session_id}_batch_{batch_seq}").strip()
+        existing = self._find(rows, row_id)
+        created_at = str(existing.get("created_at") or now_iso()) if existing else now_iso()
+        updated_at = now_iso()
+        payload_source_ids = list(payload.get("source_message_ids") or source_message_ids)
+        event = normalize_memorybank_fields(
+            apply_temporal_fields(
+                {
+                    "id": row_id,
+                    "type": "event_summary",
+                    "scope": str(payload.get("scope") or "batch"),
+                    "summary": summary,
+                    "raw_excerpt": summary,
+                    "source_session_id": session_id,
+                    "source_message_ids": [item for item in payload_source_ids if item],
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "last_recalled_at": str(existing.get("last_recalled_at") or created_at) if existing else created_at,
+                    "memory_strength": int(existing.get("memory_strength", 1) or 1) if existing else 1,
+                    "importance": float(payload.get("importance", 0.75) or 0.75),
+                    "confidence": float(payload.get("confidence", 0.8) or 0.8),
+                    "status": "active",
+                },
+                text=summary,
+                reference_time=updated_at,
+            )
+        )
+        if include_guga_reflection:
+            event["guga_assessment"] = str(payload.get("guga_assessment", "")).strip()
+            event["guga_thought"] = str(payload.get("guga_thought", "")).strip()
+        self._upsert(rows, event)
+        self._write_rows(rows)
+        return event
+
     def _read_rows(self) -> list[dict]:
         if not self.file_path.exists():
             return []

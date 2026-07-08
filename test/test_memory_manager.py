@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
 from guga.types import DocumentHit, MemoryContext
 
@@ -13,6 +14,40 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
+        if "Low-level memory consolidation" in prompt:
+            return json.dumps(
+                {
+                    "timeline_facts": [],
+                    "event_summaries": [
+                        {
+                            "action": "upsert",
+                            "scope": "batch",
+                            "summary": "用户叫小明，在深圳工作。",
+                            "source_message_ids": [],
+                            "confidence": 0.9,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "High-level memory consolidation" in prompt:
+            return json.dumps(
+                {
+                    "decision": "update_high_level_memory",
+                    "archival_updates": [
+                        {
+                            "topic": "profile",
+                            "summary": "用户叫小明，在深圳工作",
+                            "importance": 0.8,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "profile_updates": [{"summary": "用户在深圳工作。"}],
+                    "personality_insight_updates": [],
+                    "reason": "stable profile",
+                },
+                ensure_ascii=False,
+            )
         if "Memory route classifier" in prompt:
             return json.dumps(
                 [
@@ -43,6 +78,7 @@ class MemoryManagerTest(unittest.TestCase):
             top_k=2,
             recency_weight=0.2,
             enable_semantic=False,
+            consolidation_config=MemoryConsolidationConfig(batch_turns=1),
         )
 
     def tearDown(self) -> None:

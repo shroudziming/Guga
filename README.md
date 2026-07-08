@@ -128,7 +128,8 @@ python src/run_longmemeval_benchmark.py --dataset path/to/longmemeval.jsonl --li
 - debug 报告写入该 run 下的 `debug_reports/`，不会使用日常 `data/memory/debug_reports/`。
 - 问答阶段使用 LongMemEval 专用 system prompt，不复用日常 persona 配置。
 - `--limit` 适合先做小样本烟测；去掉 `--no-semantic` 后会为 benchmark 专用 memory/documents 建立独立 RAG 索引。
-- `--ingest-mode raw` 会把历史直接导入为可检索 memory；`--ingest-mode replay` 会逐轮调用现有记忆整理链路，更贴近日常聊天，但 API 成本和耗时会显著增加。
+- `--ingest-mode raw` 会把历史直接导入为可检索 memory；`--ingest-mode replay` 会逐轮记录历史，并按批量分层记忆链路整理。
+- replay 默认每 10 个完整 turn 和每个 session 结束时整理一次，可用 `--replay-finalize-every N` 调整；benchmark replay 不生成 Guga 主观评价和画像层。
 
 对 `results.jsonl` 做规则化评分：
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha1
 from pathlib import Path
 
 from guga.memory.forgetting import now_iso
@@ -80,6 +81,59 @@ class UserPortraitStore:
         self.save(profile)
         return profile
 
+    def apply_profile_updates(self, updates: list[dict]) -> dict:
+        lines = [str(item.get("summary", "")).strip().lstrip("- ").strip() for item in updates if str(item.get("summary", "")).strip()]
+        if not lines:
+            return self.load()
+        profile = self.load()
+        existing = str(profile.get("portrait_summary", "")).strip()
+        merged = self._dedupe_lines("\n".join([existing, *lines]), limit=12)
+        profile.setdefault("schema_version", 2)
+        profile["updated_at"] = now_iso()
+        profile["time_source"] = "transaction_time"
+        profile["portrait_summary"] = merged
+        self.save(profile)
+        return profile
+
+    def apply_personality_insight_updates(
+        self,
+        *,
+        updates: list[dict],
+        source_session_id: str,
+        source_message_ids: list[str],
+    ) -> list[dict]:
+        rows = self._read_daily_rows()
+        written: list[dict] = []
+        for item in updates:
+            summary = str(item.get("summary", "")).strip()
+            if not summary:
+                continue
+            row_id = str(item.get("id") or f"portrait_insight_{sha1(summary.encode('utf-8')).hexdigest()[:12]}")
+            existing = self._find(rows, row_id)
+            created_at = str(existing.get("created_at") or now_iso()) if existing else now_iso()
+            updated_at = now_iso()
+            payload = apply_temporal_fields(
+                {
+                    "id": row_id,
+                    "type": "user_portrait",
+                    "scope": "consolidated",
+                    "summary": summary,
+                    "raw_excerpt": summary,
+                    "source_session_id": source_session_id,
+                    "source_message_ids": [message_id for message_id in source_message_ids if message_id],
+                    "created_at": created_at,
+                    "updated_at": updated_at,
+                    "status": "active",
+                },
+                text=summary,
+                reference_time=updated_at,
+            )
+            self._upsert(rows, payload)
+            written.append(payload)
+        if written:
+            self._write_daily_rows(rows)
+        return written
+
     def update_from_user_text(self, user_text: str) -> dict:
         """Backward-compatible no-op; profile updates must use LLM daily/global refresh."""
         _ = user_text
@@ -137,3 +191,16 @@ class UserPortraitStore:
         if states:
             parts.append("近期状态：" + "；".join(str(item) for item in states[-3:]))
         return "\n".join(parts)
+
+    def _dedupe_lines(self, text: str, limit: int) -> str:
+        rows: list[str] = []
+        seen: set[str] = set()
+        for raw in text.splitlines():
+            line = raw.strip().lstrip("- ").strip()
+            if not line or line in seen:
+                continue
+            seen.add(line)
+            rows.append(f"- {line}")
+            if len(rows) >= limit:
+                break
+        return "\n".join(rows)

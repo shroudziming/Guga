@@ -171,6 +171,71 @@ class MemoryBankSummarizer:
         )
         return self._filter_global_portrait_text(self._generate(prompt))
 
+    def consolidate_low_level_memory(self, packet: dict, include_guga_reflection: bool) -> dict:
+        prompt = (
+            "Low-level memory consolidation for Guga.\n"
+            "Return strict JSON object only, without markdown.\n"
+            f"include_guga_reflection: {str(include_guga_reflection).lower()}\n\n"
+            "Output schema:\n"
+            "{"
+            "\"timeline_facts\": [{\"action\": \"upsert|deactivate\", \"subject\": string, \"predicate\": string, "
+            "\"object\": string, \"summary\": string, \"semantic_day\": string, \"confidence\": number, "
+            "\"source_message_ids\": [string], \"guga_assessment\": string, \"guga_thought\": string}], "
+            "\"event_summaries\": [{\"action\": \"upsert|deactivate\", \"scope\": \"batch\", \"summary\": string, "
+            "\"source_message_ids\": [string], \"confidence\": number, \"guga_assessment\": string, \"guga_thought\": string}]"
+            "}\n"
+            "Rules:\n"
+            "- timeline_facts and event_summaries are factual low-level memory only.\n"
+            "- Keep Guga assessment/thought separate from factual summary.\n"
+            "- If include_guga_reflection is false, omit guga_assessment and guga_thought or return empty strings.\n"
+            "- Do not write archival/profile/personality updates here.\n\n"
+            "Input packet:\n"
+            f"{json.dumps(packet, ensure_ascii=False)}"
+        )
+        parsed = self._parse_json_object(self._generate(prompt))
+        if not parsed:
+            raise SummaryGenerationError("LLM low-level consolidation returned invalid JSON object.")
+        parsed.setdefault("timeline_facts", [])
+        parsed.setdefault("event_summaries", [])
+        if not isinstance(parsed["timeline_facts"], list) or not isinstance(parsed["event_summaries"], list):
+            raise SummaryGenerationError("LLM low-level consolidation fields must be arrays.")
+        return parsed
+
+    def consolidate_high_level_memory(self, packet: dict) -> dict:
+        prompt = (
+            "High-level memory consolidation for Guga.\n"
+            "Return strict JSON object only, without markdown.\n\n"
+            "Output schema:\n"
+            "{"
+            "\"decision\": \"update_high_level_memory|no_high_level_update\", "
+            "\"archival_updates\": [{\"topic\": string, \"summary\": string, \"importance\": number, "
+            "\"confidence\": number, \"source_message_ids\": [string]}], "
+            "\"profile_updates\": [{\"summary\": string}], "
+            "\"personality_insight_updates\": [{\"summary\": string}], "
+            "\"reason\": string"
+            "}\n"
+            "Rules:\n"
+            "- Use only the low-level timeline_facts and event_summaries in the packet.\n"
+            "- Never infer directly from raw sessions or transcript text.\n"
+            "- Return no_high_level_update when there is no stable long-term value.\n\n"
+            "Input packet:\n"
+            f"{json.dumps(packet, ensure_ascii=False)}"
+        )
+        parsed = self._parse_json_object(self._generate(prompt))
+        if not parsed:
+            raise SummaryGenerationError("LLM high-level consolidation returned invalid JSON object.")
+        decision = str(parsed.get("decision", "")).strip()
+        if decision not in {"update_high_level_memory", "no_high_level_update"}:
+            raise SummaryGenerationError("LLM high-level consolidation returned unsupported decision.")
+        parsed.setdefault("archival_updates", [])
+        parsed.setdefault("profile_updates", [])
+        parsed.setdefault("personality_insight_updates", [])
+        for key in ("archival_updates", "profile_updates", "personality_insight_updates"):
+            if not isinstance(parsed[key], list):
+                raise SummaryGenerationError(f"LLM high-level consolidation field {key} must be an array.")
+        parsed["reason"] = str(parsed.get("reason", "")).strip()
+        return parsed
+
     def _generate(self, prompt: str) -> str:
         if not self.use_llm:
             raise SummaryGenerationError("LLM summary generation is required, but no generate_reply model is available.")

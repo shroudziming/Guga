@@ -200,6 +200,10 @@ class ChatSession:
         self.memory_manager.finalize_turn_async(self.session_id)
         self._debug("finalize_queued")
 
+    def flush_memory(self) -> dict[str, int]:
+        """Force consolidation of pending completed turns for this session."""
+        return self.memory_manager.flush_session_memory(self.session_id)
+
     def clear(self) -> None:
         """Clear only in-memory short history; persisted memory files remain."""
         self.history.clear()

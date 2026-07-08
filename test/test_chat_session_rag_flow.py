@@ -8,6 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from guga.chat.session import ChatSession
+from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
 from guga.types import GenerationConfig
 
@@ -19,6 +20,40 @@ class FakeChatModel:
     def generate_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> str:
         _ = gen
         prompt = messages[-1]["content"]
+        if "Low-level memory consolidation" in prompt:
+            return json.dumps(
+                {
+                    "timeline_facts": [],
+                    "event_summaries": [
+                        {
+                            "action": "upsert",
+                            "scope": "batch",
+                            "summary": "用户在杭州工作，做后端开发。",
+                            "source_message_ids": [],
+                            "confidence": 0.9,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "High-level memory consolidation" in prompt:
+            return json.dumps(
+                {
+                    "decision": "update_high_level_memory",
+                    "archival_updates": [
+                        {
+                            "topic": "work",
+                            "summary": "用户在杭州工作，做后端开发",
+                            "importance": 0.8,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "profile_updates": [{"summary": "用户在杭州工作，做后端开发。"}],
+                    "personality_insight_updates": [],
+                    "reason": "work context",
+                },
+                ensure_ascii=False,
+            )
         if "Memory route classifier" in prompt:
             return json.dumps(
                 [
@@ -57,7 +92,14 @@ class ChatSessionRagFlowTest(unittest.TestCase):
             prompts: list[str] = []
 
             model = FakeChatModel(capture_prompt=prompts.append)
-            manager = MemoryManager(memory_root=memory_root, model=model, debug=True, debug_sink=logs.append, top_k=2)
+            manager = MemoryManager(
+                memory_root=memory_root,
+                model=model,
+                debug=True,
+                debug_sink=logs.append,
+                top_k=2,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
             manager.record_user_message("seed_session", "我在杭州工作，做后端开发")
             manager.record_assistant_message("seed_session", "收到")
             manager.finalize_turn("seed_session")
@@ -96,25 +138,50 @@ class ChatSessionRagFlowTest(unittest.TestCase):
         class SlowMemoryModel(FakeChatModel):
             def generate_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> str:
                 prompt = messages[-1]["content"]
-                if "Memory route classifier" in prompt:
+                if "Low-level memory consolidation" in prompt or "High-level memory consolidation" in prompt:
                     sleep(1.0)
+                if "Low-level memory consolidation" in prompt:
                     return json.dumps(
-                        [
-                            {
-                                "target": "archival_memory",
-                                "label": "stable_context",
-                                "content": "The user works on backend systems.",
-                                "topic": "work",
-                                "importance": 0.8,
-                                "confidence": 0.9,
-                            }
-                        ]
+                        {
+                            "timeline_facts": [],
+                            "event_summaries": [
+                                {
+                                    "action": "upsert",
+                                    "scope": "batch",
+                                    "summary": "The user works on backend systems.",
+                                    "source_message_ids": [],
+                                    "confidence": 0.9,
+                                }
+                            ],
+                        }
+                    )
+                if "High-level memory consolidation" in prompt:
+                    return json.dumps(
+                        {
+                            "decision": "update_high_level_memory",
+                            "archival_updates": [
+                                {
+                                    "topic": "work",
+                                    "summary": "The user works on backend systems.",
+                                    "importance": 0.8,
+                                    "confidence": 0.9,
+                                }
+                            ],
+                            "profile_updates": [],
+                            "personality_insight_updates": [],
+                            "reason": "work context",
+                        }
                     )
                 return super().generate_reply(messages, gen)
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             memory_root = Path(tmp_dir)
-            manager = MemoryManager(memory_root=memory_root, model=SlowMemoryModel(), enable_semantic=False)
+            manager = MemoryManager(
+                memory_root=memory_root,
+                model=SlowMemoryModel(),
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
             session = ChatSession(
                 model=SlowMemoryModel(),
                 system_prompt="You are a companion assistant.",
@@ -163,6 +230,7 @@ class ChatSessionRagFlowTest(unittest.TestCase):
             rows = (memory_root / "sessions" / "sess_empty_stream.jsonl").read_text(encoding="utf-8")
             self.assertIn('"role": "assistant"', rows)
             self.assertIn("retry answer", rows)
+            manager.wait_for_background_tasks(timeout=3)
 
 
 if __name__ == "__main__":

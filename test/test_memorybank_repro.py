@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from guga.memory.forgetting import retention_score
+from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
 
 
@@ -15,6 +16,64 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
+        if "Low-level memory consolidation" in prompt:
+            summary = "用户提到深圳工作和不喜欢说教式安慰。"
+            if "叔本明" in prompt:
+                summary = "用户自称叔本明，并询问我是谁。"
+            return json.dumps(
+                {
+                    "timeline_facts": [],
+                    "event_summaries": [
+                        {
+                            "action": "upsert",
+                            "scope": "batch",
+                            "summary": summary,
+                            "source_message_ids": [],
+                            "confidence": 0.9,
+                            "guga_assessment": "Guga should remember this.",
+                            "guga_thought": "This may help future replies.",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "High-level memory consolidation" in prompt:
+            if "叔本明" in prompt:
+                return json.dumps(
+                    {
+                        "decision": "update_high_level_memory",
+                        "archival_updates": [
+                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9}
+                        ],
+                        "profile_updates": [{"summary": "用户自称叔本明。"}],
+                        "personality_insight_updates": [{"summary": "用户自称叔本明。"}],
+                        "reason": "identity",
+                    },
+                    ensure_ascii=False,
+                )
+            return json.dumps(
+                {
+                    "decision": "update_high_level_memory",
+                    "archival_updates": [
+                        {
+                            "topic": "profile",
+                            "summary": "用户提到深圳工作和不喜欢说教式安慰",
+                            "importance": 0.8,
+                            "confidence": 0.9,
+                        }
+                    ],
+                    "profile_updates": [
+                        {"summary": "用户谈到了工作或职业背景。"},
+                        {"summary": "用户表达了明确的负向偏好或互动边界。"},
+                    ],
+                    "personality_insight_updates": [
+                        {"summary": "用户谈到了工作或职业背景。"},
+                        {"summary": "用户表达了明确的负向偏好或互动边界。"},
+                    ],
+                    "reason": "profile",
+                },
+                ensure_ascii=False,
+            )
         if "Memory route classifier" in prompt:
             if "叔本明" in prompt:
                 return json.dumps(
@@ -69,24 +128,47 @@ class MemoryBankReproTest(unittest.TestCase):
         class FakeModel:
             def generate_reply(self, messages, gen):
                 prompt = messages[-1]["content"]
-                if "Memory route classifier" in prompt:
+                if "Low-level memory consolidation" in prompt:
                     return json.dumps(
-                        [
-                            {
-                                "target": "archival_memory",
-                                "label": "stable_context",
-                                "content": "The user works as a backend engineer in Hangzhou.",
-                                "topic": "work",
-                                "importance": 0.9,
-                                "confidence": 0.8,
-                            }
-                        ]
+                        {
+                            "timeline_facts": [],
+                            "event_summaries": [
+                                {
+                                    "action": "upsert",
+                                    "scope": "batch",
+                                    "summary": "The user works as a backend engineer in Hangzhou.",
+                                    "confidence": 0.9,
+                                }
+                            ],
+                        }
+                    )
+                if "High-level memory consolidation" in prompt:
+                    return json.dumps(
+                        {
+                            "decision": "update_high_level_memory",
+                            "archival_updates": [
+                                {
+                                    "topic": "work",
+                                    "summary": "The user works as a backend engineer in Hangzhou.",
+                                    "importance": 0.9,
+                                    "confidence": 0.8,
+                                }
+                            ],
+                            "profile_updates": [],
+                            "personality_insight_updates": [],
+                            "reason": "stable work context",
+                        }
                     )
                 return "- LLM generated summary"
 
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, model=FakeModel(), enable_semantic=False)
+            manager = MemoryManager(
+                memory_root=memory_root,
+                model=FakeModel(),
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
             manager.record_user_message("sess_llm", "I work as a backend engineer in Hangzhou.")
             manager.record_assistant_message("sess_llm", "I will remember that.")
             manager.finalize_turn("sess_llm")
@@ -265,7 +347,13 @@ class MemoryBankReproTest(unittest.TestCase):
     def test_finalize_turn_writes_memorybank_layers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, model=SummaryModel(), enable_semantic=False, top_k=4)
+            manager = MemoryManager(
+                memory_root=memory_root,
+                model=SummaryModel(),
+                enable_semantic=False,
+                top_k=4,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
             manager.record_user_message("sess_layers", "我叫小明，我在深圳工作，也不喜欢说教式安慰")
             manager.record_assistant_message("sess_layers", "记住了")
             manager.finalize_turn("sess_layers")
@@ -284,25 +372,22 @@ class MemoryBankReproTest(unittest.TestCase):
                 for line in (memory_root / "event_summaries.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            daily_event = next(row for row in event_rows if row["scope"] == "daily")
-            global_event = next(row for row in event_rows if row["scope"] == "global")
-            self.assertEqual(daily_event["type"], "event_summary")
-            self.assertIn("深圳工作", daily_event["summary"])
-            self.assertIn("深圳工作", global_event["summary"])
+            batch_event = next(row for row in event_rows if row["scope"] == "batch")
+            self.assertEqual(batch_event["type"], "event_summary")
+            self.assertIn("深圳工作", batch_event["summary"])
 
             insight_rows = [
                 json.loads(line)
                 for line in (memory_root / "personality_insights.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            self.assertEqual(insight_rows[0]["scope"], "daily")
+            self.assertEqual(insight_rows[0]["scope"], "consolidated")
             self.assertIn("工作或职业背景", insight_rows[0]["summary"])
 
             profile = json.loads((memory_root / "profile.json").read_text(encoding="utf-8"))
             self.assertIn("portrait_summary", profile)
             self.assertIn("工作或职业背景", profile["portrait_summary"])
             self.assertIn("负向偏好", profile["portrait_summary"])
-            self.assertEqual(profile["daily_personality_count"], 1)
 
             context = manager.prepare_context("你记得我在深圳工作的事吗", session_id="sess_probe")
             prompt = manager.compose_system_prompt("你是助手", context)
@@ -313,7 +398,13 @@ class MemoryBankReproTest(unittest.TestCase):
     def test_daily_summary_aggregates_sessions_from_same_day(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, model=SummaryModel(), enable_semantic=False, top_k=4)
+            manager = MemoryManager(
+                memory_root=memory_root,
+                model=SummaryModel(),
+                enable_semantic=False,
+                top_k=4,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
             manager.record_user_message("sess_a", "我是叔本明")
             manager.record_assistant_message("sess_a", "记住了")
             manager.finalize_turn("sess_a")
@@ -327,9 +418,8 @@ class MemoryBankReproTest(unittest.TestCase):
                 for line in (memory_root / "event_summaries.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            daily_event = next(row for row in event_rows if row["scope"] == "daily")
-            self.assertIn("我是叔本明", daily_event["summary"])
-            self.assertIn("我是谁", daily_event["summary"])
+            summaries = "\n".join(row["summary"] for row in event_rows if row["scope"] == "batch")
+            self.assertIn("叔本明", summaries)
 
             profile = json.loads((memory_root / "profile.json").read_text(encoding="utf-8"))
             self.assertIn("叔本明", profile["portrait_summary"])

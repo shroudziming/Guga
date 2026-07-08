@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.manager import MemoryManager
 from guga.memory.summarizer import MemoryBankSummarizer
@@ -15,6 +16,52 @@ class SummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
         prompt = messages[-1]["content"]
+        if "Low-level memory consolidation" in prompt:
+            return json.dumps(
+                {
+                    "timeline_facts": [
+                        {
+                            "action": "upsert",
+                            "subject": "user",
+                            "predicate": "has_time_bound_plan",
+                            "object": "和导师见面",
+                            "summary": "用户在2026年6月20日要和导师见面",
+                            "semantic_day": "2026-06-20",
+                            "confidence": 0.9,
+                            "source_message_ids": [],
+                        }
+                    ],
+                    "event_summaries": [
+                        {
+                            "action": "upsert",
+                            "scope": "batch",
+                            "summary": "用户在2026年6月20日要和导师见面",
+                            "source_message_ids": [],
+                            "confidence": 0.9,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        if "High-level memory consolidation" in prompt:
+            return json.dumps(
+                {
+                    "decision": "update_high_level_memory",
+                    "archival_updates": [
+                        {
+                            "topic": "schedule",
+                            "summary": "用户在2026年6月20日要和导师见面",
+                            "importance": 0.8,
+                            "confidence": 0.9,
+                            "source_message_ids": [],
+                        }
+                    ],
+                    "profile_updates": [],
+                    "personality_insight_updates": [],
+                    "reason": "time-bound plan",
+                },
+                ensure_ascii=False,
+            )
         if "Memory route classifier" in prompt:
             return json.dumps(
                 [
@@ -53,7 +100,12 @@ class MemoryTimeUtilsTest(unittest.TestCase):
     def test_archival_memory_keeps_transaction_time_and_semantic_valid_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, model=SummaryModel(), enable_semantic=False)
+            manager = MemoryManager(
+                memory_root=memory_root,
+                model=SummaryModel(),
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
 
             manager.record_user_message("sess_time", "真实测试：我在2026年6月20日要和导师见面，请你记住。")
             manager.record_assistant_message("sess_time", "记住了")
