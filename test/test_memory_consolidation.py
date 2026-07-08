@@ -8,6 +8,7 @@ from pathlib import Path
 from guga.chat.session import ChatSession
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
+from guga.memory.summarizer import MemoryBankSummarizer
 from guga.types import GenerationConfig
 
 
@@ -222,6 +223,56 @@ class MemoryConsolidationTest(unittest.TestCase):
             session.flush_memory()
 
             self.assertTrue((Path(tmp) / "event_summaries.jsonl").exists())
+
+    def test_summarizer_uses_json_mode_when_model_supports_it(self) -> None:
+        class JsonModeModel:
+            def __init__(self) -> None:
+                self.json_calls = 0
+                self.chat_calls = 0
+                self.prompts: list[str] = []
+
+            def generate_json_reply(self, messages, gen):
+                _ = gen
+                self.prompts.append(messages[-1]["content"])
+                self.json_calls += 1
+                return json.dumps({"timeline_facts": [], "event_summaries": []})
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                self.chat_calls += 1
+                return "not json"
+
+        model = JsonModeModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True)
+
+        result = summarizer.consolidate_low_level_memory({"new_turns": []}, include_guga_reflection=False)
+
+        self.assertEqual(result, {"timeline_facts": [], "event_summaries": []})
+        self.assertEqual(model.json_calls, 1)
+        self.assertEqual(model.chat_calls, 0)
+        self.assertIn("At most 3 timeline_facts", model.prompts[0])
+        self.assertIn("At most 1 event_summary", model.prompts[0])
+        self.assertIn("Do not create timeline_facts for generic questions", model.prompts[0])
+
+    def test_summarizer_retries_invalid_json_once(self) -> None:
+        class RetryModel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                self.calls += 1
+                if self.calls == 1:
+                    return "I cannot provide that."
+                return json.dumps({"timeline_facts": [], "event_summaries": []})
+
+        model = RetryModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True)
+
+        result = summarizer.consolidate_low_level_memory({"new_turns": []}, include_guga_reflection=False)
+
+        self.assertEqual(result, {"timeline_facts": [], "event_summaries": []})
+        self.assertEqual(model.calls, 2)
 
 
 if __name__ == "__main__":

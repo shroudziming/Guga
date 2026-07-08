@@ -33,7 +33,7 @@ class MemoryBankSummarizer:
 
     def __init__(self, model: Any | None = None, use_llm: bool | None = None) -> None:
         self.model = model
-        self.max_new_tokens = self._env_int("Guga_MEMORY_MAX_NEW_TOKENS", 512, minimum=128)
+        self.max_new_tokens = self._env_int("Guga_MEMORY_MAX_NEW_TOKENS", 2048, minimum=128)
         if use_llm is None:
             configured = os.environ.get("Guga_MEMORY_USE_LLM_SUMMARY", "").strip().lower()
             if configured:
@@ -186,15 +186,21 @@ class MemoryBankSummarizer:
             "}\n"
             "Rules:\n"
             "- timeline_facts and event_summaries are factual low-level memory only.\n"
+            "- At most 3 timeline_facts. Use [] unless the user states a dated or time-bound personal plan, deadline, appointment, schedule, or event.\n"
+            "- Do not create timeline_facts for generic questions, advice requests, recommendations, definitions, explanations, or assistant-only content.\n"
+            "- At most 1 event_summary. Keep it compact and factual; summarize the batch in no more than 80 words.\n"
             "- Keep Guga assessment/thought separate from factual summary.\n"
             "- If include_guga_reflection is false, omit guga_assessment and guga_thought or return empty strings.\n"
             "- Do not write archival/profile/personality updates here.\n\n"
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
         )
-        parsed = self._parse_json_object(self._generate(prompt))
+        raw = self._generate_structured_json(prompt)
+        parsed = self._parse_json_object(raw)
         if not parsed:
-            raise SummaryGenerationError("LLM low-level consolidation returned invalid JSON object.")
+            raise SummaryGenerationError(
+                f"LLM low-level consolidation returned invalid JSON object. raw={self._excerpt(raw)}"
+            )
         parsed.setdefault("timeline_facts", [])
         parsed.setdefault("event_summaries", [])
         if not isinstance(parsed["timeline_facts"], list) or not isinstance(parsed["event_summaries"], list):
@@ -221,9 +227,12 @@ class MemoryBankSummarizer:
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
         )
-        parsed = self._parse_json_object(self._generate(prompt))
+        raw = self._generate_structured_json(prompt)
+        parsed = self._parse_json_object(raw)
         if not parsed:
-            raise SummaryGenerationError("LLM high-level consolidation returned invalid JSON object.")
+            raise SummaryGenerationError(
+                f"LLM high-level consolidation returned invalid JSON object. raw={self._excerpt(raw)}"
+            )
         decision = str(parsed.get("decision", "")).strip()
         if decision not in {"update_high_level_memory", "no_high_level_update"}:
             raise SummaryGenerationError("LLM high-level consolidation returned unsupported decision.")
@@ -252,6 +261,39 @@ class MemoryBankSummarizer:
             raise SummaryGenerationError(f"LLM summary generation failed: {exc}") from exc
         return str(text).strip()
 
+    def _generate_structured_json(self, prompt: str) -> str:
+        if not self.use_llm:
+            raise SummaryGenerationError("LLM summary generation is required, but no generate_reply model is available.")
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a strict JSON generator. Output one valid JSON object only.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        gen = GenerationConfig(max_new_tokens=max(self.max_new_tokens, 2048), temperature=0.0, top_p=0.9)
+        json_reply = getattr(self.model, "generate_json_reply", None)
+        if callable(json_reply):
+            try:
+                return str(json_reply(messages, gen)).strip()
+            except Exception:
+                pass
+        first = str(self.model.generate_reply(messages, gen)).strip()
+        if self._parse_json_object(first):
+            return first
+        retry_messages = [
+            messages[0],
+            {
+                "role": "user",
+                "content": (
+                    prompt
+                    + "\n\nYour previous response was not a valid JSON object. "
+                    "Return exactly one valid JSON object now. No markdown, no prose."
+                ),
+            },
+        ]
+        return str(self.model.generate_reply(retry_messages, gen)).strip()
+
     def _parse_json_object(self, text: str) -> dict:
         candidate = text.strip()
         if candidate.startswith("```"):
@@ -265,6 +307,9 @@ class MemoryBankSummarizer:
         except json.JSONDecodeError:
             return {}
         return parsed if isinstance(parsed, dict) else {}
+
+    def _excerpt(self, text: str, limit: int = 240) -> str:
+        return re.sub(r"\s+", " ", str(text)).strip()[:limit]
 
     def _parse_json_array(self, text: str) -> list:
         candidate = text.strip()

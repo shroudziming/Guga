@@ -41,6 +41,24 @@ class OpenAICompatibleChatModel:
         content = message.get("content", "")
         return self._extract_text_content(content).strip()
 
+    def generate_json_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> str:
+        payload = {
+            "model": self.model_id,
+            "messages": messages,
+            "temperature": gen.temperature,
+            "top_p": gen.top_p,
+            "max_tokens": gen.max_new_tokens,
+            "response_format": {"type": "json_object"},
+        }
+        response = self._post_chat_completions(payload)
+        choices = response.get("choices", [])
+        if not choices:
+            raise RuntimeError(f"API 返回异常，缺少 choices: {response}")
+
+        message = choices[0].get("message", {})
+        content = message.get("content", "")
+        return self._extract_text_content(content).strip()
+
     def generate_reply_with_tools(
         self,
         messages: list[dict],
