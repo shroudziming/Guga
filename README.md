@@ -129,3 +129,11 @@ python src/run_longmemeval_benchmark.py --dataset path/to/longmemeval.jsonl --li
 - 问答阶段使用 LongMemEval 专用 system prompt，不复用日常 persona 配置。
 - `--limit` 适合先做小样本烟测；去掉 `--no-semantic` 后会为 benchmark 专用 memory/documents 建立独立 RAG 索引。
 
+对 `results.jsonl` 做规则化评分：
+
+```text
+python src/score_longmemeval_results.py --results data/benchmarks/longmemeval/runs/<run_id>/results.jsonl
+```
+
+评分脚本会在同目录写入 `metrics.json` 和 `failures.jsonl`。
+
