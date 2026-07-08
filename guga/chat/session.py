@@ -66,7 +66,7 @@ class ChatSession:
         self.max_tool_rounds = self._env_int("Guga_MAX_TOOL_ROUNDS", 3, minimum=0, maximum=8)
         self._debug("session_ready")
 
-    def reply(self, user_input: str) -> str:
+    def reply(self, user_input: str, finalize_memory: bool = True) -> str:
         """Run one non-streaming dialogue turn.
 
         Upstream input:
@@ -109,8 +109,11 @@ class ChatSession:
 
         self.history.add_assistant(answer)
         self.memory_manager.record_assistant_message(session_id=self.session_id, text=answer)
-        self.memory_manager.finalize_turn_async(self.session_id)
-        self._debug("finalize_queued")
+        if finalize_memory:
+            self.memory_manager.finalize_turn_async(self.session_id)
+            self._debug("finalize_queued")
+        else:
+            self._debug("finalize_skipped")
         return answer
 
     def reply_stream(self, user_input: str, cancel_event: Event | None = None) -> Iterator[str]:

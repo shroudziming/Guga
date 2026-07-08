@@ -229,6 +229,47 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             self.assertIn(LONGMEMEVAL_SYSTEM_PROMPT, model.system_prompts[0])
             self.assertNotIn("小咕嘎", model.system_prompts[0])
 
+    def test_run_case_skips_question_memory_finalization_for_unreliable_api_summary(self) -> None:
+        class BadSummaryModel:
+            def generate_reply(self, messages, gen):
+                _ = gen
+                prompt = messages[-1]["content"]
+                if "Memory route classifier" in prompt:
+                    return "[{\"target\": \"discard\""
+                return "blue"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "longmemeval.jsonl"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "question_id": "q1",
+                        "question": "What color does the user like?",
+                        "answer": "blue",
+                        "sessions": [[{"role": "user", "content": "I like blue notebooks."}]],
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            workspace = benchmark_workspace("longmemeval", root=root, run_id="run_001")
+            case = load_longmemeval_cases(dataset)[0]
+
+            result = run_longmemeval_case(
+                case=case,
+                model=BadSummaryModel(),
+                workspace=workspace,
+                generation=GenerationConfig(),
+                debug=False,
+                enable_semantic=False,
+            )
+
+            self.assertEqual(result["prediction"], "blue")
+            self.assertTrue(result["finalize_skipped"])
+            self.assertTrue(workspace.results_file.exists())
+
     def test_run_benchmark_respects_limit_and_writes_shared_results(self) -> None:
         class SimpleModel:
             def generate_reply(self, messages, gen):

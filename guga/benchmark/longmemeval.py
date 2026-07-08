@@ -116,8 +116,7 @@ def run_longmemeval_case(
         debug=debug,
         debug_sink=debug_sink,
     )
-    prediction = session.reply(case.question).strip()
-    manager.wait_for_background_tasks(timeout=30)
+    prediction = session.reply(case.question, finalize_memory=False).strip()
 
     result = {
         "case_id": case.case_id,
@@ -127,6 +126,7 @@ def run_longmemeval_case(
         "prediction": prediction,
         "ingest": ingest_stats,
         "memory_root": str(memory_root),
+        "finalize_skipped": True,
     }
     _append_result(workspace.results_file, result)
     return result
