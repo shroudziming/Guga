@@ -115,3 +115,17 @@ Tool loop limit:
 Guga_MAX_TOOL_ROUNDS=3
 ```
 
+## LongMemEval benchmark
+
+Guga 提供一条与日常聊天隔离的 LongMemEval 测评入口：
+
+```text
+python src/run_longmemeval_benchmark.py --dataset path/to/longmemeval.jsonl --limit 10 --no-semantic
+```
+
+- 测评状态写入 `data/benchmarks/longmemeval/runs/<run_id>/`。
+- 每个 case 使用独立 `cases/<case_id>/memory/`，避免不同题目之间互相污染。
+- debug 报告写入该 run 下的 `debug_reports/`，不会使用日常 `data/memory/debug_reports/`。
+- 问答阶段使用 LongMemEval 专用 system prompt，不复用日常 persona 配置。
+- `--limit` 适合先做小样本烟测；去掉 `--no-semantic` 后会为 benchmark 专用 memory/documents 建立独立 RAG 索引。
+

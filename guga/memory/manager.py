@@ -70,6 +70,7 @@ class _SessionStore:
         content: str,
         source: str = "chat",
         metadata: dict | None = None,
+        created_at: str | None = None,
     ) -> str:
         message_id = f"msg_{uuid4().hex[:10]}"
         target = self.session_dir / f"{session_id}.jsonl"
@@ -80,7 +81,7 @@ class _SessionStore:
             "content": content,
             "source": source,
             "metadata": metadata or {},
-            "created_at": now_beijing_iso(),
+            "created_at": created_at or now_beijing_iso(),
         }
         with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -106,6 +107,7 @@ class MemoryManager:
         document_top_k: int = DEFAULT_DOCUMENT_TOP_K,
         recency_weight: float = DEFAULT_MEMORY_RECENCY_WEIGHT,
         enable_semantic: bool = DEFAULT_RAG_ENABLE_SEMANTIC,
+        documents_dir: Path | None = None,
     ) -> None:
         """Create manager with lexical + optional semantic retrieval capabilities.
 
@@ -118,9 +120,11 @@ class MemoryManager:
             document_top_k: Max document hits returned to prompt context.
             recency_weight: Weight for recency term in lexical scoring.
             enable_semantic: Whether to enable vector-based retrieval pipeline.
+            documents_dir: Root directory for document retrieval.
         """
         self.model = model
         self.memory_root = memory_root or memory_data_dir()
+        self.documents_dir = documents_dir or rag_documents_dir()
         self.debug = debug
         self.debug_sink = debug_sink
         self.top_k = max(1, top_k)
@@ -174,7 +178,7 @@ class MemoryManager:
         if enable_semantic:
             self.rag_pipeline = RagPipeline(
                 index_dir=self.memory_root / "rag" / "index",
-                documents_dir=rag_documents_dir(),
+                documents_dir=self.documents_dir,
                 embedding_model=DEFAULT_RAG_EMBEDDING_MODEL,
                 chunk_size=DEFAULT_RAG_CHUNK_SIZE,
                 chunk_overlap=DEFAULT_RAG_CHUNK_OVERLAP,
@@ -434,14 +438,20 @@ class MemoryManager:
         beijing = parsed.astimezone(timezone(timedelta(hours=8)))
         return beijing.strftime("%Y-%m-%d %H:%M 北京时间")
 
-    def record_user_message(self, session_id: str, text: str, source: str = "chat") -> str:
+    def record_user_message(self, session_id: str, text: str, source: str = "chat", created_at: str | None = None) -> str:
         """Persist current user message and cache it in per-turn state.
 
         Returns:
             message_id written to sessions/<session_id>.jsonl.
         """
-        message_id = self.session_store.append_message(session_id=session_id, role="user", content=text, source=source)
-        turn_payload = self._build_session_memory(session_id=session_id, message_id=message_id, text=text)
+        message_id = self.session_store.append_message(
+            session_id=session_id,
+            role="user",
+            content=text,
+            source=source,
+            created_at=created_at,
+        )
+        turn_payload = self._build_session_memory(session_id=session_id, message_id=message_id, text=text, created_at=created_at)
         self._append_jsonl(self.session_memory_file, turn_payload)
         with self._turn_state_lock:
             state = self._turn_state.setdefault(session_id, {})
@@ -451,17 +461,39 @@ class MemoryManager:
         self._debug(session_id, f"ingest role=user message_id={message_id}")
         return message_id
 
-    def record_assistant_message(self, session_id: str, text: str, source: str = "chat") -> str:
+    def record_assistant_message(
+        self,
+        session_id: str,
+        text: str,
+        source: str = "chat",
+        created_at: str | None = None,
+        store_as_memory: bool = False,
+    ) -> str:
         """Persist assistant reply and cache it in per-turn state.
 
         Returns:
             message_id written to sessions/<session_id>.jsonl.
         """
-        message_id = self.session_store.append_message(session_id=session_id, role="assistant", content=text, source=source)
+        message_id = self.session_store.append_message(
+            session_id=session_id,
+            role="assistant",
+            content=text,
+            source=source,
+            created_at=created_at,
+        )
         with self._turn_state_lock:
             state = self._turn_state.setdefault(session_id, {})
             state["assistant_text"] = text
             state["assistant_message_id"] = message_id
+            if store_as_memory:
+                turn_payload = self._build_session_memory(
+                    session_id=session_id,
+                    message_id=message_id,
+                    text=f"assistant: {text}",
+                    created_at=created_at,
+                )
+                self._append_jsonl(self.session_memory_file, turn_payload)
+                state["assistant_session_memory_id"] = turn_payload["id"]
         self._debug(session_id, f"ingest role=assistant message_id={message_id}")
         return message_id
 
@@ -1160,8 +1192,8 @@ class MemoryManager:
                 f"memory_decay enabled=1 checked={total_checked} decayed={total_decayed} threshold={self.decay_threshold:.4f} min_age_days={self.decay_min_age_days:.1f}",
             )
 
-    def _build_session_memory(self, session_id: str, message_id: str, text: str) -> dict:
-        now = now_beijing_iso()
+    def _build_session_memory(self, session_id: str, message_id: str, text: str, created_at: str | None = None) -> dict:
+        now = created_at or now_beijing_iso()
         return apply_temporal_fields(
             {
                 "id": f"turn_{message_id}",
