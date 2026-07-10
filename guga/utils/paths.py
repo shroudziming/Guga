@@ -15,8 +15,10 @@ def memory_data_dir() -> Path:
     return PROJECT_ROOT / "data" / "memory"
 
 
-def debug_reports_dir() -> Path:
-    return memory_data_dir() / "debug_reports"
+def debug_reports_dir(agent_id: str = "default") -> Path:
+    from guga.memory.agent_identity import agent_memory_root
+
+    return agent_memory_root(agent_id) / "debug_reports"
 
 
 def rag_data_dir() -> Path:

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from guga.chat.history import ChatHistory
 from guga.memory import MemoryManager
+from guga.memory.agent_identity import AgentIdentity
 from guga.tools import ToolRegistry, ToolStreamText, ToolStreamToolCalls, default_tool_registry, encode_tool_result
 from guga.types import GenerationConfig
 
@@ -60,7 +61,17 @@ class ChatSession:
         self.history = ChatHistory(max_turns=max_turns)
         self.debug = debug
         self.debug_sink = debug_sink
-        self.memory_manager = memory_manager or MemoryManager(model=model, debug=debug, debug_sink=debug_sink)
+        self.memory_manager = memory_manager or MemoryManager(
+            model=model,
+            debug=debug,
+            debug_sink=debug_sink,
+            agent_identity=AgentIdentity(
+                agent_id="default",
+                reflection_context="default persona",
+                persona_source="builtin:chat_session_default",
+                persona_fingerprint="builtin:chat_session_default",
+            ),
+        )
         self.session_id = session_id or self.memory_manager.session_store.create_session_id()
         self.tool_registry = tool_registry or default_tool_registry()
         self.max_tool_rounds = self._env_int("Guga_MAX_TOOL_ROUNDS", 3, minimum=0, maximum=8)

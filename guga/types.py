@@ -13,6 +13,10 @@ class Persona:
     name: str
     system_prompt: str
     description: str = ""
+    agent_id: str = ""
+    reflection_context: str = ""
+    source_path: str = ""
+    persona_fingerprint: str = ""
 
 
 @dataclass

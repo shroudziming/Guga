@@ -11,6 +11,8 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from guga.chat import ChatSession
 from guga.config import DEFAULT_CACHE_DIR, DEFAULT_MODEL_ID, default_generation_config
+from guga.memory.agent_identity import identity_from_persona
+from guga.memory.manager import MemoryManager
 from guga.models import create_chat_model
 from guga.persona import PersonaManager
 from guga.utils.debug_reporter import FileDebugSink
@@ -47,19 +49,27 @@ def main() -> None:
     print("提示: 生成中按 Ctrl+C 可停止输出")
     print(f"model={model_id}")
     print(f"persona={persona_name}\n")
+    persona = PersonaManager(personas_dir()).load(persona_name)
+    agent_identity = identity_from_persona(persona)
     if debug_enabled:
         print("[DEBUG] 交互调试已开启（可用 Guga_DEBUG=0 关闭）\n")
-    sink = FileDebugSink(debug_reports_dir()) if debug_enabled else None
+    sink = FileDebugSink(debug_reports_dir(agent_identity.agent_id)) if debug_enabled else None
     if debug_enabled:
-        print(f"[DEBUG] 报告目录: {debug_reports_dir()}\n")
+        print(f"[DEBUG] 报告目录: {debug_reports_dir(agent_identity.agent_id)}\n")
 
-    persona = PersonaManager(personas_dir()).load(persona_name)
     model = create_chat_model(model_id=model_id, cache_dir=cache_dir)
+    memory_manager = MemoryManager(
+        model=model,
+        debug=debug_enabled,
+        debug_sink=sink,
+        agent_identity=agent_identity,
+    )
     session = ChatSession(
         model=model,
         system_prompt=persona.system_prompt,
         generation=default_generation_config(),
         max_turns=10,
+        memory_manager=memory_manager,
         debug=debug_enabled,
         debug_sink=sink,
     )

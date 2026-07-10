@@ -25,6 +25,7 @@ from guga.config import (
     DEFAULT_RAG_EMBEDDING_MODEL,
     DEFAULT_RAG_ENABLE_SEMANTIC,
 )
+from guga.memory.agent_identity import AgentIdentity, agent_memory_root
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
@@ -101,6 +102,7 @@ class MemoryManager:
     def __init__(
         self,
         memory_root: Path | None = None,
+        agent_identity: AgentIdentity | None = None,
         model=None,
         debug: bool = False,
         debug_sink: Callable[[str], None] | None = None,
@@ -115,6 +117,7 @@ class MemoryManager:
 
         Args:
             memory_root: Root directory for memory files and indexes.
+            agent_identity: Optional persona/agent binding for isolated memory roots.
             model: Reserved for future use (kept for API compatibility).
             debug: Whether to emit debug traces.
             debug_sink: Optional debug output sink callback.
@@ -125,7 +128,15 @@ class MemoryManager:
             documents_dir: Root directory for document retrieval.
         """
         self.model = model
-        self.memory_root = memory_root or memory_data_dir()
+        self.agent_identity = agent_identity
+        if memory_root is None and self.agent_identity is None:
+            self.agent_identity = self._default_agent_identity()
+        if memory_root is not None:
+            self.memory_root = Path(memory_root)
+        elif self.agent_identity is not None:
+            self.memory_root = agent_memory_root(self.agent_identity.agent_id)
+        else:
+            self.memory_root = memory_data_dir()
         self.documents_dir = documents_dir or rag_documents_dir()
         self.debug = debug
         self.debug_sink = debug_sink
@@ -160,6 +171,7 @@ class MemoryManager:
         )
 
         self.memory_root.mkdir(parents=True, exist_ok=True)
+        self._validate_or_create_agent_manifest()
         self.archival_file = self.memory_root / "archival_memory.jsonl"
         self.session_memory_file = self.memory_root / "session_memories.jsonl"
         self.timeline_fact_file = self.memory_root / "timeline_facts.jsonl"
@@ -188,6 +200,38 @@ class MemoryManager:
                 chunk_overlap=DEFAULT_RAG_CHUNK_OVERLAP,
                 debug_hook=self._debug_pipeline,
             )
+
+    def _default_agent_identity(self) -> AgentIdentity:
+        return AgentIdentity(
+            agent_id="default",
+            reflection_context="default persona",
+            persona_source="builtin:default",
+            persona_fingerprint="builtin:default",
+        )
+
+    def _validate_or_create_agent_manifest(self) -> None:
+        if self.agent_identity is None:
+            return
+        manifest_path = self.memory_root / "agent_manifest.json"
+        expected = {
+            "schema_version": 1,
+            "agent_id": self.agent_identity.agent_id,
+            "persona_source": self.agent_identity.persona_source,
+            "persona_fingerprint": self.agent_identity.persona_fingerprint,
+        }
+        allowed_keys = {*expected.keys(), "created_at"}
+        if manifest_path.exists():
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if set(payload) != allowed_keys:
+                raise ValueError(f"invalid agent manifest keys in {manifest_path}")
+            for key, value in expected.items():
+                if payload.get(key) != value:
+                    raise ValueError(f"agent manifest mismatch for {key}")
+            return
+
+        payload = dict(expected)
+        payload["created_at"] = now_beijing_iso()
+        manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     def prepare_context(self, user_text: str, session_id: str) -> MemoryContext:
         """Retrieve context for current user input and return structured hits.
