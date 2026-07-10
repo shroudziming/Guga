@@ -39,3 +39,4 @@ dist/
 *.egg-info/
 
 CLAUDE.md
+.worktrees/
