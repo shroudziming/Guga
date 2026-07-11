@@ -24,6 +24,13 @@ class _ReplyOnlyModel:
 
 
 class AgentMemoryIsolationTest(unittest.TestCase):
+    def test_persona_configs_explicitly_declare_memory_identity(self) -> None:
+        for persona_name in ("default", "gentle", "rational"):
+            with self.subTest(persona=persona_name):
+                payload = json.loads((personas_dir() / f"{persona_name}.json").read_text(encoding="utf-8"))
+                self.assertEqual(payload["agent_id"], persona_name)
+                self.assertTrue(str(payload["reflection_context"]).strip())
+
     def test_agent_identity_rejects_unsafe_agent_ids(self) -> None:
         for bad_agent_id in ("", "../escape", "two words", "semi;colon", "slash/name"):
             with self.subTest(agent_id=bad_agent_id):
