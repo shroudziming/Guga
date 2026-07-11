@@ -65,6 +65,7 @@ class ToolCallingTest(unittest.TestCase):
             )
 
             answer = session.reply("测试工具调用")
+            memory_manager.wait_for_background_tasks(timeout=3)
 
         self.assertEqual(answer, "我想起来了：handled 上周")
         self.assertTrue(any("tool_call round=1 name=guga_test_tool ok=True" in line for line in logs))
