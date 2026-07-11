@@ -193,8 +193,7 @@ def run_longmemeval_case(
             batch_turns=replay_finalize_every,
             include_guga_reflection=False,
             enable_archival_updates=True,
-            enable_profile_updates=False,
-            enable_personality_updates=False,
+            enable_user_model_updates=False,
         )
         if ingest_mode == "replay"
         else None,

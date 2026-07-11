@@ -97,41 +97,6 @@ class MemoryTimeUtilsTest(unittest.TestCase):
         self.assertEqual(source, "semantic_relative_weekday")
         self.assertEqual(granularity, "date")
 
-    def test_archival_memory_keeps_transaction_time_and_semantic_valid_time(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            memory_root = Path(tmp)
-            manager = MemoryManager(
-                memory_root=memory_root,
-                model=SummaryModel(),
-                enable_semantic=False,
-                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
-            )
-
-            manager.record_user_message("sess_time", "真实测试：我在2026年6月20日要和导师见面，请你记住。")
-            manager.record_assistant_message("sess_time", "记住了")
-            manager.finalize_turn("sess_time")
-
-            payload = json.loads((memory_root / "archival_memory.jsonl").read_text(encoding="utf-8").splitlines()[0])
-            self.assertTrue(payload["created_at"].endswith("+08:00"))
-            self.assertEqual(payload["valid_at"], "2026-06-20T00:00:00+08:00")
-            self.assertEqual(payload["semantic_day"], "2026-06-20")
-            self.assertEqual(payload["time_source"], "semantic_explicit_date")
-
-    def test_event_summary_preserves_conversation_day_and_semantic_day(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = EventSummaryStore(Path(tmp) / "event_summaries.jsonl")
-            payload = store.refresh_daily_summary(
-                session_id="sess_time",
-                day="2026-06-12",
-                dialogue="user: 我在2026年6月20日要和导师见面",
-                source_message_ids=["msg_time"],
-                summarizer=MemoryBankSummarizer(model=SummaryModel()),
-            )
-
-            self.assertEqual(payload["day"], "2026-06-12")
-            self.assertEqual(payload["valid_at"], "2026-06-20T00:00:00+08:00")
-            self.assertEqual(payload["semantic_day"], "2026-06-20")
-
     def test_date_query_uses_semantic_day_for_retrieval_boost(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)

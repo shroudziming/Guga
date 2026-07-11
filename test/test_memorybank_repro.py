@@ -22,16 +22,14 @@ class SummaryModel:
                 summary = "用户自称叔本明，并询问我是谁。"
             return json.dumps(
                 {
-                    "timeline_facts": [],
+                    "semantic_event_operations": [
+                        {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "user context", "description": summary, "time_expression": "", "end_unknown": True, "source_message_ids": []}
+                    ],
                     "event_summaries": [
                         {
-                            "action": "upsert",
-                            "scope": "batch",
                             "summary": summary,
                             "source_message_ids": [],
                             "confidence": 0.9,
-                            "guga_assessment": "Guga should remember this.",
-                            "guga_thought": "This may help future replies.",
                         }
                     ],
                 },
@@ -42,11 +40,10 @@ class SummaryModel:
                 return json.dumps(
                     {
                         "decision": "update_high_level_memory",
-                        "archival_updates": [
-                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9}
+                        "archival_operations": [
+                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9, "source_event_ids": ["evt_user_context"]}
                         ],
-                        "profile_updates": [{"summary": "用户自称叔本明。"}],
-                        "personality_insight_updates": [{"summary": "用户自称叔本明。"}],
+                        "user_model_operations": [],
                         "reason": "identity",
                     },
                     ensure_ascii=False,
@@ -54,22 +51,16 @@ class SummaryModel:
             return json.dumps(
                 {
                     "decision": "update_high_level_memory",
-                    "archival_updates": [
+                    "archival_operations": [
                         {
                             "topic": "profile",
                             "summary": "用户提到深圳工作和不喜欢说教式安慰",
                             "importance": 0.8,
                             "confidence": 0.9,
+                            "source_event_ids": ["evt_user_context"],
                         }
                     ],
-                    "profile_updates": [
-                        {"summary": "用户谈到了工作或职业背景。"},
-                        {"summary": "用户表达了明确的负向偏好或互动边界。"},
-                    ],
-                    "personality_insight_updates": [
-                        {"summary": "用户谈到了工作或职业背景。"},
-                        {"summary": "用户表达了明确的负向偏好或互动边界。"},
-                    ],
+                    "user_model_operations": [],
                     "reason": "profile",
                 },
                 ensure_ascii=False,
@@ -131,11 +122,11 @@ class MemoryBankReproTest(unittest.TestCase):
                 if "Low-level memory consolidation" in prompt:
                     return json.dumps(
                         {
-                            "timeline_facts": [],
+                            "semantic_event_operations": [
+                                {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "work", "description": "The user works as a backend engineer in Hangzhou.", "time_expression": "", "end_unknown": True, "source_message_ids": []}
+                            ],
                             "event_summaries": [
                                 {
-                                    "action": "upsert",
-                                    "scope": "batch",
                                     "summary": "The user works as a backend engineer in Hangzhou.",
                                     "confidence": 0.9,
                                 }
@@ -146,16 +137,16 @@ class MemoryBankReproTest(unittest.TestCase):
                     return json.dumps(
                         {
                             "decision": "update_high_level_memory",
-                            "archival_updates": [
+                            "archival_operations": [
                                 {
                                     "topic": "work",
                                     "summary": "The user works as a backend engineer in Hangzhou.",
                                     "importance": 0.9,
                                     "confidence": 0.8,
+                                    "source_event_ids": ["evt_work"],
                                 }
                             ],
-                            "profile_updates": [],
-                            "personality_insight_updates": [],
+                            "user_model_operations": [],
                             "reason": "stable work context",
                         }
                     )
@@ -372,22 +363,9 @@ class MemoryBankReproTest(unittest.TestCase):
                 for line in (memory_root / "event_summaries.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            batch_event = next(row for row in event_rows if row["scope"] == "batch")
+            batch_event = next(row for row in event_rows if row["source_of_truth"] is False)
             self.assertEqual(batch_event["type"], "event_summary")
             self.assertIn("深圳工作", batch_event["summary"])
-
-            insight_rows = [
-                json.loads(line)
-                for line in (memory_root / "personality_insights.jsonl").read_text(encoding="utf-8").splitlines()
-                if line.strip()
-            ]
-            self.assertEqual(insight_rows[0]["scope"], "consolidated")
-            self.assertIn("工作或职业背景", insight_rows[0]["summary"])
-
-            profile = json.loads((memory_root / "profile.json").read_text(encoding="utf-8"))
-            self.assertIn("portrait_summary", profile)
-            self.assertIn("工作或职业背景", profile["portrait_summary"])
-            self.assertIn("负向偏好", profile["portrait_summary"])
 
             context = manager.prepare_context("你记得我在深圳工作的事吗", session_id="sess_probe")
             prompt = manager.compose_system_prompt("你是助手", context)
@@ -418,11 +396,9 @@ class MemoryBankReproTest(unittest.TestCase):
                 for line in (memory_root / "event_summaries.jsonl").read_text(encoding="utf-8").splitlines()
                 if line.strip()
             ]
-            summaries = "\n".join(row["summary"] for row in event_rows if row["scope"] == "batch")
+            summaries = "\n".join(row["summary"] for row in event_rows if row["source_of_truth"] is False)
             self.assertIn("叔本明", summaries)
 
-            profile = json.loads((memory_root / "profile.json").read_text(encoding="utf-8"))
-            self.assertIn("叔本明", profile["portrait_summary"])
 
 
 if __name__ == "__main__":

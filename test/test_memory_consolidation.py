@@ -149,8 +149,7 @@ class MemoryConsolidationTest(unittest.TestCase):
                 consolidation_config=MemoryConsolidationConfig(
                     batch_turns=1,
                     include_guga_reflection=False,
-                    enable_profile_updates=False,
-                    enable_personality_updates=False,
+                    enable_user_model_updates=False,
                 ),
             )
 

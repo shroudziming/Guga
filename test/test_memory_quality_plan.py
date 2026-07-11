@@ -302,8 +302,18 @@ class MemoryQualityPlanTest(unittest.TestCase):
     def test_portrait_query_uses_profile_without_episodic_noise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            (memory_root / "profile.json").write_text(
-                json.dumps({"portrait_summary": "- 用户自称叔本明。\n- 用户想练蝴蝶刀。"}, ensure_ascii=False),
+            (memory_root / "guga_user_model.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "updated_at": "2026-06-12T00:00:00+08:00",
+                        "insights": [
+                            {"id": "gum_identity", "statement": "用户自称叔本明。", "kind": "identity", "confidence": 0.9, "stability": "explicit", "source_event_ids": ["evt_identity"], "status": "active", "updated_at": "2026-06-12T00:00:00+08:00"},
+                            {"id": "gum_interest", "statement": "用户想练蝴蝶刀。", "kind": "interest", "confidence": 0.8, "stability": "recurring", "source_event_ids": ["evt_interest"], "status": "active", "updated_at": "2026-06-12T00:00:00+08:00"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
                 encoding="utf-8",
             )
             _append_jsonl(

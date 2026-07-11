@@ -849,7 +849,7 @@ class MemoryManager:
                         self.rag_pipeline.add_memory_record(payload)
                     except Exception as exc:
                         self._debug(session_id, f"index_update status=archival_failed reason={exc}")
-        if self.consolidation_config.enable_personality_updates:
+        if self.consolidation_config.enable_user_model_updates:
             written = self.user_model_store.apply_operations(result.get("user_model_operations", []) or [])
             updates += len(written)
         return {"high_level_updates": updates, "high_level_noops": 0}
