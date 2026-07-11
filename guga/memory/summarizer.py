@@ -13,7 +13,7 @@ class SummaryGenerationError(RuntimeError):
     """Raised when required LLM-backed memory summarization cannot complete."""
 
 
-_ALLOWED_ROUTE_TARGETS = {"personality_insight", "timeline_fact", "archival_memory", "event_summary", "discard"}
+_ALLOWED_ROUTE_TARGETS = {"personality_insight", "semantic_event", "archival_memory", "event_summary", "discard"}
 _ALLOWED_ROUTE_LABELS = {
     "stable_identity",
     "stable_interest",
@@ -69,7 +69,7 @@ class MemoryBankSummarizer:
             "Memory route classifier for a MemoryBank-style AI companion.\n"
             "Return strict JSON array only, without markdown. Each item schema:\n"
             "{"
-            "\"target\": \"personality_insight|timeline_fact|archival_memory|event_summary|discard\", "
+            "\"target\": \"personality_insight|semantic_event|archival_memory|event_summary|discard\", "
             "\"label\": \"stable_identity|stable_interest|stable_preference|stable_context|temporary_state|time_bound_plan|system_feedback|one_off|none\", "
             "\"content\": string, "
             "\"topic\": string, "
@@ -79,7 +79,7 @@ class MemoryBankSummarizer:
             "}\n\n"
             "Target meanings:\n"
             "- personality_insight: stable identity, durable preference, recurring interest, stable context, or user-stated temporary state.\n"
-            "- timeline_fact: time-bound plan, appointment, deadline, schedule, task, meeting, or dated event.\n"
+            "- semantic_event: objective time-bound plan, appointment, deadline, schedule, task, meeting, state change, or dated event.\n"
             "- archival_memory: durable episodic memory worth recalling, but not a cleaner personality insight or timeline fact.\n"
             "- event_summary: conversation topic/event summary that should not enter user portrait.\n"
             "- discard: greetings, one-off questions, assistant echoes, system/model/bug feedback, unsupported inference, or no memory value.\n\n"
@@ -87,7 +87,7 @@ class MemoryBankSummarizer:
             "- Choose by meaning, not keywords.\n"
             "- Do not route assistant guesses or compliments into user memory.\n"
             "- Route bug feedback, missing output, token limits, model/system feedback, and debug comments to discard with label system_feedback.\n"
-            "- Route dated or relative-time plans to timeline_fact, not personality_insight.\n"
+            "- Route dated or relative-time plans to semantic_event, not personality_insight.\n"
             "- Use the user's main language for content. Keep content clean, factual, and free of evidence/source wording.\n"
             "- If nothing is worth storing, return [].\n\n"
             "Input:\n"

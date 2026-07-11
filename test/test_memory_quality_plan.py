@@ -420,7 +420,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
 
         self.assertIn("Memory route classifier", model.prompt)
         self.assertIn("Do not route assistant guesses", model.prompt)
-        self.assertIn("timeline_fact", model.prompt)
+        self.assertIn("semantic_event", model.prompt)
         self.assertIn("蝴蝶刀", result)
 
     def test_daily_personality_filters_dirty_llm_output(self) -> None:
@@ -431,7 +431,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
                     [
                         {"target": "discard", "label": "one_off", "content": "用户表达了个人偏好。"},
                         {"target": "discard", "label": "system_feedback", "content": "用户反馈你没有输出，有 bug。"},
-                        {"target": "timeline_fact", "label": "time_bound_plan", "content": "用户在2026年7月5日整理周报。"},
+                        {"target": "semantic_event", "label": "time_bound_plan", "content": "用户在2026年7月5日整理周报。"},
                         {"target": "personality_insight", "label": "stable_interest", "content": "用户此前提到想练蝴蝶刀。"},
                         {"target": "personality_insight", "label": "temporary_state", "content": "用户近期有点焦虑。"},
                     ],
@@ -455,8 +455,8 @@ class MemoryQualityPlanTest(unittest.TestCase):
                 _ = messages, gen
                 return json.dumps(
                     [
-                        {"target": "timeline_fact", "label": "time_bound_plan", "content": "用户明天下午要去医院复查。"},
-                        {"target": "timeline_fact", "label": "time_bound_plan", "content": "用户下周需要参加小组讨论。"},
+                        {"target": "semantic_event", "label": "time_bound_plan", "content": "用户明天下午要去医院复查。"},
+                        {"target": "semantic_event", "label": "time_bound_plan", "content": "用户下周需要参加小组讨论。"},
                         {"target": "personality_insight", "label": "stable_preference", "content": "用户偏好提前规划学习节奏。"},
                         {"target": "personality_insight", "label": "stable_interest", "content": "用户对科幻小说感兴趣。"},
                     ],
@@ -479,7 +479,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
                 return json.dumps(
                     [
                         {
-                            "target": "timeline_fact",
+                            "target": "semantic_event",
                             "label": "time_bound_plan",
                             "content": "用户明天下午要去医院复查。",
                             "confidence": 0.9,
