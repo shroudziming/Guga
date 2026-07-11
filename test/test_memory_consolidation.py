@@ -200,6 +200,54 @@ class MemoryConsolidationTest(unittest.TestCase):
             persisted = json.loads((Path(tmp) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(packet["semantic_events"][-1]["id"], persisted["id"])
 
+    def test_low_level_packet_retrieves_relevant_events_beyond_recent_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+            store = manager.semantic_event_store
+            relevant = store.apply_operations(
+                operations=[
+                    {
+                        "operation": "create",
+                        "event_kind": "state_change",
+                        "subject": "user",
+                        "entity": "房贷预批额度",
+                        "description": "用户的房贷预批额度为三十五万美元。",
+                        "time_expression": "",
+                        "end_unknown": True,
+                        "reference_created_at": "2026-07-01T09:00:00+08:00",
+                    }
+                ],
+                session_id="sess_old",
+                include_guga_reflection=False,
+            ).created_event_ids[0]
+            for index in range(21):
+                store.apply_operations(
+                    operations=[
+                        {
+                            "operation": "create",
+                            "event_kind": "task",
+                            "subject": "user",
+                            "entity": f"无关任务{index}",
+                            "description": f"用户需要完成无关任务{index}。",
+                            "time_expression": "",
+                            "end_unknown": True,
+                            "reference_created_at": "2026-07-02T09:00:00+08:00",
+                        }
+                    ],
+                    session_id="sess_recent",
+                    include_guga_reflection=False,
+                )
+
+            user_id = manager.record_user_message("sess_new", "房贷预批额度改成四十万美元了")
+            assistant_id = manager.record_assistant_message("sess_new", "我记下了。")
+            packet = manager._build_low_level_packet(
+                session_id="sess_new",
+                pending_turns=[{"user_message_id": user_id, "assistant_message_id": assistant_id}],
+            )
+
+            self.assertEqual(len(packet["recent_active_events"]), 5)
+            self.assertIn(relevant, {event["id"] for event in packet["relevant_active_events"]})
+
     def test_high_level_noop_leaves_high_level_files_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model = ConsolidationModel(high_decision="no_high_level_update")

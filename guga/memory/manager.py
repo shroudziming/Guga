@@ -809,13 +809,68 @@ class MemoryManager:
             for key in ("user_text", "assistant_text")
             if str(turn.get(key, "")).strip()
         )
+        event_context = self._select_low_level_event_context(query)
         packet = {
             "new_turns": new_turns,
-            "existing_semantic_events": self.semantic_event_store.load_active()[-20:],
+            "recent_active_events": event_context["recent_active_events"],
+            "relevant_active_events": event_context["relevant_active_events"],
+            "relevant_inactive_events": event_context["relevant_inactive_events"],
             "derived_event_summaries": self.event_summary_store.load_active()[-20:],
             "retrieved_context": self._consolidation_retrieved_context(query),
         }
         return self._trim_packet(packet)
+
+    def _select_low_level_event_context(self, query: str) -> dict[str, list[dict]]:
+        active_events = self.semantic_event_store.load_active()
+        inactive_events = [event for event in self.semantic_event_store.load_all() if event.get("status") != "active"]
+        semantic_ids = self._semantic_event_ids_for_query(query)
+        return {
+            "recent_active_events": active_events[-5:],
+            "relevant_active_events": self._rank_events_for_consolidation(active_events, query, semantic_ids, limit=8),
+            "relevant_inactive_events": (
+                self._rank_events_for_consolidation(inactive_events, query, semantic_ids, limit=5)
+                if self._has_event_change_signal(query)
+                else []
+            ),
+        }
+
+    def _semantic_event_ids_for_query(self, query: str) -> set[str]:
+        if self.rag_pipeline is None or not query.strip():
+            return set()
+        try:
+            memory_hits, _ = self.rag_pipeline.retrieve(query, memory_top_k=8, document_top_k=0)
+        except Exception:
+            return set()
+        return {str(hit.source_id) for hit in memory_hits if str(hit.source_id).startswith("evt_")}
+
+    def _rank_events_for_consolidation(
+        self,
+        events: list[dict],
+        query: str,
+        semantic_ids: set[str],
+        *,
+        limit: int,
+    ) -> list[dict]:
+        query_tokens = self._tokens(query.lower())
+        scored: list[tuple[float, dict]] = []
+        for event in events:
+            entity = str(event.get("entity", "")).strip().lower()
+            text = f"{entity} {event.get('description', '')}".lower()
+            lexical_matches = sum(1 for token in query_tokens if token and token in text)
+            entity_match = bool(entity and entity in query.lower())
+            score = lexical_matches / max(1, len(query_tokens))
+            if entity_match:
+                score += 1.0
+            if str(event.get("id", "")) in semantic_ids:
+                score += 0.5
+            if score > 0:
+                scored.append((score, event))
+        scored.sort(key=lambda item: (item[0], item[1].get("updated_at", "")), reverse=True)
+        return [event for _, event in scored[:limit]]
+
+    @staticmethod
+    def _has_event_change_signal(query: str) -> bool:
+        return any(token in query for token in ("改", "取消", "换", "不是", "原来", "之前", "推迟", "提前"))
 
     def _build_high_level_packet(self) -> dict:
         packet = {
@@ -1020,7 +1075,14 @@ class MemoryManager:
         if len(text) <= self.consolidation_config.max_packet_chars:
             return packet
         trimmed = dict(packet)
-        for key in ("retrieved_context", "derived_event_summaries", "existing_semantic_events", "personality_insights"):
+        for key in (
+            "retrieved_context",
+            "derived_event_summaries",
+            "recent_active_events",
+            "relevant_active_events",
+            "relevant_inactive_events",
+            "personality_insights",
+        ):
             value = trimmed.get(key)
             if isinstance(value, list) and len(json.dumps(trimmed, ensure_ascii=False)) > self.consolidation_config.max_packet_chars:
                 trimmed[key] = value[-5:]
