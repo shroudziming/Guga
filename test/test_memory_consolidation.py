@@ -15,6 +15,7 @@ from guga.types import GenerationConfig
 class ConsolidationModel:
     def __init__(self, high_decision: str = "update_high_level_memory") -> None:
         self.prompts: list[str] = []
+        self.high_packets: list[dict] = []
         self.high_decision = high_decision
 
     def generate_reply(self, messages, gen):
@@ -60,6 +61,9 @@ class ConsolidationModel:
                 }
             )
         if "High-level memory consolidation" in prompt:
+            packet_text = prompt.split("Input packet:\n", 1)[1]
+            packet, _ = json.JSONDecoder().raw_decode(packet_text)
+            self.high_packets.append(packet)
             if self.high_decision == "no_high_level_update":
                 return json.dumps(
                     {
@@ -103,6 +107,21 @@ class BadHighLevelModel(ConsolidationModel):
         if "High-level memory consolidation" in prompt:
             self.prompts.append(prompt)
             return "{not valid json"
+        return super().generate_reply(messages, gen)
+
+
+class RetryHighLevelModel(ConsolidationModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.high_attempts = 0
+
+    def generate_reply(self, messages, gen):
+        prompt = messages[-1]["content"]
+        if "High-level memory consolidation" in prompt:
+            self.high_attempts += 1
+            if self.high_attempts == 1:
+                self.prompts.append(prompt)
+                return "{not valid json"
         return super().generate_reply(messages, gen)
 
 
@@ -163,6 +182,24 @@ class MemoryConsolidationTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "profile.json").exists())
             self.assertFalse((Path(tmp) / "personality_insights.jsonl").exists())
 
+    def test_high_level_consolidation_receives_persisted_low_level_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = ConsolidationModel()
+            manager = MemoryManager(
+                memory_root=Path(tmp),
+                model=model,
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
+
+            self._record_turns(manager, "sess_stage_order", 1)
+
+            self.assertEqual(len(model.high_packets), 1)
+            packet = model.high_packets[0]
+            self.assertNotIn("pending_low_level_updates", packet)
+            persisted = json.loads((Path(tmp) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(packet["semantic_events"][-1]["id"], persisted["id"])
+
     def test_high_level_noop_leaves_high_level_files_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model = ConsolidationModel(high_decision="no_high_level_update")
@@ -185,7 +222,7 @@ class MemoryConsolidationTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "personality_insights.jsonl").exists())
             self.assertIn("high_level_noop", "\n".join(logs))
 
-    def test_high_level_failure_does_not_write_partial_low_level_updates(self) -> None:
+    def test_high_level_failure_keeps_only_stage_two_pending(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model = BadHighLevelModel()
             manager = MemoryManager(
@@ -198,10 +235,33 @@ class MemoryConsolidationTest(unittest.TestCase):
             self._record_turns(manager, "sess_bad_high", 1)
 
             state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
-            self.assertEqual(len(state["sessions"]["sess_bad_high"]["pending_turns"]), 1)
-            self.assertFalse((Path(tmp) / "semantic_events.jsonl").exists())
-            self.assertFalse((Path(tmp) / "event_summaries.jsonl").exists())
+            session_state = state["sessions"]["sess_bad_high"]
+            self.assertEqual(session_state["pending_turns"], [])
+            self.assertEqual(session_state["pending_high_level"]["batch_seq"], 1)
+            self.assertTrue((Path(tmp) / "semantic_events.jsonl").exists())
+            self.assertTrue((Path(tmp) / "event_summaries.jsonl").exists())
             self.assertFalse((Path(tmp) / "archival_memory.jsonl").exists())
+
+    def test_pending_high_level_retry_does_not_repeat_stage_one(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = RetryHighLevelModel()
+            manager = MemoryManager(
+                memory_root=Path(tmp),
+                model=model,
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
+
+            self._record_turns(manager, "sess_retry_high", 1)
+            manager.flush_session_memory("sess_retry_high")
+
+            low_prompts = [prompt for prompt in model.prompts if "Low-level memory consolidation" in prompt]
+            state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
+            events = (Path(tmp) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(low_prompts), 1)
+            self.assertEqual(len(events), 1)
+            self.assertIsNone(state["sessions"]["sess_retry_high"]["pending_high_level"])
+            self.assertEqual(state["sessions"]["sess_retry_high"]["consolidation_batches"], 1)
 
     def test_chat_session_flush_consolidates_incomplete_batch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -636,25 +636,29 @@ class MemoryManager:
             return pending_count
 
     def _consolidate_pending_turns(self, *, session_id: str, force: bool) -> dict[str, int]:
+        pending_high_level: dict | None = None
         with self._turn_state_lock:
             payload = self._read_consolidation_state()
             session_state = self._session_consolidation_state(payload, session_id)
             pending_turns = list(session_state.get("pending_turns", []) or [])
-            if not pending_turns:
+            pending_high_level = session_state.get("pending_high_level")
+            if not isinstance(pending_high_level, dict):
+                pending_high_level = None
+            if pending_high_level is None and not pending_turns:
                 return {
                     "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
                     "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
                     "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
                     "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
                 }
-            if not force and len(pending_turns) < self.consolidation_config.batch_turns:
+            if pending_high_level is None and not force and len(pending_turns) < self.consolidation_config.batch_turns:
                 return {
                     "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
                     "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
                     "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
                     "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
                 }
-            if not self.summarizer.use_llm:
+            if pending_high_level is None and not self.summarizer.use_llm:
                 self._debug(session_id, "consolidation_skipped reason=no_llm_model")
                 return {
                     "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
@@ -662,7 +666,16 @@ class MemoryManager:
                     "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
                     "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
                 }
-            batch_seq = int(session_state.get("batch_seq", 0) or 0) + 1
+            batch_seq = int((pending_high_level or {}).get("batch_seq", 0) or 0)
+            if not batch_seq:
+                batch_seq = int(session_state.get("batch_seq", 0) or 0) + 1
+
+        if pending_high_level is not None:
+            return self._retry_pending_high_level(
+                session_id=session_id,
+                batch_seq=batch_seq,
+                pending_high_level=pending_high_level,
+            )
 
         try:
             low_packet = self._build_low_level_packet(session_id=session_id, pending_turns=pending_turns)
@@ -670,20 +683,27 @@ class MemoryManager:
                 low_packet,
                 include_guga_reflection=self.consolidation_config.include_guga_reflection,
             )
-            high_packet = self._build_high_level_packet(pending_low_level=low_result)
-            high_result = self.summarizer.consolidate_high_level_memory(high_packet)
             low_counts = self._apply_low_level_consolidation(
                 session_id=session_id,
                 batch_seq=batch_seq,
                 result=low_result,
                 pending_turns=pending_turns,
             )
+            high_packet = self._build_high_level_packet()
+            high_result = self.summarizer.consolidate_high_level_memory(high_packet)
             high_counts = self._apply_high_level_consolidation(
                 session_id=session_id,
                 result=high_result,
                 low_source_message_ids=self._pending_source_message_ids(pending_turns),
             )
         except SummaryGenerationError as exc:
+            if "low_counts" in locals():
+                return self._mark_pending_high_level(
+                    session_id=session_id,
+                    batch_seq=batch_seq,
+                    low_counts=low_counts,
+                    reason=str(exc),
+                )
             self._debug(session_id, f"consolidation_failed reason={exc}")
             return {"consolidation_batches": 0, "low_level_updates": 0, "high_level_updates": 0, "high_level_noops": 0}
 
@@ -701,6 +721,68 @@ class MemoryManager:
                 session_id,
                 f"consolidation_done batch_seq={batch_seq} low_updates={low_counts['low_level_updates']} high_updates={high_counts['high_level_updates']} high_noops={high_counts['high_level_noops']}",
             )
+            return {
+                "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
+                "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
+                "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
+                "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
+            }
+
+    def _mark_pending_high_level(
+        self,
+        *,
+        session_id: str,
+        batch_seq: int,
+        low_counts: dict[str, int],
+        reason: str,
+    ) -> dict[str, int]:
+        with self._turn_state_lock:
+            payload = self._read_consolidation_state()
+            session_state = self._session_consolidation_state(payload, session_id)
+            session_state["pending_turns"] = []
+            session_state["pending_high_level"] = {
+                "batch_seq": batch_seq,
+                "low_level_updates": int(low_counts.get("low_level_updates", 0) or 0),
+            }
+            self._write_consolidation_state(payload)
+        self._debug(session_id, f"high_level_pending batch_seq={batch_seq} reason={reason}")
+        return {"consolidation_batches": 0, "low_level_updates": 0, "high_level_updates": 0, "high_level_noops": 0}
+
+    def _retry_pending_high_level(
+        self,
+        *,
+        session_id: str,
+        batch_seq: int,
+        pending_high_level: dict,
+    ) -> dict[str, int]:
+        try:
+            high_result = self.summarizer.consolidate_high_level_memory(self._build_high_level_packet())
+            high_counts = self._apply_high_level_consolidation(
+                session_id=session_id,
+                result=high_result,
+                low_source_message_ids=[],
+            )
+        except SummaryGenerationError as exc:
+            self._debug(session_id, f"high_level_retry_failed batch_seq={batch_seq} reason={exc}")
+            return {"consolidation_batches": 0, "low_level_updates": 0, "high_level_updates": 0, "high_level_noops": 0}
+
+        with self._turn_state_lock:
+            payload = self._read_consolidation_state()
+            session_state = self._session_consolidation_state(payload, session_id)
+            if session_state.get("pending_high_level") != pending_high_level:
+                return {
+                    "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
+                    "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
+                    "high_level_updates": int(session_state.get("high_level_updates", 0) or 0),
+                    "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
+                }
+            session_state.pop("pending_high_level", None)
+            session_state["batch_seq"] = batch_seq
+            session_state["consolidation_batches"] = int(session_state.get("consolidation_batches", 0) or 0) + 1
+            session_state["low_level_updates"] = int(session_state.get("low_level_updates", 0) or 0) + int(pending_high_level.get("low_level_updates", 0) or 0)
+            session_state["high_level_updates"] = int(session_state.get("high_level_updates", 0) or 0) + high_counts["high_level_updates"]
+            session_state["high_level_noops"] = int(session_state.get("high_level_noops", 0) or 0) + high_counts["high_level_noops"]
+            self._write_consolidation_state(payload)
             return {
                 "consolidation_batches": int(session_state.get("consolidation_batches", 0) or 0),
                 "low_level_updates": int(session_state.get("low_level_updates", 0) or 0),
@@ -735,11 +817,10 @@ class MemoryManager:
         }
         return self._trim_packet(packet)
 
-    def _build_high_level_packet(self, pending_low_level: dict | None = None) -> dict:
+    def _build_high_level_packet(self) -> dict:
         packet = {
             "semantic_events": self.semantic_event_store.load_all()[-50:],
             "event_summaries": self.event_summary_store.load_active()[-50:],
-            "pending_low_level_updates": pending_low_level or {"semantic_event_operations": [], "event_summaries": []},
             "archival_memory": self._read_jsonl_records(self.archival_file)[-50:],
             "guga_user_model": self.user_model_store.load(),
         }
@@ -976,6 +1057,7 @@ class MemoryManager:
             {
                 "batch_seq": 0,
                 "pending_turns": [],
+                "pending_high_level": None,
                 "completed_turns": 0,
                 "consolidation_batches": 0,
                 "low_level_updates": 0,
@@ -985,6 +1067,7 @@ class MemoryManager:
         )
         session_state.setdefault("batch_seq", 0)
         session_state.setdefault("pending_turns", [])
+        session_state.setdefault("pending_high_level", None)
         session_state.setdefault("completed_turns", 0)
         session_state.setdefault("consolidation_batches", 0)
         session_state.setdefault("low_level_updates", 0)
