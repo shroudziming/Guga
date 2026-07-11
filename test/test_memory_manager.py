@@ -17,11 +17,20 @@ class SummaryModel:
         if "Low-level memory consolidation" in prompt:
             return json.dumps(
                 {
-                    "timeline_facts": [],
+                    "semantic_event_operations": [
+                        {
+                            "operation": "create",
+                            "event_kind": "state_change",
+                            "subject": "user",
+                            "entity": "work location",
+                            "description": "用户叫小明，在深圳工作。",
+                            "time_expression": "",
+                            "end_unknown": True,
+                            "source_message_ids": [],
+                        }
+                    ],
                     "event_summaries": [
                         {
-                            "action": "upsert",
-                            "scope": "batch",
                             "summary": "用户叫小明，在深圳工作。",
                             "source_message_ids": [],
                             "confidence": 0.9,
@@ -34,16 +43,25 @@ class SummaryModel:
             return json.dumps(
                 {
                     "decision": "update_high_level_memory",
-                    "archival_updates": [
+                    "archival_operations": [
                         {
                             "topic": "profile",
                             "summary": "用户叫小明，在深圳工作",
                             "importance": 0.8,
                             "confidence": 0.9,
+                            "source_event_ids": ["evt_work_location"],
                         }
                     ],
-                    "profile_updates": [{"summary": "用户在深圳工作。"}],
-                    "personality_insight_updates": [],
+                    "user_model_operations": [
+                        {
+                            "operation": "upsert",
+                            "statement": "Guga 了解到用户在深圳工作。",
+                            "kind": "work_context",
+                            "confidence": 0.9,
+                            "stability": "explicit",
+                            "source_event_ids": ["evt_work_location"],
+                        }
+                    ],
                     "reason": "stable profile",
                 },
                 ensure_ascii=False,
@@ -181,16 +199,35 @@ class MemoryManagerTest(unittest.TestCase):
         context = self.manager.prepare_context("上次我们聊了什么", session_id="sess_now")
         prompt = self.manager.compose_system_prompt("你是一个助手", context)
 
-        self.assertIn("[Historical Conversation Context]", prompt)
+        self.assertIn("[Derived Event Summaries]", prompt)
+        self.assertIn("[Raw Evidence]", prompt)
         self.assertIn("在 2026-06-28 01:35 北京时间的 sess_history 对话中", prompt)
-        self.assertIn("摘要：用户询问并获得悬疑网剧推荐。", prompt)
+        self.assertIn("用户询问并获得悬疑网剧推荐。", prompt)
         self.assertIn(f"User({user_id}): 我之前问你推荐过一部悬疑网剧。", prompt)
         self.assertIn(f"Assistant({assistant_id}): 我推荐过《隐秘的角落》。", prompt)
-        self.assertNotIn("[Relevant Event Summaries]", prompt)
+        self.assertNotIn("[Historical Conversation Context]", prompt)
 
     def test_profile_prompt_renders_portrait_without_event_summary(self) -> None:
-        (self.memory_root / "profile.json").write_text(
-            json.dumps({"portrait_summary": "- 用户自称叔本明。"}, ensure_ascii=False),
+        (self.memory_root / "guga_user_model.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "updated_at": "2026-06-28T01:35:00+08:00",
+                    "insights": [
+                        {
+                            "id": "gum_name",
+                            "statement": "用户自称叔本明。",
+                            "kind": "identity",
+                            "confidence": 0.9,
+                            "stability": "explicit",
+                            "source_event_ids": ["evt_identity"],
+                            "status": "active",
+                            "updated_at": "2026-06-28T01:35:00+08:00",
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
             encoding="utf-8",
         )
         event = {
@@ -215,7 +252,7 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertIn("[User Portrait]", prompt)
         self.assertIn("叔本明", prompt)
         self.assertNotIn("一次普通闲聊摘要", prompt)
-        self.assertNotIn("[Historical Conversation Context]", prompt)
+        self.assertNotIn("[Derived Event Summaries]", prompt)
 
     def test_document_section_only_renders_when_document_hits_exist(self) -> None:
         context = MemoryContext(
@@ -256,7 +293,7 @@ class MemoryManagerTest(unittest.TestCase):
         payload = json.loads(archival_file.read_text(encoding="utf-8").splitlines()[-1])
         self.assertEqual(payload["type"], "episodic")
         self.assertEqual(payload["status"], "active")
-        self.assertTrue(payload["source_message_ids"])
+        self.assertTrue(payload["source_event_ids"])
 
 
 if __name__ == "__main__":

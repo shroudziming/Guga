@@ -23,11 +23,20 @@ class FakeChatModel:
         if "Low-level memory consolidation" in prompt:
             return json.dumps(
                 {
-                    "timeline_facts": [],
+                    "semantic_event_operations": [
+                        {
+                            "operation": "create",
+                            "event_kind": "state_change",
+                            "subject": "user",
+                            "entity": "work context",
+                            "description": "用户在杭州工作，做后端开发。",
+                            "time_expression": "",
+                            "end_unknown": True,
+                            "source_message_ids": [],
+                        }
+                    ],
                     "event_summaries": [
                         {
-                            "action": "upsert",
-                            "scope": "batch",
                             "summary": "用户在杭州工作，做后端开发。",
                             "source_message_ids": [],
                             "confidence": 0.9,
@@ -40,16 +49,16 @@ class FakeChatModel:
             return json.dumps(
                 {
                     "decision": "update_high_level_memory",
-                    "archival_updates": [
+                    "archival_operations": [
                         {
                             "topic": "work",
                             "summary": "用户在杭州工作，做后端开发",
                             "importance": 0.8,
                             "confidence": 0.9,
+                            "source_event_ids": ["evt_work_context"],
                         }
                     ],
-                    "profile_updates": [{"summary": "用户在杭州工作，做后端开发。"}],
-                    "personality_insight_updates": [],
+                    "user_model_operations": [],
                     "reason": "work context",
                 },
                 ensure_ascii=False,
@@ -143,11 +152,20 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                 if "Low-level memory consolidation" in prompt:
                     return json.dumps(
                         {
-                            "timeline_facts": [],
+                            "semantic_event_operations": [
+                                {
+                                    "operation": "create",
+                                    "event_kind": "state_change",
+                                    "subject": "user",
+                                    "entity": "work context",
+                                    "description": "The user works on backend systems.",
+                                    "time_expression": "",
+                                    "end_unknown": True,
+                                    "source_message_ids": [],
+                                }
+                            ],
                             "event_summaries": [
                                 {
-                                    "action": "upsert",
-                                    "scope": "batch",
                                     "summary": "The user works on backend systems.",
                                     "source_message_ids": [],
                                     "confidence": 0.9,
@@ -159,16 +177,16 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                     return json.dumps(
                         {
                             "decision": "update_high_level_memory",
-                            "archival_updates": [
+                            "archival_operations": [
                                 {
                                     "topic": "work",
                                     "summary": "The user works on backend systems.",
                                     "importance": 0.8,
                                     "confidence": 0.9,
+                                    "source_event_ids": ["evt_work_context"],
                                 }
                             ],
-                            "profile_updates": [],
-                            "personality_insight_updates": [],
+                            "user_model_operations": [],
                             "reason": "work context",
                         }
                     )

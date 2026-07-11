@@ -64,7 +64,7 @@ class RagPipeline:
             - memory_root/archival_memory.jsonl
             - memory_root/event_summaries.jsonl
             - memory_root/session_memories.jsonl
-            - memory_root/timeline_facts.jsonl
+            - memory_root/semantic_events.jsonl
             - memory_root/sessions/**/*.jsonl (legacy fallback user messages)
             - documents_dir/**/*.txt|md|json|jsonl
 
@@ -156,7 +156,7 @@ class RagPipeline:
             memory_root / "archival_memory.jsonl",
             memory_root / "event_summaries.jsonl",
             session_memory_file,
-            memory_root / "timeline_facts.jsonl",
+            memory_root / "semantic_events.jsonl",
         ):
             if jsonl_file.exists():
                 for line in jsonl_file.read_text(encoding="utf-8").splitlines():
@@ -211,6 +211,8 @@ class RagPipeline:
             return []
 
         summary = str(payload.get("summary") or payload.get("raw_excerpt") or "").strip()
+        if not summary and str(payload.get("type", "")) == "semantic_event":
+            summary = self._semantic_event_text(payload)
         if not summary:
             return []
 
@@ -235,6 +237,15 @@ class RagPipeline:
                 "memory_strength": str(payload.get("memory_strength", "")),
             },
         )
+
+    def _semantic_event_text(self, payload: dict) -> str:
+        description = str(payload.get("description", "")).strip()
+        if not description:
+            return ""
+        status = str(payload.get("status", "active"))
+        start_at = str(payload.get("start_at", "") or "未知时间")
+        end_at = str(payload.get("end_at", "") or ("结束未知" if payload.get("end_unknown") else ""))
+        return f"{description}（状态: {status}; 开始: {start_at}; 结束: {end_at}）"
 
     def _collect_document_chunks(self, docs_dir: Path) -> list[DocumentChunk]:
         """Collect chunked document texts from supported file extensions."""

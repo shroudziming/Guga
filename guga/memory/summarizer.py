@@ -217,10 +217,10 @@ class MemoryBankSummarizer:
             "Output schema:\n"
             "{"
             "\"decision\": \"update_high_level_memory|no_high_level_update\", "
-            "\"archival_updates\": [{\"topic\": string, \"summary\": string, \"importance\": number, "
-            "\"confidence\": number, \"source_message_ids\": [string]}], "
-            "\"profile_updates\": [{\"summary\": string}], "
-            "\"personality_insight_updates\": [{\"summary\": string}], "
+            "\"archival_operations\": [{\"topic\": string, \"summary\": string, \"importance\": number, "
+            "\"confidence\": number, \"source_event_ids\": [string]}], "
+            "\"user_model_operations\": [{\"operation\": \"upsert|deactivate\", \"statement\": string, "
+            "\"kind\": string, \"confidence\": number, \"stability\": string, \"source_event_ids\": [string]}], "
             "\"reason\": string"
             "}\n"
             "Rules:\n"
@@ -239,10 +239,9 @@ class MemoryBankSummarizer:
         decision = str(parsed.get("decision", "")).strip()
         if decision not in {"update_high_level_memory", "no_high_level_update"}:
             raise SummaryGenerationError("LLM high-level consolidation returned unsupported decision.")
-        parsed.setdefault("archival_updates", [])
-        parsed.setdefault("profile_updates", [])
-        parsed.setdefault("personality_insight_updates", [])
-        for key in ("archival_updates", "profile_updates", "personality_insight_updates"):
+        parsed.setdefault("archival_operations", [])
+        parsed.setdefault("user_model_operations", [])
+        for key in ("archival_operations", "user_model_operations"):
             if not isinstance(parsed[key], list):
                 raise SummaryGenerationError(f"LLM high-level consolidation field {key} must be an array.")
         parsed["reason"] = str(parsed.get("reason", "")).strip()

@@ -29,12 +29,10 @@ from guga.memory.agent_identity import AgentIdentity, agent_memory_root
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
-from guga.memory.portrait import UserPortraitStore
-from guga.memory.profile_store import ProfileStore
 from guga.memory.semantic_events import SemanticEventStore
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
-from guga.memory.timeline_facts import TimelineFactStore
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso
+from guga.memory.user_model import GugaUserModelStore
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
 from guga.types import ConversationEvidenceGroup, ConversationEvidenceMessage, DocumentHit, MemoryContext, MemoryHit
@@ -175,14 +173,11 @@ class MemoryManager:
         self._validate_or_create_agent_manifest()
         self.archival_file = self.memory_root / "archival_memory.jsonl"
         self.session_memory_file = self.memory_root / "session_memories.jsonl"
-        self.timeline_fact_file = self.memory_root / "timeline_facts.jsonl"
         self.semantic_event_file = self.memory_root / "semantic_events.jsonl"
         self.consolidation_state_file = self.memory_root / "consolidation_state.json"
-        self.profile_store = ProfileStore(self.memory_root / "profile.json")
         self.event_summary_store = EventSummaryStore(self.memory_root / "event_summaries.jsonl")
         self.semantic_event_store = SemanticEventStore(self.semantic_event_file)
-        self.timeline_fact_store = TimelineFactStore(self.timeline_fact_file)
-        self.portrait_store = UserPortraitStore(self.memory_root / "profile.json", self.memory_root / "personality_insights.jsonl")
+        self.user_model_store = GugaUserModelStore(self.memory_root / "guga_user_model.json")
         self.summarizer = MemoryBankSummarizer(model=model)
         self.consolidation_config = (consolidation_config or MemoryConsolidationConfig()).normalized()
         self.session_store = _SessionStore(self.memory_root / "sessions")
@@ -290,10 +285,14 @@ class MemoryManager:
             time_hints=time_hints,
             session_id=session_id,
         )
-        merged_memory_hits = self._dedupe_timeline_fact_overlaps(merged_memory_hits, query_plan)
+        merged_memory_hits = self._dedupe_semantic_event_overlaps(merged_memory_hits, query_plan)
         self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text, current_turn_ids=current_turn_ids)
         document_hits = self._to_document_hits(semantic_document_hits)
-        user_portrait = str(self.portrait_store.load().get("portrait_summary", "")).strip()
+        user_portrait = "\n".join(
+            str(insight.get("statement", "")).strip()
+            for insight in self.user_model_store.load().get("insights", [])
+            if insight.get("status") == "active" and str(insight.get("statement", "")).strip()
+        )
         event_summary_hits = self._select_event_summary_hits(merged_memory_hits, query_plan)
         conversation_evidence_groups = self._build_conversation_evidence_groups(event_summary_hits)
 
@@ -358,6 +357,11 @@ class MemoryManager:
             sections.append(memory_context.user_portrait or "- 当前还没有稳定用户画像。")
 
         if prompt_mode == "history":
+            semantic_events = [hit for hit in memory_context.hits if hit.memory_type == "semantic_event"]
+            if semantic_events:
+                sections.append("\n[Semantic Events]")
+                for hit in semantic_events:
+                    sections.append(self._format_memory_hit(hit))
             self._append_historical_context(sections, memory_context)
 
         conversation_hits = self._prompt_conversation_hits(memory_context)
@@ -387,26 +391,20 @@ class MemoryManager:
         return "general"
 
     def _append_historical_context(self, sections: list[str], memory_context: MemoryContext) -> None:
+        if memory_context.event_summaries:
+            sections.append("\n[Derived Event Summaries]")
+            for hit in memory_context.event_summaries:
+                sections.append(self._format_memory_hit(hit))
+
         if memory_context.conversation_evidence_groups:
-            sections.append("\n[Historical Conversation Context]")
+            sections.append("\n[Raw Evidence]")
             for group in memory_context.conversation_evidence_groups:
                 timestamp = self._format_beijing_minute(group.created_at)
                 sections.append(f"- 在 {timestamp}的 {group.session_id} 对话中：")
-                sections.append(f"  摘要：{group.summary_text}")
                 if group.messages:
-                    sections.append("  相关原文：")
                     for message in group.messages:
                         role = message.role.capitalize() if message.role else "Message"
                         sections.append(f"  {role}({message.message_id}): {message.content}")
-            return
-
-        if memory_context.event_summaries:
-            sections.append("\n[Historical Conversation Context]")
-            for hit in memory_context.event_summaries:
-                timestamp = self._format_beijing_minute(hit.created_at)
-                session_ref = hit.source_session_id or "unknown_session"
-                sections.append(f"- 在 {timestamp}的 {session_ref} 对话中：")
-                sections.append(f"  摘要：{hit.summary}")
 
     def _prompt_conversation_hits(self, memory_context: MemoryContext) -> list[MemoryHit]:
         evidence_message_ids = {
@@ -417,7 +415,7 @@ class MemoryManager:
         return [
             hit
             for hit in memory_context.hits
-            if hit.memory_type != "event_summary" and not hit.is_current_turn
+            if hit.memory_type not in {"event_summary", "semantic_event"} and not hit.is_current_turn
             and not evidence_message_ids.intersection(hit.source_message_ids)
         ]
 
@@ -743,8 +741,7 @@ class MemoryManager:
             "event_summaries": self.event_summary_store.load_active()[-50:],
             "pending_low_level_updates": pending_low_level or {"semantic_event_operations": [], "event_summaries": []},
             "archival_memory": self._read_jsonl_records(self.archival_file)[-50:],
-            "profile": self.portrait_store.load(),
-            "personality_insights": self._read_jsonl_records(self.portrait_store.daily_file_path)[-50:],
+            "guga_user_model": self.user_model_store.load(),
         }
         return self._trim_packet(packet)
 
@@ -839,10 +836,10 @@ class MemoryManager:
 
         updates = 0
         if self.consolidation_config.enable_archival_updates:
-            for item in result.get("archival_updates", []) or []:
+            for item in result.get("archival_operations", []) or []:
                 if not isinstance(item, dict):
                     continue
-                payload = self._build_archival_update(item=item, session_id=session_id, fallback_source_ids=low_source_message_ids)
+                payload = self._build_archival_update(item=item, session_id=session_id)
                 if not payload:
                     continue
                 self._append_jsonl(self.archival_file, payload)
@@ -852,25 +849,19 @@ class MemoryManager:
                         self.rag_pipeline.add_memory_record(payload)
                     except Exception as exc:
                         self._debug(session_id, f"index_update status=archival_failed reason={exc}")
-        if self.consolidation_config.enable_profile_updates:
-            profile = self.portrait_store.apply_profile_updates(result.get("profile_updates", []) or [])
-            if profile.get("portrait_summary"):
-                updates += 1
         if self.consolidation_config.enable_personality_updates:
-            written = self.portrait_store.apply_personality_insight_updates(
-                updates=result.get("personality_insight_updates", []) or [],
-                source_session_id=session_id,
-                source_message_ids=low_source_message_ids,
-            )
+            written = self.user_model_store.apply_operations(result.get("user_model_operations", []) or [])
             updates += len(written)
         return {"high_level_updates": updates, "high_level_noops": 0}
 
-    def _build_archival_update(self, *, item: dict, session_id: str, fallback_source_ids: list[str]) -> dict:
+    def _build_archival_update(self, *, item: dict, session_id: str) -> dict:
         summary = str(item.get("summary", "")).strip()
         if not summary:
             return {}
         now = now_beijing_iso()
-        source_message_ids = [str(value) for value in (item.get("source_message_ids") or fallback_source_ids) if str(value)]
+        source_event_ids = [str(value) for value in (item.get("source_event_ids") or []) if str(value)]
+        if not source_event_ids:
+            return {}
         return normalize_memorybank_fields(
             apply_temporal_fields(
                 {
@@ -886,7 +877,7 @@ class MemoryManager:
                     "memory_strength": 1,
                     "retention": 1.0,
                     "source_session_id": session_id,
-                    "source_message_ids": source_message_ids,
+                    "source_event_ids": source_event_ids,
                     "status": "active",
                 },
                 text=summary,
@@ -1153,13 +1144,13 @@ class MemoryManager:
         merged.sort(key=lambda item: item.score, reverse=True)
         return self._filter_memory_hits(merged)
 
-    def _dedupe_timeline_fact_overlaps(self, hits: list[MemoryHit], query_plan: _QueryPlan) -> list[MemoryHit]:
+    def _dedupe_semantic_event_overlaps(self, hits: list[MemoryHit], query_plan: _QueryPlan) -> list[MemoryHit]:
         if query_plan.route != "date_window":
             return hits
 
         fact_message_ids: set[str] = set()
         for hit in hits:
-            if hit.memory_type == "timeline_fact":
+            if hit.memory_type == "semantic_event":
                 fact_message_ids.update(hit.source_message_ids)
         if not fact_message_ids:
             return hits
@@ -1266,7 +1257,7 @@ class MemoryManager:
     def _current_turn_ids(self, session_id: str) -> set[str]:
         with self._turn_state_lock:
             state = dict(self._turn_state.get(session_id, {}))
-        return {str(value) for key in ("user_message_id", "session_memory_id", "timeline_fact_id") if (value := state.get(key))}
+        return {str(value) for key in ("user_message_id", "session_memory_id") if (value := state.get(key))}
 
     def _is_current_turn_hit(self, hit: MemoryHit, current_turn_ids: set[str]) -> bool:
         if not current_turn_ids:
@@ -1289,8 +1280,8 @@ class MemoryManager:
         archival_changed = reinforce_jsonl_records(self.archival_file, recalled_ids)
         event_changed = reinforce_jsonl_records(self.event_summary_store.file_path, recalled_ids)
         session_changed = reinforce_jsonl_records(self.session_memory_file, recalled_ids)
-        fact_changed = reinforce_jsonl_records(self.timeline_fact_file, recalled_ids)
-        changed = archival_changed + event_changed + session_changed + fact_changed
+        semantic_changed = reinforce_jsonl_records(self.semantic_event_file, recalled_ids)
+        changed = archival_changed + event_changed + session_changed + semantic_changed
         if changed:
             self._debug(session_id, f"memory_update recalled_ids={changed} action=reinforce")
 
@@ -1314,7 +1305,7 @@ class MemoryManager:
     def _load_archival_records(self) -> list[dict]:
         """Load and normalize active archival memory records from JSONL file."""
         records: list[dict] = []
-        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.timeline_fact_file):
+        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.semantic_event_file):
             if not path.exists():
                 continue
             for line in path.read_text(encoding="utf-8").splitlines():
@@ -1513,9 +1504,9 @@ class MemoryManager:
             if record_day == day:
                 adjusted = max(adjusted, 0.45)
                 rule = "date_match"
-                if item.get("type") == "timeline_fact":
+                if item.get("type") == "semantic_event":
                     adjusted += 0.25
-                    rule = "date_match_timeline_fact"
+                    rule = "date_match_semantic_event"
                 if item.get("type") == "event_summary":
                     adjusted += 0.2
                     rule = "date_match_event_summary"
@@ -1562,13 +1553,10 @@ class MemoryManager:
         return adjusted, components
 
     def _record_day(self, item: dict) -> str:
-        if item.get("type") == "timeline_fact":
-            semantic_day = str(item.get("semantic_day", "") or "").strip()
-            if semantic_day:
-                return semantic_day
-            valid_at = str(item.get("valid_at", "") or "").strip()
-            if valid_at:
-                return self._day_bucket(valid_at)
+        if item.get("type") == "semantic_event":
+            start_at = str(item.get("start_at", "") or "").strip()
+            if start_at:
+                return self._day_bucket(start_at)
         time_source = str(item.get("time_source", "") or "")
         if time_source.startswith("semantic_"):
             semantic_day = str(item.get("semantic_day", "") or "").strip()
@@ -1588,7 +1576,7 @@ class MemoryManager:
             return
         total_checked = 0
         total_decayed = 0
-        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.timeline_fact_file):
+        for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.semantic_event_file):
             stats = refresh_jsonl_retention(
                 path,
                 decay_threshold=self.decay_threshold,
@@ -1623,64 +1611,6 @@ class MemoryManager:
             text=text,
             reference_time=now,
         )
-
-    def _refresh_hierarchical_memory(self, session_id: str) -> None:
-        session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
-        day, dialogue, message_ids = self._load_daily_dialogue(session_file)
-        if not dialogue:
-            return
-        daily_event = self.event_summary_store.refresh_daily_summary(
-            session_id=session_id,
-            day=day,
-            dialogue=dialogue,
-            source_message_ids=message_ids,
-            summarizer=self.summarizer,
-        )
-        global_event = self.event_summary_store.refresh_global_summary(self.summarizer)
-        daily_portrait = self.portrait_store.refresh_daily_insight(
-            day=day,
-            dialogue=dialogue,
-            source_session_id=session_id,
-            source_message_ids=message_ids,
-            summarizer=self.summarizer,
-        )
-        profile = self.portrait_store.refresh_global_portrait(self.summarizer)
-        if self.rag_pipeline is not None:
-            for payload in (daily_event, global_event):
-                if payload:
-                    try:
-                        self.rag_pipeline.add_memory_record(payload)
-                    except Exception as exc:
-                        self._debug(session_id, f"index_update status=hierarchy_failed id={payload.get('id', '')} reason={exc}")
-        self._debug(
-            session_id,
-            f"hierarchy_update daily_event_id={daily_event.get('id', '') if daily_event else ''} global_event_id={global_event.get('id', '') if global_event else ''} daily_portrait_id={daily_portrait.get('id', '') if daily_portrait else ''} portrait_len={len(str(profile.get('portrait_summary', '')))}",
-        )
-
-    def _load_daily_dialogue(self, session_file: Path) -> tuple[str, str, list[str]]:
-        if not session_file.exists():
-            return now_beijing().date().isoformat(), "", []
-
-        current_rows = self._read_session_rows(session_file)
-        if not current_rows:
-            return now_beijing().date().isoformat(), "", []
-
-        day = self._day_bucket(str(current_rows[-1].get("created_at", "")))
-        rows: list[dict] = []
-        sessions_dir = self.memory_root / "sessions"
-        if sessions_dir.exists():
-            for path in sessions_dir.glob("*.jsonl"):
-                rows.extend(row for row in self._read_session_rows(path) if self._day_bucket(str(row.get("created_at", ""))) == day)
-        rows.sort(key=lambda row: str(row.get("created_at", "")))
-
-        message_ids = [str(row.get("id", "")) for row in rows if str(row.get("id", ""))]
-        lines = []
-        for row in rows:
-            role = str(row.get("role", "")).strip() or "message"
-            content = str(row.get("content", "")).strip()
-            if content:
-                lines.append(f"{role}: {content}")
-        return day, "\n".join(lines), message_ids
 
     def _read_session_rows(self, session_file: Path) -> list[dict]:
         rows: list[dict] = []
@@ -1734,6 +1664,11 @@ class MemoryManager:
             return None
 
         summary = str(payload.get("summary") or payload.get("raw_excerpt") or "").strip()
+        if not summary and str(payload.get("type", "")) == "semantic_event":
+            description = str(payload.get("description", "")).strip()
+            if description:
+                start_at = str(payload.get("start_at", "") or "未知时间")
+                summary = f"{description}（状态: {payload.get('status', 'active')}; 开始: {start_at}）"
         if not summary:
             return None
 

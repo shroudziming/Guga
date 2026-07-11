@@ -64,29 +64,32 @@ class ConsolidationModel:
                 return json.dumps(
                     {
                         "decision": "no_high_level_update",
-                        "archival_updates": [],
-                        "profile_updates": [],
-                        "personality_insight_updates": [],
+                        "archival_operations": [],
+                        "user_model_operations": [],
                         "reason": "No stable long-term memory found.",
                     }
                 )
             return json.dumps(
                 {
                     "decision": "update_high_level_memory",
-                    "archival_updates": [
+                    "archival_operations": [
                         {
                             "topic": "deadline",
                             "summary": "The user has a project report deadline.",
                             "importance": 0.8,
                             "confidence": 0.88,
-                            "source_message_ids": [],
+                            "source_event_ids": ["evt_project_report"],
                         }
                     ],
-                    "profile_updates": [
-                        {"summary": "The user cares about tracking deadlines."}
-                    ],
-                    "personality_insight_updates": [
-                        {"summary": "Guga should be careful about deadline reminders."}
+                    "user_model_operations": [
+                        {
+                            "operation": "upsert",
+                            "statement": "Guga should be careful about deadline reminders.",
+                            "kind": "reminder_pattern",
+                            "confidence": 0.8,
+                            "stability": "recurring",
+                            "source_event_ids": ["evt_project_report"],
+                        }
                     ],
                     "reason": "The low-level memories contain a stable reminder preference.",
                 }
