@@ -36,6 +36,10 @@ class LongMemEvalCase:
     answer: str
     question_type: str
     sessions: list[list[LongMemEvalMessage]]
+    session_ids: list[str]
+    session_dates: list[str]
+    question_date: str
+    answer_session_ids: list[str]
     raw: dict[str, Any]
 
 
@@ -49,13 +53,32 @@ def load_longmemeval_cases(path: Path) -> list[LongMemEvalCase]:
         if not question:
             continue
         case_id = _first_text(row, "question_id", "id", "qid", "case_id") or f"case_{index}"
+        sessions = _extract_sessions(row)
+        session_ids = _string_list(row.get("haystack_session_ids"))
+        session_dates = _string_list(row.get("haystack_dates"))
+        if session_dates:
+            sessions = [
+                [
+                    LongMemEvalMessage(
+                        message.role,
+                        message.content,
+                        message.created_at or (session_dates[index] if index < len(session_dates) else ""),
+                    )
+                    for message in session
+                ]
+                for index, session in enumerate(sessions)
+            ]
         cases.append(
             LongMemEvalCase(
                 case_id=safe_case_id(case_id),
                 question=question,
                 answer=_first_text(row, "answer", "reference_answer", "gold", "target"),
                 question_type=_first_text(row, "question_type", "category", "type"),
-                sessions=_extract_sessions(row),
+                sessions=sessions,
+                session_ids=session_ids,
+                session_dates=session_dates,
+                question_date=_first_text(row, "question_date"),
+                answer_session_ids=_string_list(row.get("answer_session_ids")),
                 raw=row,
             )
         )
@@ -65,7 +88,7 @@ def load_longmemeval_cases(path: Path) -> list[LongMemEvalCase]:
 def ingest_longmemeval_case(case: LongMemEvalCase, manager: MemoryManager) -> dict[str, int]:
     messages = 0
     for session_index, session in enumerate(case.sessions):
-        session_id = f"{case.case_id}_s{session_index}"
+        session_id = _case_session_id(case, session_index)
         for message in session:
             role = _normalize_role(message.role)
             if role == "assistant":
@@ -96,7 +119,7 @@ def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager
     high_level_updates = 0
     high_level_noops = 0
     for session_index, session in enumerate(case.sessions):
-        session_id = f"{case.case_id}_s{session_index}"
+        session_id = _case_session_id(case, session_index)
         has_open_user_turn = False
         for message in session:
             role = _normalize_role(message.role)
@@ -370,3 +393,15 @@ def _normalize_role(role: str) -> str:
     if normalized in {"assistant", "ai", "bot", "gpt"}:
         return "assistant"
     return "user"
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _case_session_id(case: LongMemEvalCase, session_index: int) -> str:
+    if session_index < len(case.session_ids):
+        return safe_case_id(case.session_ids[session_index])
+    return f"{case.case_id}_s{session_index}"

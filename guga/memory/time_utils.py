@@ -49,7 +49,24 @@ def parse_datetime(value: str | datetime | None) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value))
     except ValueError:
-        return None
+        match = re.fullmatch(
+            r"\s*(\d{4})/(\d{1,2})/(\d{1,2})\s+\([^)]*\)\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*",
+            str(value),
+        )
+        if not match:
+            return None
+        try:
+            parsed = datetime(
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                int(match.group(4)),
+                int(match.group(5)),
+                int(match.group(6) or 0),
+                tzinfo=BEIJING_TZ,
+            )
+        except ValueError:
+            return None
     return parsed.astimezone(BEIJING_TZ) if parsed.tzinfo else parsed.replace(tzinfo=BEIJING_TZ)
 
 

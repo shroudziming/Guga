@@ -191,11 +191,20 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                 if "Low-level memory consolidation" in prompt:
                     return json.dumps(
                         {
-                            "timeline_facts": [],
+                            "semantic_event_operations": [
+                                {
+                                    "operation": "create",
+                                    "event_kind": "state_change",
+                                    "subject": "user",
+                                    "entity": "notebook preference",
+                                    "description": "User likes blue notebooks.",
+                                    "time_expression": "",
+                                    "end_unknown": True,
+                                    "source_message_ids": [],
+                                }
+                            ],
                             "event_summaries": [
                                 {
-                                    "action": "upsert",
-                                    "scope": "batch",
                                     "summary": "User likes blue notebooks.",
                                     "source_message_ids": [],
                                     "confidence": 0.9,
@@ -207,16 +216,16 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                     return json.dumps(
                         {
                             "decision": "update_high_level_memory",
-                            "archival_updates": [
+                            "archival_operations": [
                                 {
                                     "topic": "preference",
                                     "summary": "User likes blue notebooks.",
                                     "importance": 0.8,
                                     "confidence": 0.9,
+                                    "source_event_ids": ["evt_notebook_preference"],
                                 }
                             ],
-                            "profile_updates": [],
-                            "personality_insight_updates": [],
+                            "user_model_operations": [],
                             "reason": "preference",
                         }
                     )
