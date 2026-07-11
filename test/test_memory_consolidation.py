@@ -24,24 +24,27 @@ class ConsolidationModel:
         if "Low-level memory consolidation" in prompt:
             include_reflection = "include_guga_reflection: true" in prompt
             reflection = {
-                "guga_assessment": "Guga thinks this is important.",
-                "guga_thought": "Guga should remember the plan gently.",
+                "appraisal": "Guga thinks this is important.",
+                "felt_response": "Guga feels attentive.",
+                "relational_intent": "Guga should remember the plan gently.",
+                "interpretation_confidence": 0.8,
             }
             if not include_reflection:
                 reflection = {}
             return json.dumps(
                 {
-                    "timeline_facts": [
+                    "semantic_event_operations": [
                         {
-                            "action": "upsert",
+                            "operation": "create",
+                            "event_kind": "task",
                             "subject": "user",
-                            "predicate": "has_time_bound_plan",
-                            "object": "submit the project report",
-                            "summary": "The user needs to submit the project report.",
-                            "semantic_day": "2026-07-03",
+                            "entity": "project report",
+                            "description": "The user needs to submit the project report.",
+                            "time_expression": "2026-07-03",
+                            "end_unknown": False,
                             "confidence": 0.91,
                             "source_message_ids": [],
-                            **reflection,
+                            "guga_reflection": reflection if include_reflection else {},
                         }
                     ],
                     "event_summaries": [
@@ -150,10 +153,9 @@ class MemoryConsolidationTest(unittest.TestCase):
 
             self._record_turns(manager, "sess_benchmark", 1)
 
-            fact = json.loads((Path(tmp) / "timeline_facts.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            fact = json.loads((Path(tmp) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()[0])
             event = json.loads((Path(tmp) / "event_summaries.jsonl").read_text(encoding="utf-8").splitlines()[0])
-            self.assertFalse(fact.get("guga_assessment"))
-            self.assertFalse(fact.get("guga_thought"))
+            self.assertNotIn("guga_reflection", fact)
             self.assertFalse(event.get("guga_assessment"))
             self.assertFalse(event.get("guga_thought"))
             self.assertFalse((Path(tmp) / "profile.json").exists())
@@ -174,7 +176,7 @@ class MemoryConsolidationTest(unittest.TestCase):
 
             self._record_turns(manager, "sess_noop", 1)
 
-            self.assertTrue((Path(tmp) / "timeline_facts.jsonl").exists())
+            self.assertTrue((Path(tmp) / "semantic_events.jsonl").exists())
             self.assertTrue((Path(tmp) / "event_summaries.jsonl").exists())
             self.assertFalse((Path(tmp) / "archival_memory.jsonl").exists())
             self.assertFalse((Path(tmp) / "profile.json").exists())
@@ -195,7 +197,7 @@ class MemoryConsolidationTest(unittest.TestCase):
 
             state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
             self.assertEqual(len(state["sessions"]["sess_bad_high"]["pending_turns"]), 1)
-            self.assertFalse((Path(tmp) / "timeline_facts.jsonl").exists())
+            self.assertFalse((Path(tmp) / "semantic_events.jsonl").exists())
             self.assertFalse((Path(tmp) / "event_summaries.jsonl").exists())
             self.assertFalse((Path(tmp) / "archival_memory.jsonl").exists())
 
@@ -235,7 +237,7 @@ class MemoryConsolidationTest(unittest.TestCase):
                 _ = gen
                 self.prompts.append(messages[-1]["content"])
                 self.json_calls += 1
-                return json.dumps({"timeline_facts": [], "event_summaries": []})
+                return json.dumps({"semantic_event_operations": [], "event_summaries": []})
 
             def generate_reply(self, messages, gen):
                 _ = messages, gen
@@ -247,12 +249,12 @@ class MemoryConsolidationTest(unittest.TestCase):
 
         result = summarizer.consolidate_low_level_memory({"new_turns": []}, include_guga_reflection=False)
 
-        self.assertEqual(result, {"timeline_facts": [], "event_summaries": []})
+        self.assertEqual(result, {"semantic_event_operations": [], "event_summaries": []})
         self.assertEqual(model.json_calls, 1)
         self.assertEqual(model.chat_calls, 0)
-        self.assertIn("At most 3 timeline_facts", model.prompts[0])
+        self.assertIn("semantic_event_operations", model.prompts[0])
         self.assertIn("At most 1 event_summary", model.prompts[0])
-        self.assertIn("Do not create timeline_facts for generic questions", model.prompts[0])
+        self.assertIn("Do not create events for generic questions", model.prompts[0])
 
     def test_summarizer_retries_invalid_json_once(self) -> None:
         class RetryModel:
@@ -264,14 +266,14 @@ class MemoryConsolidationTest(unittest.TestCase):
                 self.calls += 1
                 if self.calls == 1:
                     return "I cannot provide that."
-                return json.dumps({"timeline_facts": [], "event_summaries": []})
+                return json.dumps({"semantic_event_operations": [], "event_summaries": []})
 
         model = RetryModel()
         summarizer = MemoryBankSummarizer(model=model, use_llm=True)
 
         result = summarizer.consolidate_low_level_memory({"new_turns": []}, include_guga_reflection=False)
 
-        self.assertEqual(result, {"timeline_facts": [], "event_summaries": []})
+        self.assertEqual(result, {"semantic_event_operations": [], "event_summaries": []})
         self.assertEqual(model.calls, 2)
 
 

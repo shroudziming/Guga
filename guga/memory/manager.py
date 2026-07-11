@@ -31,6 +31,7 @@ from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
 from guga.memory.portrait import UserPortraitStore
 from guga.memory.profile_store import ProfileStore
+from guga.memory.semantic_events import SemanticEventStore
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
 from guga.memory.timeline_facts import TimelineFactStore
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso
@@ -175,9 +176,11 @@ class MemoryManager:
         self.archival_file = self.memory_root / "archival_memory.jsonl"
         self.session_memory_file = self.memory_root / "session_memories.jsonl"
         self.timeline_fact_file = self.memory_root / "timeline_facts.jsonl"
+        self.semantic_event_file = self.memory_root / "semantic_events.jsonl"
         self.consolidation_state_file = self.memory_root / "consolidation_state.json"
         self.profile_store = ProfileStore(self.memory_root / "profile.json")
         self.event_summary_store = EventSummaryStore(self.memory_root / "event_summaries.jsonl")
+        self.semantic_event_store = SemanticEventStore(self.semantic_event_file)
         self.timeline_fact_store = TimelineFactStore(self.timeline_fact_file)
         self.portrait_store = UserPortraitStore(self.memory_root / "profile.json", self.memory_root / "personality_insights.jsonl")
         self.summarizer = MemoryBankSummarizer(model=model)
@@ -728,17 +731,17 @@ class MemoryManager:
         )
         packet = {
             "new_turns": new_turns,
-            "existing_timeline_facts": self.timeline_fact_store.load_active()[-20:],
-            "existing_event_summaries": self.event_summary_store.load_active()[-20:],
+            "existing_semantic_events": self.semantic_event_store.load_active()[-20:],
+            "derived_event_summaries": self.event_summary_store.load_active()[-20:],
             "retrieved_context": self._consolidation_retrieved_context(query),
         }
         return self._trim_packet(packet)
 
     def _build_high_level_packet(self, pending_low_level: dict | None = None) -> dict:
         packet = {
-            "timeline_facts": self.timeline_fact_store.load_active()[-50:],
+            "semantic_events": self.semantic_event_store.load_all()[-50:],
             "event_summaries": self.event_summary_store.load_active()[-50:],
-            "pending_low_level_updates": pending_low_level or {"timeline_facts": [], "event_summaries": []},
+            "pending_low_level_updates": pending_low_level or {"semantic_event_operations": [], "event_summaries": []},
             "archival_memory": self._read_jsonl_records(self.archival_file)[-50:],
             "profile": self.portrait_store.load(),
             "personality_insights": self._read_jsonl_records(self.portrait_store.daily_file_path)[-50:],
@@ -755,31 +758,38 @@ class MemoryManager:
     ) -> dict[str, int]:
         updates = 0
         source_message_ids = self._pending_source_message_ids(pending_turns)
-        for item in result.get("timeline_facts", []) or []:
-            if not isinstance(item, dict) or str(item.get("action", "upsert")) != "upsert":
-                continue
-            payload = self.timeline_fact_store.upsert_consolidated_fact(
-                payload=item,
-                session_id=session_id,
-                source_message_ids=source_message_ids,
-                include_guga_reflection=self.consolidation_config.include_guga_reflection,
-            )
-            if payload:
-                updates += 1
-                if self.rag_pipeline is not None:
-                    try:
-                        self.rag_pipeline.add_memory_record(payload)
-                    except Exception as exc:
-                        self._debug(session_id, f"index_update status=timeline_fact_failed reason={exc}")
+        operations = self._event_operations_with_references(
+            session_id=session_id,
+            pending_turns=pending_turns,
+            operations=result.get("semantic_event_operations", []) or [],
+            fallback_source_ids=source_message_ids,
+        )
+        outcome = self.semantic_event_store.apply_operations(
+            operations=operations,
+            session_id=session_id,
+            include_guga_reflection=self.consolidation_config.include_guga_reflection,
+        )
+        changed_ids = set(outcome.created_event_ids + outcome.updated_event_ids + outcome.deactivated_event_ids)
+        changed_events = [event for event in self.semantic_event_store.load_all() if event.get("id") in changed_ids]
+        updates += len(changed_ids)
+        if self.rag_pipeline is not None:
+            for payload in changed_events:
+                if payload.get("status") != "active":
+                    continue
+                try:
+                    self.rag_pipeline.add_memory_record(payload)
+                except Exception as exc:
+                    self._debug(session_id, f"index_update status=semantic_event_failed reason={exc}")
         for item in result.get("event_summaries", []) or []:
-            if not isinstance(item, dict) or str(item.get("action", "upsert")) != "upsert":
+            if not isinstance(item, dict):
                 continue
             payload = self.event_summary_store.upsert_batch_summary(
                 session_id=session_id,
                 batch_seq=batch_seq,
                 payload=item,
                 source_message_ids=source_message_ids,
-                include_guga_reflection=self.consolidation_config.include_guga_reflection,
+                event_result=outcome,
+                covered_events=changed_events,
             )
             if payload:
                 updates += 1
@@ -789,6 +799,31 @@ class MemoryManager:
                     except Exception as exc:
                         self._debug(session_id, f"index_update status=event_summary_failed reason={exc}")
         return {"low_level_updates": updates}
+
+    def _event_operations_with_references(
+        self,
+        *,
+        session_id: str,
+        pending_turns: list[dict],
+        operations: list[object],
+        fallback_source_ids: list[str],
+    ) -> list[dict]:
+        rows = self._read_session_rows(self.memory_root / "sessions" / f"{session_id}.jsonl")
+        created_at_by_id = {str(row.get("id", "")): str(row.get("created_at", "")) for row in rows}
+        normalized: list[dict] = []
+        for operation in operations:
+            if not isinstance(operation, dict):
+                raise SummaryGenerationError("semantic event operation must be an object")
+            item = dict(operation)
+            source_ids = [str(value) for value in (item.get("source_message_ids") or fallback_source_ids) if str(value)]
+            item["source_message_ids"] = source_ids
+            if not item.get("reference_created_at"):
+                item["reference_created_at"] = next(
+                    (created_at_by_id.get(message_id, "") for message_id in source_ids if created_at_by_id.get(message_id)),
+                    now_beijing_iso(),
+                )
+            normalized.append(item)
+        return normalized
 
     def _apply_high_level_consolidation(
         self,
@@ -913,7 +948,7 @@ class MemoryManager:
         if len(text) <= self.consolidation_config.max_packet_chars:
             return packet
         trimmed = dict(packet)
-        for key in ("retrieved_context", "existing_event_summaries", "existing_timeline_facts", "personality_insights"):
+        for key in ("retrieved_context", "derived_event_summaries", "existing_semantic_events", "personality_insights"):
             value = trimmed.get(key)
             if isinstance(value, list) and len(json.dumps(trimmed, ensure_ascii=False)) > self.consolidation_config.max_packet_chars:
                 trimmed[key] = value[-5:]

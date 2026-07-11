@@ -178,19 +178,22 @@ class MemoryBankSummarizer:
             f"include_guga_reflection: {str(include_guga_reflection).lower()}\n\n"
             "Output schema:\n"
             "{"
-            "\"timeline_facts\": [{\"action\": \"upsert|deactivate\", \"subject\": string, \"predicate\": string, "
-            "\"object\": string, \"summary\": string, \"semantic_day\": string, \"confidence\": number, "
-            "\"source_message_ids\": [string], \"guga_assessment\": string, \"guga_thought\": string}], "
-            "\"event_summaries\": [{\"action\": \"upsert|deactivate\", \"scope\": \"batch\", \"summary\": string, "
-            "\"source_message_ids\": [string], \"confidence\": number, \"guga_assessment\": string, \"guga_thought\": string}]"
+            "\"semantic_event_operations\": [{\"operation\": \"create|update|replace|cancel|ignore\", "
+            "\"target_event_id\": string, \"event_kind\": string, \"subject\": string, \"entity\": string, "
+            "\"description\": string, \"time_expression\": string, \"end_unknown\": boolean, "
+            "\"source_message_ids\": [string], \"confidence\": number, "
+            "\"guga_reflection\": {\"appraisal\": string, \"felt_response\": string, "
+            "\"relational_intent\": string, \"interpretation_confidence\": number}}], "
+            "\"event_summaries\": [{\"summary\": string, \"source_message_ids\": [string], \"confidence\": number}]"
             "}\n"
             "Rules:\n"
-            "- timeline_facts and event_summaries are factual low-level memory only.\n"
-            "- At most 3 timeline_facts. Use [] unless the user states a dated or time-bound personal plan, deadline, appointment, schedule, or event.\n"
-            "- Do not create timeline_facts for generic questions, advice requests, recommendations, definitions, explanations, or assistant-only content.\n"
+            "- semantic_event_operations describe objective events or objective state changes only.\n"
+            "- Do not create events for generic questions, advice requests, recommendations, definitions, explanations, preferences, or assistant-only content.\n"
+            "- Never calculate or output start_at, end_at, time_source, or time_granularity. Copy only the user's original time_expression.\n"
+            "- For update/replace/cancel, target_event_id must be one of the supplied conflict candidates.\n"
             "- At most 1 event_summary. Keep it compact and factual; summarize the batch in no more than 80 words.\n"
-            "- Keep Guga assessment/thought separate from factual summary.\n"
-            "- If include_guga_reflection is false, omit guga_assessment and guga_thought or return empty strings.\n"
+            "- guga_reflection is a role-specific interpretation, never factual evidence.\n"
+            "- If include_guga_reflection is false, omit guga_reflection.\n"
             "- Do not write archival/profile/personality updates here.\n\n"
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
@@ -201,9 +204,9 @@ class MemoryBankSummarizer:
             raise SummaryGenerationError(
                 f"LLM low-level consolidation returned invalid JSON object. raw={self._excerpt(raw)}"
             )
-        parsed.setdefault("timeline_facts", [])
+        parsed.setdefault("semantic_event_operations", [])
         parsed.setdefault("event_summaries", [])
-        if not isinstance(parsed["timeline_facts"], list) or not isinstance(parsed["event_summaries"], list):
+        if not isinstance(parsed["semantic_event_operations"], list) or not isinstance(parsed["event_summaries"], list):
             raise SummaryGenerationError("LLM low-level consolidation fields must be arrays.")
         return parsed
 
@@ -221,7 +224,7 @@ class MemoryBankSummarizer:
             "\"reason\": string"
             "}\n"
             "Rules:\n"
-            "- Use only the low-level timeline_facts and event_summaries in the packet.\n"
+            "- Use only semantic_events and derived event_summaries in the packet.\n"
             "- Never infer directly from raw sessions or transcript text.\n"
             "- Return no_high_level_update when there is no stable long-term value.\n\n"
             "Input packet:\n"

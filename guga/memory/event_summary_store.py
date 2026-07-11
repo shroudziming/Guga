@@ -132,7 +132,8 @@ class EventSummaryStore:
         batch_seq: int,
         payload: dict,
         source_message_ids: list[str],
-        include_guga_reflection: bool,
+        event_result,
+        covered_events: list[dict],
     ) -> dict:
         summary = str(payload.get("summary", "")).strip()
         if not summary:
@@ -143,31 +144,36 @@ class EventSummaryStore:
         created_at = str(existing.get("created_at") or now_iso()) if existing else now_iso()
         updated_at = now_iso()
         payload_source_ids = list(payload.get("source_message_ids") or source_message_ids)
+        event_ids = [str(event.get("id", "")) for event in covered_events if str(event.get("id", ""))]
+        time_values = [
+            str(event.get(field, ""))
+            for event in covered_events
+            for field in ("start_at", "end_at")
+            if str(event.get(field, ""))
+        ]
         event = normalize_memorybank_fields(
-            apply_temporal_fields(
-                {
-                    "id": row_id,
-                    "type": "event_summary",
-                    "scope": str(payload.get("scope") or "batch"),
-                    "summary": summary,
-                    "raw_excerpt": summary,
-                    "source_session_id": session_id,
-                    "source_message_ids": [item for item in payload_source_ids if item],
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                    "last_recalled_at": str(existing.get("last_recalled_at") or created_at) if existing else created_at,
-                    "memory_strength": int(existing.get("memory_strength", 1) or 1) if existing else 1,
-                    "importance": float(payload.get("importance", 0.75) or 0.75),
-                    "confidence": float(payload.get("confidence", 0.8) or 0.8),
-                    "status": "active",
-                },
-                text=summary,
-                reference_time=updated_at,
-            )
+            {
+                "id": row_id,
+                "type": "event_summary",
+                "summary": summary,
+                "source_of_truth": False,
+                "covered_event_ids": event_ids,
+                "created_event_ids": list(event_result.created_event_ids),
+                "updated_event_ids": list(event_result.updated_event_ids),
+                "deactivated_event_ids": list(event_result.deactivated_event_ids),
+                "time_window_start": min(time_values) if time_values else None,
+                "time_window_end": max(time_values) if time_values else None,
+                "source_session_id": session_id,
+                "source_message_ids": [item for item in payload_source_ids if item],
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "last_recalled_at": str(existing.get("last_recalled_at") or created_at) if existing else created_at,
+                "memory_strength": int(existing.get("memory_strength", 1) or 1) if existing else 1,
+                "importance": float(payload.get("importance", 0.75) or 0.75),
+                "confidence": float(payload.get("confidence", 0.8) or 0.8),
+                "status": "active",
+            }
         )
-        if include_guga_reflection:
-            event["guga_assessment"] = str(payload.get("guga_assessment", "")).strip()
-            event["guga_thought"] = str(payload.get("guga_thought", "")).strip()
         self._upsert(rows, event)
         self._write_rows(rows)
         return event
