@@ -129,6 +129,26 @@ class SemanticEventStoreTest(unittest.TestCase):
                 )
             self.assertFalse((Path(tmp_dir) / "semantic_events.jsonl").exists())
 
+    def test_store_rejects_non_user_semantic_event_subject(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
+            with self.assertRaisesRegex(ValueError, "subject must be 'user'"):
+                store.apply_operations(
+                    operations=[
+                        {
+                            "operation": "create",
+                            "event_kind": "appointment",
+                            "subject": "Guga",
+                            "entity": "dentist",
+                            "description": "Guga sees a dentist.",
+                            "start_at": "2026-07-14T15:00:00+08:00",
+                            "end_unknown": False,
+                        }
+                    ],
+                    session_id="sess_non_user",
+                    include_guga_reflection=False,
+                )
+
     def test_replace_and_cancel_preserve_lifecycle_and_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")

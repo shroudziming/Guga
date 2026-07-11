@@ -115,6 +115,8 @@ class SemanticEventStore:
     ) -> dict:
         event_kind = _required_text(payload, "event_kind")
         subject = _required_text(payload, "subject")
+        if subject != "user":
+            raise ValueError("semantic event subject must be 'user'")
         entity = _required_text(payload, "entity")
         description = _required_text(payload, "description")
         reference_created_at = str(payload.get("reference_created_at") or now).strip()
@@ -157,6 +159,8 @@ class SemanticEventStore:
     ) -> None:
         for key in ("event_kind", "subject", "entity", "description"):
             if key in payload and str(payload[key]).strip():
+                if key == "subject" and str(payload[key]).strip() != "user":
+                    raise ValueError("semantic event subject must be 'user'")
                 event[key] = str(payload[key]).strip()
         if any(key in payload for key in ("time_expression", "start_at", "end_at", "end_unknown")):
             reference_created_at = str(payload.get("reference_created_at") or event["reference_created_at"]).strip()
