@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
 
-from guga.memory.time_utils import now_beijing_iso, resolve_event_time
+from guga.memory.time_utils import format_beijing, now_beijing_iso, parse_datetime
 
 
 _OPERATIONS = {"create", "update", "replace", "cancel", "ignore"}
@@ -118,8 +118,7 @@ class SemanticEventStore:
         entity = _required_text(payload, "entity")
         description = _required_text(payload, "description")
         reference_created_at = str(payload.get("reference_created_at") or now).strip()
-        end_unknown = bool(payload.get("end_unknown", False))
-        resolved = resolve_event_time(str(payload.get("time_expression", "")), reference_created_at, end_unknown)
+        time_fields = _llm_time_fields(payload, default_end_unknown=False)
         event = {
             "id": f"evt_{uuid4().hex}",
             "type": "semantic_event",
@@ -127,12 +126,12 @@ class SemanticEventStore:
             "subject": subject,
             "entity": entity,
             "description": description,
-            "start_at": resolved.start_at,
-            "end_at": resolved.end_at,
-            "end_unknown": resolved.end_unknown,
+            "start_at": time_fields["start_at"],
+            "end_at": time_fields["end_at"],
+            "end_unknown": time_fields["end_unknown"],
             "time_expression": str(payload.get("time_expression", "")).strip(),
-            "time_source": resolved.time_source,
-            "time_granularity": resolved.time_granularity,
+            "time_source": time_fields["time_source"],
+            "time_granularity": time_fields["time_granularity"],
             "reference_created_at": reference_created_at,
             "status": "active",
             "inactive_reason": None,
@@ -159,21 +158,17 @@ class SemanticEventStore:
         for key in ("event_kind", "subject", "entity", "description"):
             if key in payload and str(payload[key]).strip():
                 event[key] = str(payload[key]).strip()
-        if "time_expression" in payload:
+        if any(key in payload for key in ("time_expression", "start_at", "end_at", "end_unknown")):
             reference_created_at = str(payload.get("reference_created_at") or event["reference_created_at"]).strip()
-            resolved = resolve_event_time(
-                str(payload.get("time_expression", "")),
-                reference_created_at,
-                bool(payload.get("end_unknown", event["end_unknown"])),
-            )
+            time_fields = _llm_time_fields(payload, default_end_unknown=bool(event["end_unknown"]))
             event.update(
                 {
-                    "start_at": resolved.start_at,
-                    "end_at": resolved.end_at,
-                    "end_unknown": resolved.end_unknown,
-                    "time_expression": str(payload.get("time_expression", "")).strip(),
-                    "time_source": resolved.time_source,
-                    "time_granularity": resolved.time_granularity,
+                    "start_at": time_fields["start_at"],
+                    "end_at": time_fields["end_at"],
+                    "end_unknown": time_fields["end_unknown"],
+                    "time_expression": str(payload.get("time_expression", event["time_expression"])).strip(),
+                    "time_source": time_fields["time_source"],
+                    "time_granularity": time_fields["time_granularity"],
                     "reference_created_at": reference_created_at,
                 }
             )
@@ -204,6 +199,44 @@ def _required_text(payload: dict, key: str) -> str:
     if not value:
         raise ValueError(f"semantic event {key} is required")
     return value
+
+
+def _llm_time_fields(payload: dict, *, default_end_unknown: bool) -> dict:
+    start_at = _optional_datetime(payload.get("start_at"), field="start_at")
+    end_at = _optional_datetime(payload.get("end_at"), field="end_at")
+    end_unknown = bool(payload.get("end_unknown", default_end_unknown))
+    if start_at is None:
+        if end_at is not None:
+            raise ValueError("end_at requires start_at")
+        return {
+            "start_at": None,
+            "end_at": None,
+            "end_unknown": True,
+            "time_source": "unknown",
+            "time_granularity": "unknown",
+        }
+    if end_at is not None:
+        if end_at < start_at:
+            raise ValueError("end_at must not be before start_at")
+        end_unknown = False
+    elif not end_unknown:
+        end_at = start_at
+    return {
+        "start_at": format_beijing(start_at),
+        "end_at": format_beijing(end_at) if end_at is not None else None,
+        "end_unknown": end_unknown,
+        "time_source": "llm_resolved",
+        "time_granularity": "datetime",
+    }
+
+
+def _optional_datetime(value: object, *, field: str):
+    if value is None or not str(value).strip():
+        return None
+    parsed = parse_datetime(str(value))
+    if parsed is None:
+        raise ValueError(f"invalid {field}: {value!r}")
+    return parsed
 
 
 def _merge_ids(existing: object, incoming: object) -> list[str]:

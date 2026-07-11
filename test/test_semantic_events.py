@@ -36,7 +36,7 @@ class SemanticEventTimeTest(unittest.TestCase):
 
 
 class SemanticEventStoreTest(unittest.TestCase):
-    def test_store_ignores_llm_absolute_time_and_keeps_only_event_schema(self) -> None:
+    def test_store_uses_llm_absolute_time_and_defaults_same_day_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
             outcome = store.apply_operations(
@@ -51,9 +51,7 @@ class SemanticEventStoreTest(unittest.TestCase):
                         "end_unknown": False,
                         "reference_created_at": "2026-07-09T09:30:00+08:00",
                         "source_message_ids": ["msg_1"],
-                        "start_at": "1999-01-01T00:00:00+08:00",
-                        "end_at": "1999-01-01T23:59:59+08:00",
-                        "time_source": "llm_claim",
+                        "start_at": "2026-07-12T10:30:00+08:00",
                         "confidence": 0.9,
                         "guga_reflection": {
                             "appraisal": "我会在意这件事。",
@@ -69,8 +67,10 @@ class SemanticEventStoreTest(unittest.TestCase):
 
             self.assertEqual(len(outcome.created_event_ids), 1)
             event = store.load_active()[0]
-            self.assertEqual(event["start_at"], "2026-07-12T00:00:00+08:00")
-            self.assertEqual(event["time_source"], "relative_weekday")
+            self.assertEqual(event["start_at"], "2026-07-12T10:30:00+08:00")
+            self.assertEqual(event["end_at"], "2026-07-12T10:30:00+08:00")
+            self.assertFalse(event["end_unknown"])
+            self.assertEqual(event["time_source"], "llm_resolved")
             self.assertNotIn("guga_reflection", event)
             self.assertNotIn("summary", event)
             self.assertNotIn("object", event)
@@ -79,6 +79,55 @@ class SemanticEventStoreTest(unittest.TestCase):
 
             persisted = json.loads((Path(tmp_dir) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(persisted["id"], event["id"])
+
+    def test_store_keeps_unknown_end_for_multi_day_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
+            store.apply_operations(
+                operations=[
+                    {
+                        "operation": "create",
+                        "event_kind": "travel",
+                        "subject": "user",
+                        "entity": "business trip",
+                        "description": "用户下周开始出差。",
+                        "time_expression": "下周开始",
+                        "start_at": "2026-07-13T00:00:00+08:00",
+                        "end_at": None,
+                        "end_unknown": True,
+                        "reference_created_at": "2026-07-09T09:30:00+08:00",
+                    }
+                ],
+                session_id="sess_trip",
+                include_guga_reflection=False,
+            )
+
+            event = store.load_active()[0]
+            self.assertEqual(event["start_at"], "2026-07-13T00:00:00+08:00")
+            self.assertIsNone(event["end_at"])
+            self.assertTrue(event["end_unknown"])
+
+    def test_store_rejects_llm_time_range_with_end_before_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
+            with self.assertRaisesRegex(ValueError, "end_at must not be before start_at"):
+                store.apply_operations(
+                    operations=[
+                        {
+                            "operation": "create",
+                            "event_kind": "travel",
+                            "subject": "user",
+                            "entity": "business trip",
+                            "description": "用户出差。",
+                            "start_at": "2026-07-16T00:00:00+08:00",
+                            "end_at": "2026-07-14T00:00:00+08:00",
+                            "end_unknown": False,
+                        }
+                    ],
+                    session_id="sess_invalid_time",
+                    include_guga_reflection=False,
+                )
+            self.assertFalse((Path(tmp_dir) / "semantic_events.jsonl").exists())
 
     def test_replace_and_cancel_preserve_lifecycle_and_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
