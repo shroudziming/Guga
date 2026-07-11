@@ -200,7 +200,7 @@ class MemoryConsolidationTest(unittest.TestCase):
             persisted = json.loads((Path(tmp) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(packet["semantic_events"][-1]["id"], persisted["id"])
 
-    def test_low_level_packet_retrieves_relevant_events_beyond_recent_window(self) -> None:
+    def test_low_level_packet_uses_rag_event_ids_without_keyword_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
             store = manager.semantic_event_store
@@ -220,8 +220,9 @@ class MemoryConsolidationTest(unittest.TestCase):
                 session_id="sess_old",
                 include_guga_reflection=False,
             ).created_event_ids[0]
+            rag_selected = ""
             for index in range(21):
-                store.apply_operations(
+                created = store.apply_operations(
                     operations=[
                         {
                             "operation": "create",
@@ -237,6 +238,27 @@ class MemoryConsolidationTest(unittest.TestCase):
                     session_id="sess_recent",
                     include_guga_reflection=False,
                 )
+                rag_selected = created.created_event_ids[0]
+
+            class RagStub:
+                def retrieve(self, query, memory_top_k, document_top_k):
+                    _ = query, memory_top_k, document_top_k
+                    return [
+                        type(
+                            "Hit",
+                            (),
+                            {
+                                "source_id": rag_selected,
+                                "source_type": "memory",
+                                "text": "RAG selected memory",
+                                "source_session_id": "sess_recent",
+                                "source_message_id": "",
+                                "score": 0.9,
+                            },
+                        )()
+                    ], []
+
+            manager.rag_pipeline = RagStub()
 
             user_id = manager.record_user_message("sess_new", "房贷预批额度改成四十万美元了")
             assistant_id = manager.record_assistant_message("sess_new", "我记下了。")
@@ -246,7 +268,9 @@ class MemoryConsolidationTest(unittest.TestCase):
             )
 
             self.assertEqual(len(packet["recent_active_events"]), 5)
-            self.assertIn(relevant, {event["id"] for event in packet["relevant_active_events"]})
+            relevant_ids = {event["id"] for event in packet["relevant_active_events"]}
+            self.assertIn(rag_selected, relevant_ids)
+            self.assertNotIn(relevant, relevant_ids)
 
     def test_high_level_noop_leaves_high_level_files_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
