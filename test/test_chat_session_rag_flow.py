@@ -127,7 +127,8 @@ class ChatSessionRagFlowTest(unittest.TestCase):
 
             self.assertEqual(answer, "这是测试回复")
             self.assertTrue(prompts)
-            self.assertIn("[Relevant Conversation Memories]", prompts[0])
+            self.assertIn("[Semantic Events]", prompts[0])
+            self.assertIn("[Archival Memory]", prompts[0])
             self.assertNotIn("[Relevant Documents]", prompts[0])
             self.assertIn("src=", prompts[0])
 

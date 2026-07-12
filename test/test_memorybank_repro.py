@@ -369,9 +369,11 @@ class MemoryBankReproTest(unittest.TestCase):
 
             context = manager.prepare_context("你记得我在深圳工作的事吗", session_id="sess_probe")
             prompt = manager.compose_system_prompt("你是助手", context)
-            self.assertIn("[Relevant Conversation Memories]", prompt)
-            self.assertNotIn("[User Portrait]", prompt)
-            self.assertNotIn("[Relevant Event Summaries]", prompt)
+            self.assertIn("[Semantic Events]", prompt)
+            self.assertIn("[Archival Memory]", prompt)
+            self.assertIn("[Derived Event Summaries]", prompt)
+            self.assertIn("[Raw Evidence]", prompt)
+            self.assertNotIn("[Guga User Model]", prompt)
 
     def test_daily_summary_aggregates_sessions_from_same_day(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

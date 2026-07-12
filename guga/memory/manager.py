@@ -35,7 +35,7 @@ from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day
 from guga.memory.user_model import GugaUserModelStore
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
-from guga.types import ConversationEvidenceGroup, ConversationEvidenceMessage, DocumentHit, MemoryContext, MemoryHit
+from guga.types import DocumentHit, MemoryContext, MemoryHit
 from guga.utils.paths import memory_data_dir, rag_documents_dir
 
 
@@ -293,9 +293,6 @@ class MemoryManager:
             for insight in self.user_model_store.load().get("insights", [])
             if insight.get("status") == "active" and str(insight.get("statement", "")).strip()
         )
-        event_summary_hits = self._select_event_summary_hits(merged_memory_hits, query_plan)
-        conversation_evidence_groups = self._build_conversation_evidence_groups(event_summary_hits)
-
         elapsed_ms = int((perf_counter() - started) * 1000)
         memory_hit_ids = [hit.id for hit in merged_memory_hits]
         doc_hit_ids = [hit.chunk_id for hit in document_hits]
@@ -332,11 +329,9 @@ class MemoryManager:
             archival_memories=[hit.summary for hit in merged_memory_hits],
             hits=merged_memory_hits,
             document_hits=document_hits,
-            event_summaries=event_summary_hits,
             user_portrait=user_portrait,
             query_route=query_plan.route,
             query_reason=query_plan.reason,
-            conversation_evidence_groups=conversation_evidence_groups,
         )
 
     def compose_system_prompt(self, base_prompt: str, memory_context: MemoryContext) -> str:
@@ -350,25 +345,38 @@ class MemoryManager:
             A single system prompt string consumed by the chat model.
         """
         sections = ["[Base Persona]", base_prompt]
-        prompt_mode = self._prompt_mode(memory_context)
+        semantic_events = [hit for hit in memory_context.hits if hit.memory_type == "semantic_event"]
+        derived_summaries = [hit for hit in memory_context.hits if hit.memory_type == "event_summary"]
+        raw_evidence = [
+            hit
+            for hit in memory_context.hits
+            if hit.memory_type == "conversation_turn" and not hit.is_current_turn
+        ]
+        archival_memories = [
+            hit
+            for hit in memory_context.hits
+            if hit.memory_type not in {"semantic_event", "event_summary", "conversation_turn"}
+        ]
 
-        if prompt_mode == "profile":
-            sections.append("\n[User Portrait]")
-            sections.append(memory_context.user_portrait or "- 当前还没有稳定用户画像。")
+        if semantic_events:
+            sections.append("\n[Semantic Events]")
+            sections.extend(self._format_memory_hit(hit) for hit in semantic_events)
 
-        if prompt_mode == "history":
-            semantic_events = [hit for hit in memory_context.hits if hit.memory_type == "semantic_event"]
-            if semantic_events:
-                sections.append("\n[Semantic Events]")
-                for hit in semantic_events:
-                    sections.append(self._format_memory_hit(hit))
-            self._append_historical_context(sections, memory_context)
+        if archival_memories:
+            sections.append("\n[Archival Memory]")
+            sections.extend(self._format_memory_hit(hit) for hit in archival_memories)
 
-        conversation_hits = self._prompt_conversation_hits(memory_context)
-        if conversation_hits:
-            sections.append("\n[Relevant Conversation Memories]")
-            for hit in conversation_hits:
-                sections.append(self._format_memory_hit(hit))
+        if derived_summaries:
+            sections.append("\n[Derived Event Summaries]")
+            sections.extend(self._format_memory_hit(hit) for hit in derived_summaries)
+
+        if raw_evidence:
+            sections.append("\n[Raw Evidence]")
+            sections.extend(self._format_memory_hit(hit) for hit in raw_evidence)
+
+        if memory_context.user_portrait:
+            sections.append("\n[Guga User Model]")
+            sections.append(memory_context.user_portrait)
 
         if memory_context.document_hits:
             sections.append("\n[Relevant Documents]")
@@ -376,104 +384,27 @@ class MemoryManager:
                 source_ref = hit.source_id or hit.source_path
                 sections.append(f"- ({hit.chunk_id} | score={hit.score:.2f} | src={source_ref}) {hit.text}")
 
-        if prompt_mode in {"history", "document"}:
+        if semantic_events or archival_memories or derived_summaries or raw_evidence or memory_context.document_hits:
             sections.append("\n[Current Rule]")
-            sections.append("请仅依据上面的历史或文档证据回答；如果证据不足，请说明没有找到可靠信息，不要编造。")
+            sections.append(
+                "请按层级优先级使用证据：当前 Semantic Events 优先于 Archival Memory，"
+                "再优先于 Derived Event Summaries 和 Raw Evidence。Guga User Model 只用于理解用户，"
+                "不得覆盖客观事实；如果证据不足，请说明没有找到可靠信息，不要编造。"
+            )
         return "\n".join(sections)
-
-    def _prompt_mode(self, memory_context: MemoryContext) -> str:
-        if memory_context.query_route == "portrait":
-            return "profile"
-        if memory_context.query_route in {"date_window", "last_session", "recent_turn"}:
-            return "history"
-        if memory_context.document_hits:
-            return "document"
-        return "general"
-
-    def _append_historical_context(self, sections: list[str], memory_context: MemoryContext) -> None:
-        if memory_context.event_summaries:
-            sections.append("\n[Derived Event Summaries]")
-            for hit in memory_context.event_summaries:
-                sections.append(self._format_memory_hit(hit))
-
-        if memory_context.conversation_evidence_groups:
-            sections.append("\n[Raw Evidence]")
-            for group in memory_context.conversation_evidence_groups:
-                timestamp = self._format_beijing_minute(group.created_at)
-                sections.append(f"- 在 {timestamp}的 {group.session_id} 对话中：")
-                if group.messages:
-                    for message in group.messages:
-                        role = message.role.capitalize() if message.role else "Message"
-                        sections.append(f"  {role}({message.message_id}): {message.content}")
-
-    def _prompt_conversation_hits(self, memory_context: MemoryContext) -> list[MemoryHit]:
-        evidence_message_ids = {
-            message.message_id
-            for group in memory_context.conversation_evidence_groups
-            for message in group.messages
-        }
-        return [
-            hit
-            for hit in memory_context.hits
-            if hit.memory_type not in {"event_summary", "semantic_event"} and not hit.is_current_turn
-            and not evidence_message_ids.intersection(hit.source_message_ids)
-        ]
 
     def _format_memory_hit(self, hit: MemoryHit) -> str:
         source_message = hit.source_message_ids[0] if hit.source_message_ids else ""
         source_ref = f"{hit.source_session_id}/{source_message}".strip("/")
-        return f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | S={hit.memory_strength} | src={source_ref}) {hit.summary}"
-
-    def _select_event_summary_hits(self, hits: list[MemoryHit], query_plan: _QueryPlan) -> list[MemoryHit]:
-        if query_plan.route not in {"date_window", "last_session", "recent_turn"}:
-            return []
-        summaries = [hit for hit in hits if hit.memory_type == "event_summary"]
-        specific = [hit for hit in summaries if hit.id != "evt_global"]
-        if specific:
-            return specific
-        return [hit for hit in summaries if hit.id == "evt_global"][:1]
-
-    def _build_conversation_evidence_groups(self, event_summary_hits: list[MemoryHit]) -> list[ConversationEvidenceGroup]:
-        groups: list[ConversationEvidenceGroup] = []
-        for hit in event_summary_hits:
-            if not hit.source_session_id:
-                continue
-            messages = self._load_evidence_messages(hit.source_session_id, hit.source_message_ids)
-            groups.append(
-                ConversationEvidenceGroup(
-                    session_id=hit.source_session_id,
-                    summary_id=hit.id,
-                    summary_text=hit.summary,
-                    summary_score=hit.score,
-                    created_at=hit.created_at,
-                    messages=messages,
-                )
-            )
-        return groups
-
-    def _load_evidence_messages(self, session_id: str, source_message_ids: list[str]) -> list[ConversationEvidenceMessage]:
-        if not session_id or not source_message_ids:
-            return []
-        session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
-        rows = self._read_session_rows(session_file)
-        row_by_id = {str(row.get("id", "")): row for row in rows}
-        messages: list[ConversationEvidenceMessage] = []
-        for message_id in source_message_ids:
-            row = row_by_id.get(str(message_id))
-            if not row:
-                continue
-            content = str(row.get("content", "")).strip()
-            if not content:
-                continue
-            messages.append(
-                ConversationEvidenceMessage(
-                    message_id=str(row.get("id", "")),
-                    role=str(row.get("role", "")) or "message",
-                    content=content,
-                    created_at=str(row.get("created_at", "")),
-                )
-            )
-        return messages
+        timestamp = self._format_beijing_minute(hit.created_at)
+        text = hit.summary
+        if hit.memory_type == "conversation_turn" and not hit.chunk_id and len(text) > DEFAULT_RAG_CHUNK_SIZE:
+            text = text[:DEFAULT_RAG_CHUNK_SIZE].rstrip() + "..."
+        chunk_ref = f" | chunk={hit.chunk_id}" if hit.chunk_id else ""
+        return (
+            f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | "
+            f"S={hit.memory_strength} | at={timestamp} | src={source_ref}{chunk_ref}) {text}"
+        )
 
     def _format_beijing_minute(self, value: str) -> str:
         if not value:
@@ -1151,7 +1082,7 @@ class MemoryManager:
             self._ensure_semantic_index(session_id)
             return self.rag_pipeline.retrieve(
                 query=user_text,
-                memory_top_k=self.top_k,
+                memory_top_k=max(24, self.top_k * 6),
                 document_top_k=self.document_top_k,
             )
         except Exception as exc:
@@ -1213,8 +1144,17 @@ class MemoryManager:
                 candidates,
                 MemoryHit(
                     id=key,
-                    summary=str(record.get("summary") or hit.text),
-                    raw_excerpt=str(record.get("raw_excerpt") or hit.text),
+                    summary=(
+                        hit.text
+                        if str(record.get("type", "")) == "conversation_turn"
+                        else str(record.get("summary") or hit.text)
+                    ),
+                    raw_excerpt=(
+                        hit.text
+                        if str(record.get("type", "")) == "conversation_turn"
+                        else str(record.get("raw_excerpt") or hit.text)
+                    ),
+                    chunk_id=hit.chunk_id,
                     score=round(score, 4),
                     memory_type=str(normalized.get("type") or hit.source_type or "episodic"),
                     source_session_id=hit.source_session_id or str(record.get("source_session_id", "")),
@@ -1355,7 +1295,28 @@ class MemoryManager:
         historical = [hit for hit in hits if not hit.is_current_turn and hit.score >= self.memory_min_score]
         current_hits = [hit for hit in hits if hit.is_current_turn and hit.score >= self.memory_min_score]
         if historical:
-            return (historical + current_hits)[: self.top_k]
+            selected: list[MemoryHit] = []
+            selected_ids: set[str] = set()
+            for memory_type in ("semantic_event", "episodic", "event_summary", "conversation_turn"):
+                candidate = next((hit for hit in historical if hit.memory_type == memory_type), None)
+                if candidate is not None:
+                    selected.append(candidate)
+                    selected_ids.add(candidate.id)
+                if len(selected) >= self.top_k:
+                    return selected
+            for hit in historical:
+                if hit.id in selected_ids:
+                    continue
+                selected.append(hit)
+                selected_ids.add(hit.id)
+                if len(selected) >= self.top_k:
+                    break
+            for hit in current_hits:
+                if hit.id in selected_ids or len(selected) >= self.top_k:
+                    continue
+                selected.append(hit)
+                selected_ids.add(hit.id)
+            return selected
         fallback_current = current_hits or [hit for hit in hits if hit.is_current_turn]
         return fallback_current[:1]
 

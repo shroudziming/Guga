@@ -7,7 +7,8 @@ from pathlib import Path
 
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
-from guga.types import DocumentHit, MemoryContext
+from guga.rag.schemas import RetrievalHit
+from guga.types import DocumentHit, MemoryContext, MemoryHit
 
 
 class SummaryModel:
@@ -148,7 +149,7 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertIn("用户提到", context.archival_memories[0])
 
         prompt = self.manager.compose_system_prompt("你是一个助手", context)
-        self.assertIn("[Relevant Conversation Memories]", prompt)
+        self.assertIn("[Archival Memory]", prompt)
         self.assertNotIn("[Relevant Documents]", prompt)
         self.assertIn("mem_new", prompt)
         self.assertIn("src=sess_new/msg_new", prompt)
@@ -201,10 +202,11 @@ class MemoryManagerTest(unittest.TestCase):
 
         self.assertIn("[Derived Event Summaries]", prompt)
         self.assertIn("[Raw Evidence]", prompt)
-        self.assertIn("在 2026-06-28 01:35 北京时间的 sess_history 对话中", prompt)
+        self.assertIn("[Raw Evidence]", prompt)
+        self.assertIn("at=2026-07-12", prompt)
         self.assertIn("用户询问并获得悬疑网剧推荐。", prompt)
-        self.assertIn(f"User({user_id}): 我之前问你推荐过一部悬疑网剧。", prompt)
-        self.assertIn(f"Assistant({assistant_id}): 我推荐过《隐秘的角落》。", prompt)
+        self.assertIn("我之前问你推荐过一部悬疑网剧。", prompt)
+        self.assertNotIn(f"Assistant({assistant_id})", prompt)
         self.assertNotIn("[Historical Conversation Context]", prompt)
 
     def test_profile_prompt_renders_portrait_without_event_summary(self) -> None:
@@ -249,7 +251,7 @@ class MemoryManagerTest(unittest.TestCase):
         context = self.manager.prepare_context("你觉得我是谁？", session_id="sess_now")
         prompt = self.manager.compose_system_prompt("你是一个助手", context)
 
-        self.assertIn("[User Portrait]", prompt)
+        self.assertIn("[Guga User Model]", prompt)
         self.assertIn("叔本明", prompt)
         self.assertNotIn("一次普通闲聊摘要", prompt)
         self.assertNotIn("[Derived Event Summaries]", prompt)
@@ -274,6 +276,108 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertIn("[Relevant Documents]", prompt)
         self.assertIn("doc_1", prompt)
         self.assertIn("文档片段内容", prompt)
+
+    def test_hybrid_prompt_renders_memory_layers_in_priority_order(self) -> None:
+        context = MemoryContext(
+            hits=[
+                MemoryHit(
+                    id="evt_current",
+                    summary="用户当前房贷预批额度为 $400,000。",
+                    memory_type="semantic_event",
+                    source_session_id="mortgage_update",
+                    source_message_ids=["msg_400"],
+                    created_at="2023-11-30T00:36:00+08:00",
+                ),
+                MemoryHit(
+                    id="mem_background",
+                    summary="用户正在购房。",
+                    memory_type="episodic",
+                    source_session_id="mortgage_old",
+                    source_message_ids=["msg_background"],
+                    created_at="2023-08-11T00:01:00+08:00",
+                ),
+                MemoryHit(
+                    id="summary_mortgage",
+                    summary="房贷相关对话摘要。",
+                    memory_type="event_summary",
+                    source_session_id="mortgage_update",
+                    source_message_ids=["msg_400"],
+                    created_at="2023-11-30T00:36:00+08:00",
+                ),
+                MemoryHit(
+                    id="turn_400",
+                    summary="remember when I got pre-approved for $400,000 from Wells Fargo?",
+                    raw_excerpt="VERY LONG ORIGINAL MESSAGE THAT MUST NOT BE RENDERED",
+                    memory_type="conversation_turn",
+                    source_session_id="mortgage_update",
+                    source_message_ids=["msg_400"],
+                    created_at="2023-11-30T00:36:00+08:00",
+                ),
+            ],
+            user_portrait="用户倾向在重要财务决策前确认细节。",
+            query_route="hybrid",
+        )
+
+        prompt = self.manager.compose_system_prompt("你是一个助手", context)
+
+        self.assertLess(prompt.index("[Semantic Events]"), prompt.index("[Archival Memory]"))
+        self.assertLess(prompt.index("[Archival Memory]"), prompt.index("[Derived Event Summaries]"))
+        self.assertLess(prompt.index("[Derived Event Summaries]"), prompt.index("[Raw Evidence]"))
+        self.assertLess(prompt.index("[Raw Evidence]"), prompt.index("[Guga User Model]"))
+        self.assertIn("2023-11-30 00:36", prompt)
+        self.assertNotIn("VERY LONG ORIGINAL MESSAGE", prompt)
+
+    def test_semantic_raw_chunk_does_not_restore_full_message(self) -> None:
+        record = {
+            "id": "turn_long",
+            "type": "conversation_turn",
+            "summary": "FULL ORIGINAL MESSAGE " * 100,
+            "raw_excerpt": "FULL ORIGINAL MESSAGE " * 100,
+            "created_at": "2023-11-30T00:36:00+08:00",
+            "source_session_id": "mortgage_update",
+            "source_message_ids": ["msg_400"],
+            "status": "active",
+        }
+        semantic_hit = RetrievalHit(
+            chunk_id="memory:turn_long:c4",
+            text="remember when I got pre-approved for $400,000 from Wells Fargo?",
+            score=0.8,
+            source_type="memory",
+            source_id="turn_long",
+            source_session_id="mortgage_update",
+            source_message_id="msg_400",
+            created_at="2023-11-30T00:36:00+08:00",
+        )
+
+        hits = self.manager._merge_memory_hits(
+            [semantic_hit],
+            [],
+            [record],
+            current_turn_ids=set(),
+            time_hints={},
+            session_id="sess_now",
+        )
+
+        self.assertEqual(hits[0].summary, semantic_hit.text)
+        self.assertEqual(hits[0].raw_excerpt, semantic_hit.text)
+        self.assertEqual(hits[0].chunk_id, "memory:turn_long:c4")
+
+    def test_context_selection_reserves_relevant_slots_for_memory_layers(self) -> None:
+        self.manager.top_k = 4
+        hits = [
+            MemoryHit(id="raw_1", summary="raw one", score=0.99, memory_type="conversation_turn"),
+            MemoryHit(id="raw_2", summary="raw two", score=0.98, memory_type="conversation_turn"),
+            MemoryHit(id="archive", summary="background", score=0.70, memory_type="episodic"),
+            MemoryHit(id="summary", summary="derived", score=0.60, memory_type="event_summary"),
+            MemoryHit(id="event", summary="current fact", score=0.50, memory_type="semantic_event"),
+        ]
+
+        selected = self.manager._filter_memory_hits(hits)
+
+        self.assertEqual(
+            {hit.memory_type for hit in selected},
+            {"semantic_event", "episodic", "event_summary", "conversation_turn"},
+        )
 
     def test_finalize_turn_writes_archival_and_session_schema(self) -> None:
         session_id = "sess_schema"
