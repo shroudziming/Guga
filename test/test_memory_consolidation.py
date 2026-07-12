@@ -126,6 +126,18 @@ class RetryHighLevelModel(ConsolidationModel):
         return super().generate_reply(messages, gen)
 
 
+class AlwaysBadLowModel(ConsolidationModel):
+    def generate_reply(self, messages, gen):
+        _ = gen
+        prompt = messages[-1]["content"]
+        self.prompts.append(prompt)
+        if "Low-level memory consolidation" in prompt:
+            return "{not valid json"
+        if "High-level memory consolidation" in prompt:
+            raise AssertionError("Stage 2 must not run after Stage 1 failure")
+        return "chat answer"
+
+
 class MemoryConsolidationTest(unittest.TestCase):
     def _record_turns(self, manager: MemoryManager, session_id: str, count: int) -> None:
         for index in range(count):
@@ -314,6 +326,62 @@ class MemoryConsolidationTest(unittest.TestCase):
             self.assertTrue((Path(tmp) / "semantic_events.jsonl").exists())
             self.assertTrue((Path(tmp) / "event_summaries.jsonl").exists())
             self.assertFalse((Path(tmp) / "archival_memory.jsonl").exists())
+
+    def test_low_failure_persists_active_batch_and_queues_new_turns(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            model = AlwaysBadLowModel()
+            manager = MemoryManager(
+                memory_root=Path(tmp),
+                model=model,
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
+            manager.summarizer.retry_delays = ()
+
+            self._record_turns(manager, "sess_low_pending", 1)
+            state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
+            active = state["sessions"]["sess_low_pending"]["active_batch"]
+            self.assertEqual(active["stage"], "low")
+            self.assertEqual(active["status"], "pending_retry")
+            self.assertEqual(active["attempt_count"], 3)
+
+            manager.record_user_message("sess_low_pending", "a later queued turn")
+            manager.record_assistant_message("sess_low_pending", "queued")
+            manager.finalize_turn("sess_low_pending")
+            state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
+            session_state = state["sessions"]["sess_low_pending"]
+            self.assertEqual(len(session_state["queued_turns"]), 1)
+            self.assertEqual(session_state["active_batch"]["batch_seq"], 1)
+
+    def test_restart_resumes_high_stage_without_repeating_low_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = MemoryManager(
+                memory_root=root,
+                model=BadHighLevelModel(),
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
+            first.summarizer.retry_delays = ()
+            self._record_turns(first, "sess_restart_high", 1)
+            event_count = len((root / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines())
+
+            recovery_model = ConsolidationModel(high_decision="no_high_level_update")
+            recovered = MemoryManager(
+                memory_root=root,
+                model=recovery_model,
+                enable_semantic=False,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=1),
+            )
+            recovered.summarizer.retry_delays = ()
+            recovered.flush_session_memory("sess_restart_high")
+
+            state = json.loads((root / "consolidation_state.json").read_text(encoding="utf-8"))
+            session_state = state["sessions"]["sess_restart_high"]
+            low_calls = [prompt for prompt in recovery_model.prompts if "Low-level memory consolidation" in prompt]
+            self.assertEqual(low_calls, [])
+            self.assertIsNone(session_state["active_batch"])
+            self.assertEqual(len((root / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()), event_count)
 
     def test_pending_high_level_retry_does_not_repeat_stage_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
