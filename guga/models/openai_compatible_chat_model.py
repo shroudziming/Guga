@@ -8,6 +8,7 @@ from urllib import error, request
 
 from guga.types import GenerationConfig
 from guga.tools import ToolCall, ToolModelResponse, ToolStreamText, ToolStreamToolCalls, parse_tool_arguments
+from guga.models.structured import StructuredReply
 
 
 @dataclass
@@ -42,6 +43,9 @@ class OpenAICompatibleChatModel:
         return self._extract_text_content(content).strip()
 
     def generate_json_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> str:
+        return self.generate_structured_reply(messages, gen).content
+
+    def generate_structured_reply(self, messages: list[dict[str, str]], gen: GenerationConfig) -> StructuredReply:
         payload = {
             "model": self.model_id,
             "messages": messages,
@@ -57,7 +61,20 @@ class OpenAICompatibleChatModel:
 
         message = choices[0].get("message", {})
         content = message.get("content", "")
-        return self._extract_text_content(content).strip()
+        text = self._extract_text_content(content).strip()
+        raw_usage = response.get("usage", {})
+        usage = {
+            str(key): int(value)
+            for key, value in raw_usage.items()
+            if isinstance(value, (int, float))
+        } if isinstance(raw_usage, dict) else {}
+        return StructuredReply(
+            content=text,
+            finish_reason=str(choices[0].get("finish_reason") or "unknown"),
+            response_mode="json_object",
+            output_chars=len(text),
+            usage=usage,
+        )
 
     def generate_reply_with_tools(
         self,

@@ -11,6 +11,33 @@ from guga.types import GenerationConfig
 
 
 class OpenAICompatibleChatModelTest(unittest.TestCase):
+    def test_structured_reply_preserves_finish_reason_and_usage(self) -> None:
+        model = OpenAICompatibleChatModel(
+            model_id="fake",
+            api_config=ApiConfig(base_url="https://example.invalid", api_key="fake"),
+        )
+        response = {
+            "choices": [
+                {
+                    "message": {"content": '{"ok": true}'},
+                    "finish_reason": "length",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30},
+        }
+
+        with patch.object(model, "_post_chat_completions", return_value=response):
+            reply = model.generate_structured_reply(
+                [{"role": "user", "content": "return json"}],
+                GenerationConfig(max_new_tokens=128),
+            )
+
+        self.assertEqual(reply.content, '{"ok": true}')
+        self.assertEqual(reply.finish_reason, "length")
+        self.assertEqual(reply.response_mode, "json_object")
+        self.assertEqual(reply.output_chars, 12)
+        self.assertEqual(reply.usage["total_tokens"], 30)
+
     def test_extract_text_content_ignores_none_stream_chunks(self) -> None:
         model = OpenAICompatibleChatModel(
             model_id="fake",

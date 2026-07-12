@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
+from time import sleep
+from time import perf_counter
 from collections.abc import Sequence
 from typing import Any
 
@@ -11,6 +14,19 @@ from guga.types import GenerationConfig
 
 class SummaryGenerationError(RuntimeError):
     """Raised when required LLM-backed memory summarization cannot complete."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "schema",
+        attempts: int = 0,
+        response_hash: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.error_type = error_type
+        self.attempts = attempts
+        self.response_hash = response_hash
 
 
 _ALLOWED_ROUTE_TARGETS = {"personality_insight", "semantic_event", "archival_memory", "event_summary", "discard"}
@@ -31,8 +47,15 @@ _PERSONALITY_LABELS = {"stable_identity", "stable_interest", "stable_preference"
 class MemoryBankSummarizer:
     """Generate MemoryBank daily/global summaries with optional LLM backing."""
 
-    def __init__(self, model: Any | None = None, use_llm: bool | None = None) -> None:
+    def __init__(
+        self,
+        model: Any | None = None,
+        use_llm: bool | None = None,
+        retry_delays: tuple[float, ...] = (1.0, 2.0),
+    ) -> None:
         self.model = model
+        self.retry_delays = tuple(max(0.0, float(value)) for value in retry_delays)
+        self.last_structured_attempts: list[dict[str, object]] = []
         self.max_new_tokens = self._env_int("Guga_MEMORY_MAX_NEW_TOKENS", 2048, minimum=128)
         if use_llm is None:
             configured = os.environ.get("Guga_MEMORY_USE_LLM_SUMMARY", "").strip().lower()
@@ -206,17 +229,10 @@ class MemoryBankSummarizer:
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
         )
-        raw = self._generate_structured_json(prompt)
-        parsed = self._parse_json_object(raw)
-        if not parsed:
-            raise SummaryGenerationError(
-                f"LLM low-level consolidation returned invalid JSON object. raw={self._excerpt(raw)}"
-            )
-        parsed.setdefault("semantic_event_operations", [])
-        parsed.setdefault("event_summaries", [])
-        if not isinstance(parsed["semantic_event_operations"], list) or not isinstance(parsed["event_summaries"], list):
-            raise SummaryGenerationError("LLM low-level consolidation fields must be arrays.")
-        return parsed
+        return self._generate_validated_json(
+            prompt,
+            lambda parsed: self._validate_low_level_result(parsed, packet, include_guga_reflection),
+        )
 
     def consolidate_high_level_memory(self, packet: dict) -> dict:
         prompt = (
@@ -238,22 +254,7 @@ class MemoryBankSummarizer:
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
         )
-        raw = self._generate_structured_json(prompt)
-        parsed = self._parse_json_object(raw)
-        if not parsed:
-            raise SummaryGenerationError(
-                f"LLM high-level consolidation returned invalid JSON object. raw={self._excerpt(raw)}"
-            )
-        decision = str(parsed.get("decision", "")).strip()
-        if decision not in {"update_high_level_memory", "no_high_level_update"}:
-            raise SummaryGenerationError("LLM high-level consolidation returned unsupported decision.")
-        parsed.setdefault("archival_operations", [])
-        parsed.setdefault("user_model_operations", [])
-        for key in ("archival_operations", "user_model_operations"):
-            if not isinstance(parsed[key], list):
-                raise SummaryGenerationError(f"LLM high-level consolidation field {key} must be an array.")
-        parsed["reason"] = str(parsed.get("reason", "")).strip()
-        return parsed
+        return self._generate_validated_json(prompt, lambda parsed: self._validate_high_level_result(parsed, packet))
 
     def _generate(self, prompt: str) -> str:
         if not self.use_llm:
@@ -271,7 +272,7 @@ class MemoryBankSummarizer:
             raise SummaryGenerationError(f"LLM summary generation failed: {exc}") from exc
         return str(text).strip()
 
-    def _generate_structured_json(self, prompt: str) -> str:
+    def _generate_validated_json(self, prompt: str, validator) -> dict:
         if not self.use_llm:
             raise SummaryGenerationError("LLM summary generation is required, but no generate_reply model is available.")
         messages = [
@@ -281,28 +282,194 @@ class MemoryBankSummarizer:
             },
             {"role": "user", "content": prompt},
         ]
-        gen = GenerationConfig(max_new_tokens=max(self.max_new_tokens, 2048), temperature=0.0, top_p=0.9)
+        base_tokens = max(self.max_new_tokens, 2048)
+        self.last_structured_attempts = []
+        previous = ""
+        finish_reason = "unknown"
+        last_error_type = "empty"
+        last_error = "empty response"
+        structured_reply = getattr(self.model, "generate_structured_reply", None)
         json_reply = getattr(self.model, "generate_json_reply", None)
-        if callable(json_reply):
+        for attempt in range(3):
+            if attempt:
+                delay_index = attempt - 1
+                if delay_index < len(self.retry_delays) and self.retry_delays[delay_index] > 0:
+                    sleep(self.retry_delays[delay_index])
+            token_budget = 4096 if finish_reason == "length" or attempt == 2 else base_tokens
+            gen = GenerationConfig(max_new_tokens=token_budget, temperature=0.0, top_p=0.9)
+            attempt_messages = messages
+            if attempt:
+                attempt_messages = [
+                    messages[0],
+                    {
+                        "role": "user",
+                        "content": (
+                            prompt
+                            + "\n\nThe previous response failed JSON validation. "
+                            + f"finish_reason={finish_reason}; response={self._excerpt(previous, 800)}\n"
+                            + "Return exactly one complete valid JSON object. No markdown or prose."
+                        ),
+                    },
+                ]
+            started = perf_counter()
+            response_mode = "plain"
             try:
-                return str(json_reply(messages, gen)).strip()
-            except Exception:
-                pass
-        first = str(self.model.generate_reply(messages, gen)).strip()
-        if self._parse_json_object(first):
-            return first
-        retry_messages = [
-            messages[0],
-            {
-                "role": "user",
-                "content": (
-                    prompt
-                    + "\n\nYour previous response was not a valid JSON object. "
-                    "Return exactly one valid JSON object now. No markdown, no prose."
-                ),
-            },
-        ]
-        return str(self.model.generate_reply(retry_messages, gen)).strip()
+                if attempt == 0 and callable(structured_reply):
+                    response_mode = "json_object"
+                    reply = structured_reply(attempt_messages, gen)
+                    previous = str(getattr(reply, "content", "")).strip()
+                    finish_reason = str(getattr(reply, "finish_reason", "unknown") or "unknown")
+                elif attempt == 0 and callable(json_reply):
+                    response_mode = "json_object"
+                    previous = str(json_reply(attempt_messages, gen)).strip()
+                    finish_reason = "unknown"
+                else:
+                    previous = str(self.model.generate_reply(attempt_messages, gen)).strip()
+                    finish_reason = "unknown"
+            except Exception as exc:
+                previous = ""
+                finish_reason = "unknown"
+                last_error_type = "api"
+                last_error = f"{type(exc).__name__}: {exc}"
+                self.last_structured_attempts.append(
+                    self._attempt_diagnostic(attempt, response_mode, finish_reason, previous, last_error_type, last_error, started)
+                )
+                continue
+            if not previous:
+                last_error_type = "empty"
+                last_error = "empty response"
+            elif finish_reason == "length":
+                last_error_type = "truncated"
+                last_error = "finish_reason=length"
+            else:
+                parsed = self._parse_json_object(previous)
+                if not parsed:
+                    last_error_type = "json"
+                    last_error = "response is not a valid JSON object"
+                else:
+                    try:
+                        validated = validator(parsed)
+                    except SummaryGenerationError as exc:
+                        last_error_type = "schema"
+                        last_error = str(exc)
+                    else:
+                        self.last_structured_attempts.append(
+                            self._attempt_diagnostic(attempt, response_mode, finish_reason, previous, "", "", started)
+                        )
+                        return validated
+            self.last_structured_attempts.append(
+                self._attempt_diagnostic(attempt, response_mode, finish_reason, previous, last_error_type, last_error, started)
+            )
+        response_hash = hashlib.sha256(previous.encode("utf-8")).hexdigest()[:16] if previous else ""
+        raise SummaryGenerationError(
+            f"LLM structured consolidation failed after 3 attempts: {last_error}. raw={self._excerpt(previous)}",
+            error_type=last_error_type,
+            attempts=3,
+            response_hash=response_hash,
+        )
+
+    def _attempt_diagnostic(
+        self,
+        attempt: int,
+        response_mode: str,
+        finish_reason: str,
+        content: str,
+        error_type: str,
+        error: str,
+        started: float,
+    ) -> dict[str, object]:
+        return {
+            "attempt": attempt + 1,
+            "response_mode": response_mode,
+            "finish_reason": finish_reason,
+            "output_chars": len(content),
+            "latency_ms": int((perf_counter() - started) * 1000),
+            "error_type": error_type,
+            "error": error,
+            "response_hash": hashlib.sha256(content.encode("utf-8")).hexdigest()[:16] if content else "",
+        }
+
+    def _validate_low_level_result(self, parsed: dict, packet: dict, include_guga_reflection: bool) -> dict:
+        parsed.setdefault("semantic_event_operations", [])
+        parsed.setdefault("event_summaries", [])
+        operations = parsed["semantic_event_operations"]
+        summaries = parsed["event_summaries"]
+        if not isinstance(operations, list) or not isinstance(summaries, list):
+            raise SummaryGenerationError("low-level fields semantic_event_operations and event_summaries must be arrays")
+        if len(summaries) > 1:
+            raise SummaryGenerationError("low-level event_summaries must contain at most one item")
+        allowed_operations = {"create", "update", "replace", "cancel", "ignore"}
+        candidate_ids = {
+            str(event.get("id", ""))
+            for key in ("recent_active_events", "relevant_active_events")
+            for event in (packet.get(key, []) or [])
+            if isinstance(event, dict) and str(event.get("id", ""))
+        }
+        source_ids = {
+            str(turn.get(key, ""))
+            for turn in (packet.get("new_turns", []) or [])
+            if isinstance(turn, dict)
+            for key in ("user_message_id", "assistant_message_id")
+            if str(turn.get(key, ""))
+        }
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                raise SummaryGenerationError(f"semantic_event_operations[{index}] must be an object")
+            action = str(operation.get("operation", ""))
+            if action not in allowed_operations:
+                raise SummaryGenerationError(f"semantic_event_operations[{index}].operation is invalid")
+            if action in {"create", "update", "replace"} and str(operation.get("subject", "user")) != "user":
+                raise SummaryGenerationError(f"semantic_event_operations[{index}].subject must be user")
+            if action == "create":
+                for field in ("event_kind", "entity", "description"):
+                    if not str(operation.get(field, "")).strip():
+                        raise SummaryGenerationError(f"semantic_event_operations[{index}].{field} is required")
+            if action in {"update", "replace", "cancel"}:
+                target = str(operation.get("target_event_id", ""))
+                if not target or target not in candidate_ids:
+                    raise SummaryGenerationError(f"semantic_event_operations[{index}].target_event_id is not an allowed candidate")
+            operation_sources = operation.get("source_message_ids", []) or []
+            if not isinstance(operation_sources, list):
+                raise SummaryGenerationError(f"semantic_event_operations[{index}].source_message_ids must be an array")
+            if source_ids and any(str(value) not in source_ids for value in operation_sources):
+                raise SummaryGenerationError(f"semantic_event_operations[{index}].source_message_ids contains foreign evidence")
+            if not include_guga_reflection and operation.get("guga_reflection"):
+                raise SummaryGenerationError(f"semantic_event_operations[{index}].guga_reflection is disabled")
+        for index, summary in enumerate(summaries):
+            if not isinstance(summary, dict) or not str(summary.get("summary", "")).strip():
+                raise SummaryGenerationError(f"event_summaries[{index}].summary is required")
+            if len(str(summary.get("summary", ""))) > 1000:
+                raise SummaryGenerationError(f"event_summaries[{index}].summary is too long")
+        return parsed
+
+    def _validate_high_level_result(self, parsed: dict, packet: dict) -> dict:
+        decision = str(parsed.get("decision", "")).strip()
+        if decision not in {"update_high_level_memory", "no_high_level_update"}:
+            raise SummaryGenerationError("high-level decision is unsupported")
+        parsed.setdefault("archival_operations", [])
+        parsed.setdefault("user_model_operations", [])
+        for key in ("archival_operations", "user_model_operations"):
+            if not isinstance(parsed[key], list):
+                raise SummaryGenerationError(f"high-level field {key} must be an array")
+        if decision == "no_high_level_update":
+            parsed["archival_operations"] = []
+            parsed["user_model_operations"] = []
+        valid_event_ids = {
+            str(event.get("id", ""))
+            for event in (packet.get("semantic_events", []) or [])
+            if isinstance(event, dict) and str(event.get("id", ""))
+        }
+        for key in ("archival_operations", "user_model_operations"):
+            for index, operation in enumerate(parsed[key]):
+                if not isinstance(operation, dict):
+                    raise SummaryGenerationError(f"{key}[{index}] must be an object")
+                ids = operation.get("source_event_ids", []) or []
+                if not isinstance(ids, list) or not ids:
+                    raise SummaryGenerationError(f"{key}[{index}].source_event_ids is required")
+                if any(str(value) not in valid_event_ids for value in ids):
+                    raise SummaryGenerationError(f"{key}[{index}].source_event_ids contains unknown event")
+        parsed["reason"] = str(parsed.get("reason", "")).strip()
+        return parsed
 
     def _parse_json_object(self, text: str) -> dict:
         candidate = text.strip()

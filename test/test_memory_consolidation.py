@@ -64,6 +64,7 @@ class ConsolidationModel:
             packet_text = prompt.split("Input packet:\n", 1)[1]
             packet, _ = json.JSONDecoder().raw_decode(packet_text)
             self.high_packets.append(packet)
+            source_event_ids = [str(packet["semantic_events"][-1]["id"])] if packet.get("semantic_events") else []
             if self.high_decision == "no_high_level_update":
                 return json.dumps(
                     {
@@ -82,7 +83,7 @@ class ConsolidationModel:
                             "summary": "The user has a project report deadline.",
                             "importance": 0.8,
                             "confidence": 0.88,
-                            "source_event_ids": ["evt_project_report"],
+                            "source_event_ids": source_event_ids,
                         }
                     ],
                     "user_model_operations": [
@@ -92,7 +93,7 @@ class ConsolidationModel:
                             "kind": "reminder_pattern",
                             "confidence": 0.8,
                             "stability": "recurring",
-                            "source_event_ids": ["evt_project_report"],
+                            "source_event_ids": source_event_ids,
                         }
                     ],
                     "reason": "The low-level memories contain a stable reminder preference.",
@@ -409,6 +410,52 @@ class MemoryConsolidationTest(unittest.TestCase):
 
         self.assertEqual(result, {"semantic_event_operations": [], "event_summaries": []})
         self.assertEqual(model.calls, 2)
+
+    def test_summarizer_retries_invalid_json_mode_response(self) -> None:
+        class InvalidJsonModeModel:
+            def __init__(self) -> None:
+                self.json_calls = 0
+                self.chat_calls = 0
+
+            def generate_json_reply(self, messages, gen):
+                _ = messages, gen
+                self.json_calls += 1
+                return "{truncated"
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                self.chat_calls += 1
+                return json.dumps({"semantic_event_operations": [], "event_summaries": []})
+
+        model = InvalidJsonModeModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
+
+        result = summarizer.consolidate_low_level_memory({"new_turns": []}, include_guga_reflection=False)
+
+        self.assertEqual(result, {"semantic_event_operations": [], "event_summaries": []})
+        self.assertEqual(model.json_calls, 1)
+        self.assertEqual(model.chat_calls, 1)
+
+    def test_summarizer_retries_schema_invalid_json(self) -> None:
+        class SchemaRetryModel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                self.calls += 1
+                if self.calls == 1:
+                    return json.dumps({"semantic_event_operations": {}, "event_summaries": []})
+                return json.dumps({"semantic_event_operations": [], "event_summaries": []})
+
+        model = SchemaRetryModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
+
+        result = summarizer.consolidate_low_level_memory({"new_turns": []}, include_guga_reflection=False)
+
+        self.assertEqual(result, {"semantic_event_operations": [], "event_summaries": []})
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(summarizer.last_structured_attempts[0]["error_type"], "schema")
 
 
 if __name__ == "__main__":
