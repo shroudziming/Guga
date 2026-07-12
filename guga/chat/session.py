@@ -77,7 +77,7 @@ class ChatSession:
         self.max_tool_rounds = self._env_int("Guga_MAX_TOOL_ROUNDS", 3, minimum=0, maximum=8)
         self._debug("session_ready")
 
-    def reply(self, user_input: str, finalize_memory: bool = True) -> str:
+    def reply(self, user_input: str, finalize_memory: bool = True, created_at: str | None = None) -> str:
         """Run one non-streaming dialogue turn.
 
         Upstream input:
@@ -93,7 +93,7 @@ class ChatSession:
         """
         self._debug("reply_start")
         self.history.add_user(user_input)
-        self.memory_manager.record_user_message(session_id=self.session_id, text=user_input)
+        self.memory_manager.record_user_message(session_id=self.session_id, text=user_input, created_at=created_at)
 
         context_started = perf_counter()
         memory_context = self.memory_manager.prepare_context(user_text=user_input, session_id=self.session_id)
@@ -119,7 +119,7 @@ class ChatSession:
         self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
 
         self.history.add_assistant(answer)
-        self.memory_manager.record_assistant_message(session_id=self.session_id, text=answer)
+        self.memory_manager.record_assistant_message(session_id=self.session_id, text=answer, created_at=created_at)
         if finalize_memory:
             self.memory_manager.finalize_turn_async(self.session_id)
             self._debug("finalize_queued")

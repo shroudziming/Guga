@@ -31,7 +31,7 @@ from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
 from guga.memory.semantic_events import SemanticEventStore
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
-from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso
+from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso, parse_datetime
 from guga.memory.user_model import GugaUserModelStore
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
@@ -507,6 +507,9 @@ class MemoryManager:
             state["user_text"] = text
             state["user_message_id"] = message_id
             state["session_memory_id"] = turn_payload["id"]
+            parsed_created_at = parse_datetime(created_at)
+            if parsed_created_at is not None:
+                self._date_context_by_session[session_id] = parsed_created_at.date().isoformat()
         self._debug(session_id, f"ingest role=user message_id={message_id}")
         return message_id
 
@@ -1545,7 +1548,8 @@ class MemoryManager:
 
     def _extract_query_day_with_source(self, query: str, session_id: str) -> tuple[str, str]:
         normalized = query.strip()
-        extracted = extract_semantic_time(normalized, reference_time=now_beijing())
+        reference_time = self._date_context_by_session.get(session_id) or now_beijing()
+        extracted = extract_semantic_time(normalized, reference_time=reference_time)
         if extracted is not None:
             day = extracted[0].date().isoformat()
             source = extracted[1]

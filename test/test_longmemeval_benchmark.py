@@ -108,6 +108,56 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             self.assertEqual(session_row["created_at"], "2026-01-02T09:30:00+08:00")
             self.assertEqual(memory_row["created_at"], "2026-01-02T09:30:00+08:00")
 
+    def test_run_case_uses_question_date_for_question_and_relative_time(self) -> None:
+        class AnswerModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return "blue"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "longmemeval.jsonl"
+            dataset.write_text(
+                json.dumps(
+                    {
+                        "question_id": "q_question_time",
+                        "question": "What did the user mention today?",
+                        "question_date": "2026/01/02 (Fri) 09:30",
+                        "answer_session_ids": ["history_session"],
+                        "answer": "blue notebooks",
+                        "sessions": [[{"role": "user", "content": "I like blue notebooks."}]],
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            case = load_longmemeval_cases(dataset)[0]
+            workspace = benchmark_workspace("longmemeval", root=root, run_id="run_001")
+
+            result = run_longmemeval_case(
+                case=case,
+                model=AnswerModel(),
+                workspace=workspace,
+                generation=GenerationConfig(),
+                enable_semantic=False,
+            )
+
+            question_row = json.loads(
+                (workspace.case_memory_root(case.case_id) / "sessions" / "q_question_time_question.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            )
+            self.assertEqual(question_row["created_at"], "2026/01/02 (Fri) 09:30")
+            self.assertEqual(result["question_date"], "2026/01/02 (Fri) 09:30")
+            self.assertEqual(result["answer_session_ids"], ["history_session"])
+            manager = MemoryManager(memory_root=workspace.case_memory_root(case.case_id), enable_semantic=False)
+            manager.record_user_message(
+                "q_question_time_relative",
+                "今天",
+                created_at="2026/01/02 (Fri) 09:30",
+            )
+            self.assertEqual(manager._extract_query_day_with_source("今天", "q_question_time_relative"), ("2026-01-02", "semantic_relative_date"))
+
     def test_ingest_case_writes_only_to_benchmark_memory_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

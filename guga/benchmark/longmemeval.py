@@ -219,7 +219,7 @@ def run_longmemeval_case(
         debug_sink=debug_sink,
     )
     answer_started = perf_counter()
-    prediction = session.reply(case.question, finalize_memory=False).strip()
+    prediction = session.reply(case.question, finalize_memory=False, created_at=case.question_date or None).strip()
     answer_latency_ms = int((perf_counter() - answer_started) * 1000)
     total_latency_ms = int((perf_counter() - total_started) * 1000)
 
@@ -228,6 +228,8 @@ def run_longmemeval_case(
         "question_type": case.question_type,
         "question": case.question,
         "answer": case.answer,
+        "question_date": case.question_date,
+        "answer_session_ids": case.answer_session_ids,
         "prediction": prediction,
         "ingest": ingest_stats,
         "ingest_mode": ingest_mode,
