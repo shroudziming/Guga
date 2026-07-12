@@ -4,11 +4,12 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
 from threading import RLock
-from time import perf_counter
+from time import perf_counter, sleep
 from uuid import uuid4
 
 from guga.config import (
@@ -527,6 +528,34 @@ class MemoryManager:
         """Force consolidation for any pending completed turns in a session."""
         return self._consolidate_pending_turns(session_id=session_id, force=True)
 
+    def consolidate_until_settled(
+        self,
+        session_id: str,
+        *,
+        max_retry_cycles: int = 3,
+        retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
+        progress: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Synchronously settle one session's ordered memory chain."""
+        result = self.flush_session_memory(session_id)
+        while not bool(result.get("memory_complete", False)):
+            cycle = int(result.get("retry_cycle", 0) or 0)
+            stage = str(result.get("pending_stage", ""))
+            if cycle >= max_retry_cycles:
+                if progress is not None:
+                    progress({"phase": "stage_retry_exhausted", "stage": stage, "cycle": cycle})
+                result["status"] = "failed"
+                return result
+            if progress is not None:
+                progress({"phase": "stage_retry_started", "stage": stage, "cycle": cycle + 1})
+            if retry_delays:
+                delay_index = min(max(cycle - 1, 0), len(retry_delays) - 1)
+                sleep(max(float(retry_delays[delay_index]), 0.0))
+            result = self._consolidate_pending_turns(session_id=session_id, force=True)
+            if bool(result.get("memory_complete", False)) and progress is not None:
+                progress({"phase": "stage_retry_succeeded", "stage": stage, "cycle": cycle + 1})
+        return result
+
     def _pop_turn_state(self, session_id: str) -> dict[str, str]:
         with self._turn_state_lock:
             return dict(self._turn_state.pop(session_id, {}))
@@ -623,6 +652,7 @@ class MemoryManager:
                 low_packet,
                 include_guga_reflection=self.consolidation_config.include_guga_reflection,
             )
+            self._debug_structured_attempts(session_id, batch_seq=batch_seq, stage="low")
             low_counts = self._apply_low_level_consolidation(
                 session_id=session_id,
                 batch_seq=batch_seq,
@@ -630,6 +660,7 @@ class MemoryManager:
                 pending_turns=pending_turns,
             )
         except SummaryGenerationError as exc:
+            self._debug_structured_attempts(session_id, batch_seq=batch_seq, stage="low")
             self._mark_active_batch_failure(session_id=session_id, batch_seq=batch_seq, stage="low", error=exc)
             self._debug(session_id, f"consolidation_failed reason={exc}")
             return self._current_consolidation_result(session_id, status="pending_retry")
@@ -654,12 +685,15 @@ class MemoryManager:
     def _run_high_stage(self, *, session_id: str, batch_seq: int, force: bool) -> dict[str, Any]:
         try:
             high_result = self.summarizer.consolidate_high_level_memory(self._build_high_level_packet())
+            self._debug_structured_attempts(session_id, batch_seq=batch_seq, stage="high")
             high_counts = self._apply_high_level_consolidation(
                 session_id=session_id,
+                batch_seq=batch_seq,
                 result=high_result,
                 low_source_message_ids=[],
             )
         except SummaryGenerationError as exc:
+            self._debug_structured_attempts(session_id, batch_seq=batch_seq, stage="high")
             self._mark_active_batch_failure(session_id=session_id, batch_seq=batch_seq, stage="high", error=exc)
             self._debug(session_id, f"high_level_retry_failed batch_seq={batch_seq} reason={exc}")
             return self._current_consolidation_result(session_id, status="pending_retry")
@@ -745,6 +779,18 @@ class MemoryManager:
             "retry_cycle": int(active.get("retry_cycle", 0) or 0) if isinstance(active, dict) else 0,
         }
 
+    def _debug_structured_attempts(self, session_id: str, *, batch_seq: int, stage: str) -> None:
+        for diagnostic in self.summarizer.last_structured_attempts:
+            self._debug(
+                session_id,
+                "structured_call "
+                + json.dumps(
+                    {"batch_seq": batch_seq, "stage": stage, **diagnostic},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+
     def consolidation_stats(self, session_id: str) -> dict[str, int]:
         payload = self._read_consolidation_state()
         session_state = self._session_consolidation_state(payload, session_id)
@@ -808,6 +854,7 @@ class MemoryManager:
         source_message_ids = self._pending_source_message_ids(pending_turns)
         operations = self._event_operations_with_references(
             session_id=session_id,
+            batch_seq=batch_seq,
             pending_turns=pending_turns,
             operations=result.get("semantic_event_operations", []) or [],
             fallback_source_ids=source_message_ids,
@@ -852,6 +899,7 @@ class MemoryManager:
         self,
         *,
         session_id: str,
+        batch_seq: int,
         pending_turns: list[dict],
         operations: list[object],
         fallback_source_ids: list[str],
@@ -859,10 +907,15 @@ class MemoryManager:
         rows = self._read_session_rows(self.memory_root / "sessions" / f"{session_id}.jsonl")
         created_at_by_id = {str(row.get("id", "")): str(row.get("created_at", "")) for row in rows}
         normalized: list[dict] = []
-        for operation in operations:
+        for operation_index, operation in enumerate(operations):
             if not isinstance(operation, dict):
                 raise SummaryGenerationError("semantic event operation must be an object")
             item = dict(operation)
+            if str(item.get("operation", "")) in {"create", "replace"}:
+                digest = hashlib.sha256(
+                    f"{session_id}:{batch_seq}:event:{operation_index}".encode("utf-8")
+                ).hexdigest()[:24]
+                item["event_id"] = f"evt_{digest}"
             source_ids = [str(value) for value in (item.get("source_message_ids") or fallback_source_ids) if str(value)]
             item["source_message_ids"] = source_ids
             if not item.get("reference_created_at"):
@@ -877,6 +930,7 @@ class MemoryManager:
         self,
         *,
         session_id: str,
+        batch_seq: int,
         result: dict,
         low_source_message_ids: list[str],
     ) -> dict[str, int]:
@@ -887,13 +941,18 @@ class MemoryManager:
 
         updates = 0
         if self.consolidation_config.enable_archival_updates:
-            for item in result.get("archival_operations", []) or []:
+            for operation_index, item in enumerate(result.get("archival_operations", []) or []):
                 if not isinstance(item, dict):
                     continue
-                payload = self._build_archival_update(item=item, session_id=session_id)
+                payload = self._build_archival_update(
+                    item=item,
+                    session_id=session_id,
+                    batch_seq=batch_seq,
+                    operation_index=operation_index,
+                )
                 if not payload:
                     continue
-                self._append_jsonl(self.archival_file, payload)
+                self._upsert_jsonl(self.archival_file, payload)
                 updates += 1
                 if self.rag_pipeline is not None:
                     try:
@@ -905,7 +964,14 @@ class MemoryManager:
             updates += len(written)
         return {"high_level_updates": updates, "high_level_noops": 0}
 
-    def _build_archival_update(self, *, item: dict, session_id: str) -> dict:
+    def _build_archival_update(
+        self,
+        *,
+        item: dict,
+        session_id: str,
+        batch_seq: int,
+        operation_index: int,
+    ) -> dict:
         summary = str(item.get("summary", "")).strip()
         if not summary:
             return {}
@@ -916,7 +982,7 @@ class MemoryManager:
         return normalize_memorybank_fields(
             apply_temporal_fields(
                 {
-                    "id": f"mem_{uuid4().hex[:10]}",
+                    "id": f"mem_{hashlib.sha256(f'{session_id}:{batch_seq}:archival:{operation_index}'.encode('utf-8')).hexdigest()[:24]}",
                     "type": "episodic",
                     "topic": str(item.get("topic") or "general").strip()[:64] or "general",
                     "summary": summary[:500],
@@ -1730,6 +1796,21 @@ class MemoryManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _upsert_jsonl(self, path: Path, payload: dict) -> None:
+        payload_id = str(payload.get("id", ""))
+        rows = self._read_jsonl_records(path)
+        for index, row in enumerate(rows):
+            if payload_id and str(row.get("id", "")) == payload_id:
+                rows[index] = payload
+                break
+        else:
+            rows.append(payload)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + ("\n" if rows else ""),
+            encoding="utf-8",
+        )
 
     def _load_memory_by_id(self, path: Path, memory_id: str) -> dict:
         if not path.exists() or not memory_id:

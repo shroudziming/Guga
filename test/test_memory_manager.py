@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +42,7 @@ class SummaryModel:
                 ensure_ascii=False,
             )
         if "High-level memory consolidation" in prompt:
+            event_match = re.search(r'"id"\s*:\s*"(evt_[^"]+)"', prompt)
             return json.dumps(
                 {
                     "decision": "update_high_level_memory",
@@ -50,7 +52,7 @@ class SummaryModel:
                             "summary": "用户叫小明，在深圳工作",
                             "importance": 0.8,
                             "confidence": 0.9,
-                            "source_event_ids": ["evt_work_location"],
+                            "source_event_ids": [event_match.group(1)] if event_match else [],
                         }
                     ],
                     "user_model_operations": [
@@ -60,7 +62,7 @@ class SummaryModel:
                             "kind": "work_context",
                             "confidence": 0.9,
                             "stability": "explicit",
-                            "source_event_ids": ["evt_work_location"],
+                            "source_event_ids": [event_match.group(1)] if event_match else [],
                         }
                     ],
                     "reason": "stable profile",
@@ -384,6 +386,7 @@ class MemoryManagerTest(unittest.TestCase):
         self.manager.record_user_message(session_id, "我叫小明，我在深圳工作")
         self.manager.record_assistant_message(session_id, "记住了")
         self.manager.finalize_turn(session_id)
+        self.manager.flush_session_memory(session_id)
 
         session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
         self.assertTrue(session_file.exists())

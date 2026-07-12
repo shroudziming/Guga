@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from time import perf_counter, sleep
 import unittest
@@ -46,6 +47,7 @@ class FakeChatModel:
                 ensure_ascii=False,
             )
         if "High-level memory consolidation" in prompt:
+            event_match = re.search(r'"id"\s*:\s*"(evt_[^"]+)"', prompt)
             return json.dumps(
                 {
                     "decision": "update_high_level_memory",
@@ -55,7 +57,7 @@ class FakeChatModel:
                             "summary": "用户在杭州工作，做后端开发",
                             "importance": 0.8,
                             "confidence": 0.9,
-                            "source_event_ids": ["evt_work_context"],
+                            "source_event_ids": [event_match.group(1)] if event_match else [],
                         }
                     ],
                     "user_model_operations": [],
@@ -175,6 +177,7 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                         }
                     )
                 if "High-level memory consolidation" in prompt:
+                    event_match = re.search(r'"id"\s*:\s*"(evt_[^"]+)"', prompt)
                     return json.dumps(
                         {
                             "decision": "update_high_level_memory",
@@ -184,7 +187,7 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                                     "summary": "The user works on backend systems.",
                                     "importance": 0.8,
                                     "confidence": 0.9,
-                                    "source_event_ids": ["evt_work_context"],
+                                    "source_event_ids": [event_match.group(1)] if event_match else [],
                                 }
                             ],
                             "user_model_operations": [],

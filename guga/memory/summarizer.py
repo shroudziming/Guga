@@ -421,6 +421,10 @@ class MemoryBankSummarizer:
             if action in {"create", "update", "replace"} and str(operation.get("subject", "user")) != "user":
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].subject must be user")
             if action == "create":
+                if str(operation.get("target_event_id", "")).strip():
+                    raise SummaryGenerationError(
+                        f"semantic_event_operations[{index}].target_event_id is forbidden for create"
+                    )
                 for field in ("event_kind", "entity", "description"):
                     if not str(operation.get(field, "")).strip():
                         raise SummaryGenerationError(f"semantic_event_operations[{index}].{field} is required")

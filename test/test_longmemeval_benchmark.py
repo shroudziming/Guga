@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -263,6 +264,7 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                         }
                     )
                 if "High-level memory consolidation" in prompt:
+                    event_match = re.search(r'"id"\s*:\s*"(evt_[^"]+)"', prompt)
                     return json.dumps(
                         {
                             "decision": "update_high_level_memory",
@@ -272,7 +274,7 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                                     "summary": "User likes blue notebooks.",
                                     "importance": 0.8,
                                     "confidence": 0.9,
-                                    "source_event_ids": ["evt_notebook_preference"],
+                                    "source_event_ids": [event_match.group(1)] if event_match else [],
                                 }
                             ],
                             "user_model_operations": [],

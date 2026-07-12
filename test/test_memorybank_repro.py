@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import tempfile
 import unittest
@@ -36,12 +37,14 @@ class SummaryModel:
                 ensure_ascii=False,
             )
         if "High-level memory consolidation" in prompt:
+            event_match = re.search(r'"id"\s*:\s*"(evt_[^"]+)"', prompt)
+            event_ids = [event_match.group(1)] if event_match else []
             if "叔本明" in prompt:
                 return json.dumps(
                     {
                         "decision": "update_high_level_memory",
                         "archival_operations": [
-                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9, "source_event_ids": ["evt_user_context"]}
+                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9, "source_event_ids": event_ids}
                         ],
                         "user_model_operations": [],
                         "reason": "identity",
@@ -57,7 +60,7 @@ class SummaryModel:
                             "summary": "用户提到深圳工作和不喜欢说教式安慰",
                             "importance": 0.8,
                             "confidence": 0.9,
-                            "source_event_ids": ["evt_user_context"],
+                            "source_event_ids": event_ids,
                         }
                     ],
                     "user_model_operations": [],
@@ -134,6 +137,7 @@ class MemoryBankReproTest(unittest.TestCase):
                         }
                     )
                 if "High-level memory consolidation" in prompt:
+                    event_match = re.search(r'"id"\s*:\s*"(evt_[^"]+)"', prompt)
                     return json.dumps(
                         {
                             "decision": "update_high_level_memory",
@@ -143,7 +147,7 @@ class MemoryBankReproTest(unittest.TestCase):
                                     "summary": "The user works as a backend engineer in Hangzhou.",
                                     "importance": 0.9,
                                     "confidence": 0.8,
-                                    "source_event_ids": ["evt_work"],
+                                    "source_event_ids": [event_match.group(1)] if event_match else [],
                                 }
                             ],
                             "user_model_operations": [],

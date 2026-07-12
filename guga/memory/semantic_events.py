@@ -66,7 +66,11 @@ class SemanticEventStore:
                 continue
             if operation == "create":
                 event = self._new_event(operation_payload, session_id, now, include_guga_reflection)
-                rows.append(event)
+                existing = self._find(rows, event["id"])
+                if existing is None:
+                    rows.append(event)
+                else:
+                    event = existing
                 created.append(event["id"])
                 continue
 
@@ -95,7 +99,11 @@ class SemanticEventStore:
                     include_guga_reflection,
                     replaces_event_id=target_id,
                 )
-                rows.append(event)
+                existing = self._find(rows, event["id"])
+                if existing is None:
+                    rows.append(event)
+                else:
+                    event = existing
                 created.append(event["id"])
                 continue
 
@@ -122,7 +130,7 @@ class SemanticEventStore:
         reference_created_at = str(payload.get("reference_created_at") or now).strip()
         time_fields = _llm_time_fields(payload, default_end_unknown=False)
         event = {
-            "id": f"evt_{uuid4().hex}",
+            "id": str(payload.get("event_id") or f"evt_{uuid4().hex}"),
             "type": "semantic_event",
             "event_kind": event_kind,
             "subject": subject,

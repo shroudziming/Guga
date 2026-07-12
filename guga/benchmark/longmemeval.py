@@ -25,6 +25,14 @@ LONGMEMEVAL_SYSTEM_PROMPT = (
 ProgressCallback = Callable[[dict[str, Any]], None]
 
 
+class ConsolidationExhaustedError(RuntimeError):
+    def __init__(self, session_index: int, session_id: str, diagnostics: dict[str, Any]) -> None:
+        super().__init__(f"memory consolidation failed for {session_id}")
+        self.session_index = session_index
+        self.session_id = session_id
+        self.diagnostics = diagnostics
+
+
 @dataclass(frozen=True)
 class LongMemEvalMessage:
     role: str
@@ -134,6 +142,8 @@ def ingest_longmemeval_case_replay(
     initial_stats: dict[str, int] | None = None,
     on_session_completed: Callable[[int, dict[str, int]], None] | None = None,
     on_message_processed: Callable[[int, dict[str, int]], None] | None = None,
+    on_stage_progress: ProgressCallback | None = None,
+    retry_delays: tuple[float, ...] = (2.0, 5.0, 10.0),
 ) -> dict[str, int]:
     stats = _initial_ingest_stats("replay", initial_stats)
     for session_index, session in enumerate(case.sessions[start_session_index:], start=start_session_index):
@@ -172,7 +182,14 @@ def ingest_longmemeval_case_replay(
             manager.finalize_turn(session_id)
             stats["finalized_turns"] += 1
             stats["completed_turns"] += 1
-        flush_stats = manager.flush_session_memory(session_id)
+        flush_stats = manager.consolidate_until_settled(
+            session_id,
+            max_retry_cycles=3,
+            retry_delays=retry_delays,
+            progress=on_stage_progress,
+        )
+        if not bool(flush_stats.get("memory_complete", False)):
+            raise ConsolidationExhaustedError(session_index, session_id, flush_stats)
         for key in ("consolidation_batches", "low_level_updates", "high_level_updates", "high_level_noops"):
             stats[key] += int(flush_stats.get(key, 0))
         stats["sessions"] += 1
@@ -263,14 +280,47 @@ def run_longmemeval_case(
 
     ingest_started = perf_counter()
     if ingest_mode == "replay":
-        ingest_stats = ingest_longmemeval_case_replay(
-            case,
-            manager,
-            start_session_index=start_session_index,
-            initial_stats=initial_stats,
-            on_session_completed=checkpoint_session,
-            on_message_processed=report_message,
-        )
+        try:
+            ingest_stats = ingest_longmemeval_case_replay(
+                case,
+                manager,
+                start_session_index=start_session_index,
+                initial_stats=initial_stats,
+                on_session_completed=checkpoint_session,
+                on_message_processed=report_message,
+                on_stage_progress=lambda event: _emit_progress(
+                    progress, {**event, "case_id": case.case_id}
+                ),
+            )
+        except ConsolidationExhaustedError as exc:
+            failed_stats = dict(initial_stats or _initial_ingest_stats("replay"))
+            failed_result = {
+                "case_id": case.case_id,
+                "question_type": case.question_type,
+                "question": case.question,
+                "answer": case.answer,
+                "prediction": None,
+                "status": "consolidation_failed",
+                "memory_complete": False,
+                "ingest": failed_stats,
+                "ingest_mode": ingest_mode,
+                "memory_root": str(memory_root),
+                "consolidation": exc.diagnostics,
+                "timing_ms": {"ingest": int((perf_counter() - ingest_started) * 1000)},
+            }
+            _write_checkpoint(
+                checkpoint_file,
+                {
+                    "schema_version": 2,
+                    "case_id": case.case_id,
+                    "ingest_mode": ingest_mode,
+                    "next_session_index": exc.session_index,
+                    "ingest": failed_stats,
+                    "phase": "consolidation_failed",
+                },
+            )
+            _append_result(workspace.results_file, failed_result)
+            return failed_result
     elif ingest_mode == "raw":
         ingest_stats = ingest_longmemeval_case(
             case,
@@ -332,6 +382,8 @@ def run_longmemeval_case(
         "question_date": case.question_date,
         "answer_session_ids": case.answer_session_ids,
         "prediction": prediction,
+        "status": "complete",
+        "memory_complete": True,
         "ingest": ingest_stats,
         "ingest_mode": ingest_mode,
         "memory_root": str(memory_root),
@@ -488,7 +540,10 @@ def _load_completed_results(path: Path) -> dict[str, dict[str, Any]]:
         except json.JSONDecodeError:
             continue
         case_id = payload.get("case_id") if isinstance(payload, dict) else None
-        if isinstance(case_id, str) and case_id:
+        is_complete = payload.get("status") == "complete" or (
+            "status" not in payload and payload.get("prediction") is not None
+        )
+        if isinstance(case_id, str) and case_id and is_complete:
             completed[case_id] = payload
     return completed
 

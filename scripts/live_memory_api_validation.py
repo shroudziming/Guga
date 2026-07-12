@@ -55,6 +55,12 @@ class RecordingModel:
         self.responses.append(str(response))
         return response
 
+    def generate_structured_reply(self, messages, gen):
+        self.prompts.append(str(messages[-1]["content"]))
+        response = self.delegate.generate_structured_reply(messages, gen)
+        self.responses.append(str(response.content))
+        return response
+
 
 def validate_time_event(event: dict, *, expect_unknown_end: bool) -> None:
     start_at = str(event.get("start_at") or "")
@@ -245,7 +251,7 @@ def run_two_stage_persistence(model: RecordingModel) -> dict:
         scenario_prompts = model.prompts[prompt_start:]
         low_prompts = [prompt for prompt in scenario_prompts if "Low-level memory consolidation" in prompt]
         high_prompts = [prompt for prompt in scenario_prompts if "High-level memory consolidation" in prompt]
-        if len(low_prompts) != 1 or len(high_prompts) != 1:
+        if not low_prompts or len(high_prompts) != 1:
             raise AssertionError(f"unexpected API call count: low={len(low_prompts)}, high={len(high_prompts)}")
         high_packet = _packet_from_prompt(high_prompts[0])
         high_event_ids = {str(event.get("id", "")) for event in high_packet.get("semantic_events", [])}
