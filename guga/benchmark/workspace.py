@@ -33,6 +33,10 @@ class BenchmarkWorkspace:
     def results_file(self) -> Path:
         return self.root / "results.jsonl"
 
+    @property
+    def progress_file(self) -> Path:
+        return self.root / "progress.jsonl"
+
     def case_root(self, case_id: str) -> Path:
         return self.root / "cases" / safe_case_id(case_id)
 
@@ -41,6 +45,9 @@ class BenchmarkWorkspace:
 
     def case_debug_reports_dir(self, case_id: str) -> Path:
         return self.debug_reports_dir / safe_case_id(case_id)
+
+    def case_checkpoint_file(self, case_id: str) -> Path:
+        return self.case_root(case_id) / "checkpoint.json"
 
 
 def benchmark_workspace(name: str, root: Path | None = None, run_id: str | None = None) -> BenchmarkWorkspace:

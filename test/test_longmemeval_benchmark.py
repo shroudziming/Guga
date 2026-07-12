@@ -461,6 +461,78 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             self.assertTrue((workspace.case_memory_root("q1") / "session_memories.jsonl").exists())
             self.assertFalse((workspace.case_memory_root("q2") / "session_memories.jsonl").exists())
 
+    def test_benchmark_resumes_from_completed_session_checkpoint(self) -> None:
+        class SimpleModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return "blue"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "longmemeval_resume.json"
+            # Keep the production LongMemEval shape while making the history intentionally small.
+            dataset.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question_id": "q_resume",
+                            "question_type": "information_extraction",
+                            "question": "What color does the user like?",
+                            "answer": "blue",
+                            "question_date": "2026/01/03 (Sat) 09:30",
+                            "haystack_session_ids": ["history_1", "history_2"],
+                            "haystack_dates": ["2026/01/01 (Thu) 09:30", "2026/01/02 (Fri) 09:30"],
+                            "haystack_sessions": [
+                                [{"role": "user", "content": "The user likes blue notebooks."}],
+                                [{"role": "user", "content": "The user owns a blue pen."}],
+                            ],
+                            "answer_session_ids": ["history_1"],
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            workspace = benchmark_workspace("longmemeval", root=root, run_id="resume_001")
+
+            def interrupt_after_first_session(event: dict[str, object]) -> None:
+                if event.get("phase") == "ingest_session_completed" and event.get("session_index") == 1:
+                    raise KeyboardInterrupt("simulated interruption")
+
+            with self.assertRaises(KeyboardInterrupt):
+                run_longmemeval_benchmark(
+                    dataset_path=dataset,
+                    model=SimpleModel(),
+                    workspace=workspace,
+                    generation=GenerationConfig(),
+                    enable_semantic=False,
+                    progress=interrupt_after_first_session,
+                )
+
+            checkpoint = json.loads((workspace.case_root("q_resume") / "checkpoint.json").read_text(encoding="utf-8"))
+            self.assertEqual(checkpoint["next_session_index"], 1)
+            first_session = workspace.case_memory_root("q_resume") / "sessions" / "history_1.jsonl"
+            self.assertEqual(len(first_session.read_text(encoding="utf-8").splitlines()), 1)
+
+            results = run_longmemeval_benchmark(
+                dataset_path=dataset,
+                model=SimpleModel(),
+                workspace=workspace,
+                generation=GenerationConfig(),
+                enable_semantic=False,
+            )
+
+            self.assertEqual([result["case_id"] for result in results], ["q_resume"])
+            self.assertEqual(len(workspace.results_file.read_text(encoding="utf-8").splitlines()), 1)
+            self.assertEqual(len(first_session.read_text(encoding="utf-8").splitlines()), 1)
+            self.assertFalse((workspace.case_root("q_resume") / "checkpoint.json").exists())
+            progress_phases = [
+                json.loads(line)["phase"]
+                for line in workspace.progress_file.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertIn("ingest_session_completed", progress_phases)
+            self.assertIn("case_completed", progress_phases)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 from guga.chat import ChatSession
 from guga.memory.consolidation import MemoryConsolidationConfig
@@ -20,6 +21,8 @@ LONGMEMEVAL_SYSTEM_PROMPT = (
     "Give a concise answer. If the evidence is insufficient or the question has a false premise, "
     "state that the answer is unknown instead of guessing. Do not role-play a daily companion persona."
 )
+
+ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 @dataclass(frozen=True)
@@ -85,9 +88,17 @@ def load_longmemeval_cases(path: Path) -> list[LongMemEvalCase]:
     return cases
 
 
-def ingest_longmemeval_case(case: LongMemEvalCase, manager: MemoryManager) -> dict[str, int]:
-    messages = 0
-    for session_index, session in enumerate(case.sessions):
+def ingest_longmemeval_case(
+    case: LongMemEvalCase,
+    manager: MemoryManager,
+    *,
+    start_session_index: int = 0,
+    initial_stats: dict[str, int] | None = None,
+    on_session_completed: Callable[[int, dict[str, int]], None] | None = None,
+    on_message_processed: Callable[[int, dict[str, int]], None] | None = None,
+) -> dict[str, int]:
+    stats = _initial_ingest_stats("raw", initial_stats)
+    for session_index, session in enumerate(case.sessions[start_session_index:], start=start_session_index):
         session_id = _case_session_id(case, session_index)
         for message in session:
             role = _normalize_role(message.role)
@@ -106,19 +117,26 @@ def ingest_longmemeval_case(case: LongMemEvalCase, manager: MemoryManager) -> di
                     source="benchmark:longmemeval",
                     created_at=message.created_at or None,
                 )
-            messages += 1
-    return {"sessions": len(case.sessions), "messages": messages}
+            stats["messages"] += 1
+            if on_message_processed is not None:
+                on_message_processed(session_index + 1, dict(stats))
+        stats["sessions"] += 1
+        if on_session_completed is not None:
+            on_session_completed(session_index + 1, dict(stats))
+    return stats
 
 
-def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager) -> dict[str, int]:
-    messages = 0
-    finalized_turns = 0
-    completed_turns = 0
-    consolidation_batches = 0
-    low_level_updates = 0
-    high_level_updates = 0
-    high_level_noops = 0
-    for session_index, session in enumerate(case.sessions):
+def ingest_longmemeval_case_replay(
+    case: LongMemEvalCase,
+    manager: MemoryManager,
+    *,
+    start_session_index: int = 0,
+    initial_stats: dict[str, int] | None = None,
+    on_session_completed: Callable[[int, dict[str, int]], None] | None = None,
+    on_message_processed: Callable[[int, dict[str, int]], None] | None = None,
+) -> dict[str, int]:
+    stats = _initial_ingest_stats("replay", initial_stats)
+    for session_index, session in enumerate(case.sessions[start_session_index:], start=start_session_index):
         session_id = _case_session_id(case, session_index)
         has_open_user_turn = False
         for message in session:
@@ -132,14 +150,14 @@ def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager
                 )
                 if has_open_user_turn:
                     manager.finalize_turn(session_id)
-                    finalized_turns += 1
-                    completed_turns += 1
+                    stats["finalized_turns"] += 1
+                    stats["completed_turns"] += 1
                     has_open_user_turn = False
             else:
                 if has_open_user_turn:
                     manager.finalize_turn(session_id)
-                    finalized_turns += 1
-                    completed_turns += 1
+                    stats["finalized_turns"] += 1
+                    stats["completed_turns"] += 1
                 manager.record_user_message(
                     session_id=session_id,
                     text=message.content,
@@ -147,26 +165,20 @@ def ingest_longmemeval_case_replay(case: LongMemEvalCase, manager: MemoryManager
                     created_at=message.created_at or None,
                 )
                 has_open_user_turn = True
-            messages += 1
+            stats["messages"] += 1
+            if on_message_processed is not None:
+                on_message_processed(session_index + 1, dict(stats))
         if has_open_user_turn:
             manager.finalize_turn(session_id)
-            finalized_turns += 1
-            completed_turns += 1
-        stats = manager.flush_session_memory(session_id)
-        consolidation_batches += stats.get("consolidation_batches", 0)
-        low_level_updates += stats.get("low_level_updates", 0)
-        high_level_updates += stats.get("high_level_updates", 0)
-        high_level_noops += stats.get("high_level_noops", 0)
-    return {
-        "sessions": len(case.sessions),
-        "messages": messages,
-        "finalized_turns": finalized_turns,
-        "completed_turns": completed_turns,
-        "consolidation_batches": consolidation_batches,
-        "low_level_updates": low_level_updates,
-        "high_level_updates": high_level_updates,
-        "high_level_noops": high_level_noops,
-    }
+            stats["finalized_turns"] += 1
+            stats["completed_turns"] += 1
+        flush_stats = manager.flush_session_memory(session_id)
+        for key in ("consolidation_batches", "low_level_updates", "high_level_updates", "high_level_noops"):
+            stats[key] += int(flush_stats.get(key, 0))
+        stats["sessions"] += 1
+        if on_session_completed is not None:
+            on_session_completed(session_index + 1, dict(stats))
+    return stats
 
 
 def run_longmemeval_case(
@@ -178,6 +190,8 @@ def run_longmemeval_case(
     enable_semantic: bool = True,
     ingest_mode: str = "raw",
     replay_finalize_every: int = 10,
+    resume: bool = True,
+    progress: ProgressCallback | None = None,
 ) -> dict[str, Any]:
     total_started = perf_counter()
     memory_root = workspace.case_memory_root(case.case_id)
@@ -198,15 +212,90 @@ def run_longmemeval_case(
         if ingest_mode == "replay"
         else None,
     )
+    checkpoint_file = workspace.case_checkpoint_file(case.case_id)
+    checkpoint = _load_checkpoint(checkpoint_file) if resume else None
+    start_session_index = int(checkpoint.get("next_session_index", 0)) if checkpoint else 0
+    initial_stats = checkpoint.get("ingest", {}) if checkpoint else None
+    if start_session_index:
+        _emit_progress(
+            progress,
+            {
+                "phase": "case_resumed",
+                "case_id": case.case_id,
+                "next_session_index": start_session_index,
+                "session_total": len(case.sessions),
+            },
+        )
+
+    def checkpoint_session(next_session_index: int, stats: dict[str, int]) -> None:
+        _write_checkpoint(
+            checkpoint_file,
+            {
+                "schema_version": 1,
+                "case_id": case.case_id,
+                "ingest_mode": ingest_mode,
+                "next_session_index": next_session_index,
+                "ingest": stats,
+            },
+        )
+        _emit_progress(
+            progress,
+            {
+                "phase": "ingest_session_completed",
+                "case_id": case.case_id,
+                "session_index": next_session_index,
+                "session_total": len(case.sessions),
+                "ingest": stats,
+            },
+        )
+
+    def report_message(session_index: int, stats: dict[str, int]) -> None:
+        _emit_progress(
+            progress,
+            {
+                "phase": "ingest_message_progress",
+                "case_id": case.case_id,
+                "session_index": session_index,
+                "session_total": len(case.sessions),
+                "ingest": stats,
+            },
+        )
+
     ingest_started = perf_counter()
     if ingest_mode == "replay":
-        ingest_stats = ingest_longmemeval_case_replay(case, manager)
+        ingest_stats = ingest_longmemeval_case_replay(
+            case,
+            manager,
+            start_session_index=start_session_index,
+            initial_stats=initial_stats,
+            on_session_completed=checkpoint_session,
+            on_message_processed=report_message,
+        )
     elif ingest_mode == "raw":
-        ingest_stats = ingest_longmemeval_case(case, manager)
+        ingest_stats = ingest_longmemeval_case(
+            case,
+            manager,
+            start_session_index=start_session_index,
+            initial_stats=initial_stats,
+            on_session_completed=checkpoint_session,
+            on_message_processed=report_message,
+        )
     else:
         raise ValueError(f"Unsupported LongMemEval ingest_mode: {ingest_mode}")
     ingest_latency_ms = int((perf_counter() - ingest_started) * 1000)
     if manager.rag_pipeline is not None:
+        _write_checkpoint(
+            checkpoint_file,
+            {
+                "schema_version": 1,
+                "case_id": case.case_id,
+                "ingest_mode": ingest_mode,
+                "next_session_index": len(case.sessions),
+                "ingest": ingest_stats,
+                "phase": "rebuild_indexes",
+            },
+        )
+        _emit_progress(progress, {"phase": "rebuild_indexes", "case_id": case.case_id})
         manager.rebuild_rag_indexes(session_id=f"{case.case_id}_benchmark")
 
     session = ChatSession(
@@ -219,6 +308,18 @@ def run_longmemeval_case(
         debug_sink=debug_sink,
     )
     answer_started = perf_counter()
+    _write_checkpoint(
+        checkpoint_file,
+        {
+            "schema_version": 1,
+            "case_id": case.case_id,
+            "ingest_mode": ingest_mode,
+            "next_session_index": len(case.sessions),
+            "ingest": ingest_stats,
+            "phase": "answering",
+        },
+    )
+    _emit_progress(progress, {"phase": "answering", "case_id": case.case_id})
     prediction = session.reply(case.question, finalize_memory=False, created_at=case.question_date or None).strip()
     answer_latency_ms = int((perf_counter() - answer_started) * 1000)
     total_latency_ms = int((perf_counter() - total_started) * 1000)
@@ -242,6 +343,15 @@ def run_longmemeval_case(
         },
     }
     _append_result(workspace.results_file, result)
+    checkpoint_file.unlink(missing_ok=True)
+    _emit_progress(
+        progress,
+        {
+            "phase": "case_completed",
+            "case_id": case.case_id,
+            "timing_ms": result["timing_ms"],
+        },
+    )
     return result
 
 
@@ -255,13 +365,35 @@ def run_longmemeval_benchmark(
     enable_semantic: bool = True,
     ingest_mode: str = "raw",
     replay_finalize_every: int = 10,
+    resume: bool = True,
+    progress: ProgressCallback | None = None,
 ) -> list[dict[str, Any]]:
     cases = load_longmemeval_cases(dataset_path)
     if limit is not None:
         cases = cases[: max(0, limit)]
 
+    completed_results = _load_completed_results(workspace.results_file) if resume else {}
     results: list[dict[str, Any]] = []
-    for case in cases:
+    for case_index, case in enumerate(cases, start=1):
+        case_progress = lambda event, case_index=case_index: _record_progress(
+            workspace,
+            {
+                **event,
+                "case_index": case_index,
+                "case_total": len(cases),
+            },
+            progress,
+        )
+        completed = completed_results.get(case.case_id)
+        if completed is not None:
+            workspace.case_checkpoint_file(case.case_id).unlink(missing_ok=True)
+            _emit_progress(
+                case_progress,
+                {"phase": "case_skipped_completed", "case_id": case.case_id},
+            )
+            results.append(completed)
+            continue
+        _emit_progress(case_progress, {"phase": "case_started", "case_id": case.case_id})
         results.append(
             run_longmemeval_case(
                 case=case,
@@ -272,6 +404,8 @@ def run_longmemeval_benchmark(
                 enable_semantic=enable_semantic,
                 ingest_mode=ingest_mode,
                 replay_finalize_every=replay_finalize_every,
+                resume=resume,
+                progress=case_progress,
             )
         )
     return results
@@ -300,9 +434,82 @@ def _load_rows(path: Path) -> list[Any]:
 
 
 def _append_result(path: Path, result: dict[str, Any]) -> None:
+    _append_json_line(path, result)
+
+
+def _append_json_line(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _initial_ingest_stats(mode: str, initial_stats: dict[str, int] | None) -> dict[str, int]:
+    keys = ["sessions", "messages"]
+    if mode == "replay":
+        keys.extend(
+            [
+                "finalized_turns",
+                "completed_turns",
+                "consolidation_batches",
+                "low_level_updates",
+                "high_level_updates",
+                "high_level_noops",
+            ]
+        )
+    initial_stats = initial_stats or {}
+    return {key: int(initial_stats.get(key, 0)) for key in keys}
+
+
+def _load_checkpoint(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid LongMemEval checkpoint: {path}")
+    return payload
+
+
+def _write_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _load_completed_results(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    completed: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        case_id = payload.get("case_id") if isinstance(payload, dict) else None
+        if isinstance(case_id, str) and case_id:
+            completed[case_id] = payload
+    return completed
+
+
+def _emit_progress(progress: ProgressCallback | None, event: dict[str, Any]) -> None:
+    if progress is not None:
+        progress(event)
+
+
+def _record_progress(
+    workspace: BenchmarkWorkspace,
+    event: dict[str, Any],
+    callback: ProgressCallback | None,
+) -> None:
+    payload = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "run_id": workspace.run_id,
+        **event,
+    }
+    _append_json_line(workspace.progress_file, payload)
+    _emit_progress(callback, payload)
 
 
 def _extract_sessions(row: dict[str, Any]) -> list[list[LongMemEvalMessage]]:

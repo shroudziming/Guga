@@ -36,6 +36,12 @@ def main() -> None:
     parser.add_argument("--run-id", default=None, help="Run id under data/benchmarks/longmemeval/runs/.")
     parser.add_argument("--limit", type=int, default=None, help="Optional case limit for smoke runs.")
     parser.add_argument("--debug", action="store_true", help="Write benchmark debug reports.")
+    parser.add_argument(
+        "--progress-every-messages",
+        type=int,
+        default=10,
+        help="Print ingest progress after this many source messages; session and answer phases are always printed.",
+    )
     parser.add_argument("--no-semantic", action="store_true", help="Disable semantic RAG indexes for a lightweight run.")
     parser.add_argument(
         "--ingest-mode",
@@ -56,6 +62,33 @@ def main() -> None:
     cache_dir = os.environ.get("Guga_CACHE_DIR", str(DEFAULT_CACHE_DIR))
     model = create_chat_model(model_id=model_id, cache_dir=cache_dir)
     workspace = benchmark_workspace("longmemeval", run_id=args.run_id)
+
+    def print_progress(event: dict[str, object]) -> None:
+        phase = str(event.get("phase", "progress"))
+        case_label = f"case={event.get('case_index', '?')}/{event.get('case_total', '?')} id={event.get('case_id', '?')}"
+        ingest = event.get("ingest")
+        if phase == "ingest_message_progress":
+            messages = int(ingest.get("messages", 0)) if isinstance(ingest, dict) else 0
+            if messages % max(1, args.progress_every_messages):
+                return
+            print(f"[LongMemEval] {case_label} ingest messages={messages}", flush=True)
+            return
+        if phase == "ingest_session_completed":
+            stats = ingest if isinstance(ingest, dict) else {}
+            print(
+                f"[LongMemEval] {case_label} session={event.get('session_index')}/{event.get('session_total')} "
+                f"messages={stats.get('messages', 0)} turns={stats.get('completed_turns', 0)} "
+                f"batches={stats.get('consolidation_batches', 0)}",
+                flush=True,
+            )
+            return
+        if phase == "case_completed":
+            timing = event.get("timing_ms")
+            total_ms = timing.get("total", 0) if isinstance(timing, dict) else 0
+            print(f"[LongMemEval] {case_label} completed total_ms={total_ms}", flush=True)
+            return
+        print(f"[LongMemEval] {case_label} phase={phase}", flush=True)
+
     results = run_longmemeval_benchmark(
         dataset_path=args.dataset,
         model=model,
@@ -66,11 +99,13 @@ def main() -> None:
         enable_semantic=not args.no_semantic,
         ingest_mode=args.ingest_mode,
         replay_finalize_every=max(1, args.replay_finalize_every),
+        progress=print_progress,
     )
 
     print(f"LongMemEval cases={len(results)}")
     print(f"run_root={workspace.root}")
     print(f"results={workspace.results_file}")
+    print(f"progress={workspace.progress_file}")
 
 
 if __name__ == "__main__":
