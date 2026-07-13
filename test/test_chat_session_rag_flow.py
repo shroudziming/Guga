@@ -11,6 +11,7 @@ from pathlib import Path
 from guga.chat.session import ChatSession
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
+from guga.rag.embedder import HashingEmbedder
 from guga.types import GenerationConfig
 
 
@@ -111,6 +112,7 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                 top_k=2,
                 consolidation_config=MemoryConsolidationConfig(batch_turns=1),
             )
+            manager.rag_pipeline.embedder = HashingEmbedder(dim=64)
             manager.record_user_message("seed_session", "我在杭州工作，做后端开发")
             manager.record_assistant_message("seed_session", "收到")
             manager.finalize_turn("seed_session")

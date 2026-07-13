@@ -302,6 +302,16 @@ class MemoryQualityPlanTest(unittest.TestCase):
     def test_portrait_query_uses_profile_without_episodic_noise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
+            (memory_root / "semantic_events.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"id": "evt_identity", "type": "semantic_event", "description": "用户自称叔本明。", "status": "active"}, ensure_ascii=False),
+                        json.dumps({"id": "evt_interest", "type": "semantic_event", "description": "用户想练蝴蝶刀。", "status": "active"}, ensure_ascii=False),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
             (memory_root / "guga_user_model.json").write_text(
                 json.dumps(
                     {
