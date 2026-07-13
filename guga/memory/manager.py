@@ -31,6 +31,7 @@ from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
 from guga.memory.semantic_events import SemanticEventStore
+from guga.memory_source_validity import active_event_ids, uses_only_active_event_sources
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso, parse_datetime
 from guga.memory.user_model import GugaUserModelStore
@@ -290,10 +291,12 @@ class MemoryManager:
         merged_memory_hits = self._dedupe_semantic_event_overlaps(merged_memory_hits, query_plan)
         self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text, current_turn_ids=current_turn_ids)
         document_hits = self._to_document_hits(semantic_document_hits)
+        current_event_ids = active_event_ids(self.semantic_event_store.load_all())
         user_portrait = "\n".join(
             str(insight.get("statement", "")).strip()
             for insight in self.user_model_store.load().get("insights", [])
-            if insight.get("status") == "active" and str(insight.get("statement", "")).strip()
+            if uses_only_active_event_sources(insight, current_event_ids)
+            and str(insight.get("statement", "")).strip()
         )
         elapsed_ms = int((perf_counter() - started) * 1000)
         memory_hit_ids = [hit.id for hit in merged_memory_hits]
@@ -835,11 +838,30 @@ class MemoryManager:
         }
 
     def _build_high_level_packet(self) -> dict:
+        events = self.semantic_event_store.load_all()
+        current_event_ids = active_event_ids(events)
+        user_model = self.user_model_store.load()
+        user_model = {
+            **user_model,
+            "insights": [
+                insight
+                for insight in user_model.get("insights", [])
+                if isinstance(insight, dict) and uses_only_active_event_sources(insight, current_event_ids)
+            ],
+        }
         packet = {
-            "semantic_events": self.semantic_event_store.load_all()[-50:],
-            "event_summaries": self.event_summary_store.load_active()[-50:],
-            "archival_memory": self._read_jsonl_records(self.archival_file)[-50:],
-            "guga_user_model": self.user_model_store.load(),
+            "semantic_events": [event for event in events if event.get("id") in current_event_ids][-50:],
+            "event_summaries": [
+                item
+                for item in self.event_summary_store.load_active()
+                if uses_only_active_event_sources(item, current_event_ids)
+            ][-50:],
+            "archival_memory": [
+                item
+                for item in self._read_jsonl_records(self.archival_file)
+                if uses_only_active_event_sources(item, current_event_ids)
+            ][-50:],
+            "guga_user_model": user_model,
         }
         return self._trim_packet(packet)
 
@@ -866,14 +888,14 @@ class MemoryManager:
             include_guga_reflection=self.consolidation_config.include_guga_reflection,
         )
         changed_ids = set(outcome.created_event_ids + outcome.updated_event_ids + outcome.deactivated_event_ids)
-        changed_events = [event for event in self.semantic_event_store.load_all() if event.get("id") in changed_ids]
+        all_events = self.semantic_event_store.load_all()
+        current_event_ids = active_event_ids(all_events)
+        changed_events = [event for event in all_events if event.get("id") in changed_ids]
         updates += len(changed_ids)
         if self.rag_pipeline is not None:
             for payload in changed_events:
-                if payload.get("status") != "active":
-                    continue
                 try:
-                    self.rag_pipeline.add_memory_record(payload)
+                    self.rag_pipeline.add_memory_record(payload, active_event_ids=current_event_ids)
                 except Exception as exc:
                     self._debug(session_id, f"index_update status=semantic_event_failed reason={exc}")
         for item in result.get("event_summaries", []) or []:
@@ -891,9 +913,14 @@ class MemoryManager:
                 updates += 1
                 if self.rag_pipeline is not None:
                     try:
-                        self.rag_pipeline.add_memory_record(payload)
+                        self.rag_pipeline.add_memory_record(payload, active_event_ids=current_event_ids)
                     except Exception as exc:
                         self._debug(session_id, f"index_update status=event_summary_failed reason={exc}")
+        if self.rag_pipeline is not None:
+            try:
+                self.rag_pipeline.prune_invalid_memory_records(self.memory_root)
+            except Exception as exc:
+                self._debug(session_id, f"index_update status=prune_failed reason={exc}")
         return {"low_level_updates": updates}
 
     def _event_operations_with_references(
@@ -957,7 +984,10 @@ class MemoryManager:
                 updates += 1
                 if self.rag_pipeline is not None:
                     try:
-                        self.rag_pipeline.add_memory_record(payload)
+                        self.rag_pipeline.add_memory_record(
+                            payload,
+                            active_event_ids=active_event_ids(self.semantic_event_store.load_all()),
+                        )
                     except Exception as exc:
                         self._debug(session_id, f"index_update status=archival_failed reason={exc}")
         if self.consolidation_config.enable_user_model_updates:
@@ -1039,6 +1069,11 @@ class MemoryManager:
             memory_hits, _ = self.rag_pipeline.retrieve(query, memory_top_k=8, document_top_k=0)
         except Exception:
             return []
+        valid_source_ids = {
+            str(record.get("id", ""))
+            for record in self._load_archival_records()
+            if str(record.get("id", ""))
+        }
         return [
             {
                 "id": str(hit.source_id),
@@ -1049,6 +1084,7 @@ class MemoryManager:
                 "semantic_score": float(hit.score),
             }
             for hit in memory_hits
+            if str(hit.source_id) in valid_source_ids
         ]
 
     def _trim_packet(self, packet: dict) -> dict:
@@ -1206,6 +1242,10 @@ class MemoryManager:
                 session_id,
                 f"index_update memory_chunks={result['memory_chunks']} document_chunks={result['document_chunks']} total_chunks={result['total_chunks']}",
             )
+        else:
+            removed = self.rag_pipeline.prune_invalid_memory_records(self.memory_root)
+            if removed:
+                self._debug(session_id, f"index_prune removed_chunks={removed}")
         self._semantic_ready = True
 
     def _merge_memory_hits(
@@ -1476,6 +1516,7 @@ class MemoryManager:
     def _load_archival_records(self) -> list[dict]:
         """Load and normalize active archival memory records from JSONL file."""
         records: list[dict] = []
+        current_event_ids = active_event_ids(self.semantic_event_store.load_all())
         for path in (self.archival_file, self.event_summary_store.file_path, self.session_memory_file, self.semantic_event_file):
             if not path.exists():
                 continue
@@ -1486,6 +1527,8 @@ class MemoryManager:
                 try:
                     payload = json.loads(line)
                 except json.JSONDecodeError:
+                    continue
+                if not uses_only_active_event_sources(payload, current_event_ids):
                     continue
                 normalized = self._normalize_archival_record(payload)
                 if normalized and normalized["status"] == "active":

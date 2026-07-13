@@ -64,6 +64,23 @@ class VectorStore:
         self.vectors.extend(vectors)
         self._rebuild_index()
 
+    def prune_memory_sources(self, valid_source_ids: set[str]) -> int:
+        kept_chunks: list[DocumentChunk] = []
+        kept_vectors: list[list[float]] = []
+        removed = 0
+        for chunk, vector in zip(self.chunks, self.vectors):
+            if chunk.source_type == "memory" and chunk.source_id not in valid_source_ids:
+                removed += 1
+                continue
+            kept_chunks.append(chunk)
+            kept_vectors.append(vector)
+        if removed:
+            self.chunks = kept_chunks
+            self.vectors = kept_vectors
+            self.dim = len(kept_vectors[0]) if kept_vectors else 0
+            self._rebuild_index()
+        return removed
+
     def _rebuild_index(self) -> None:
         self._index = None
         self._typed_indexes = {}

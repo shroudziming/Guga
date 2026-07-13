@@ -131,6 +131,32 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertEqual(rag.rebuild_calls, 1)
         self.assertTrue(self.manager._semantic_ready)
 
+    def test_compatible_persisted_index_prunes_invalid_memory_sources(self) -> None:
+        class StoreStub:
+            def has_persisted_index(self) -> bool:
+                return True
+
+        class RagStub:
+            def __init__(self) -> None:
+                self.store = StoreStub()
+                self.prune_calls = 0
+
+            def ensure_loaded(self) -> None:
+                return None
+
+            def prune_invalid_memory_records(self, memory_root) -> int:
+                _ = memory_root
+                self.prune_calls += 1
+                return 2
+
+        rag = RagStub()
+        self.manager.rag_pipeline = rag
+
+        self.manager._ensure_semantic_index("sess_prune")
+
+        self.assertEqual(rag.prune_calls, 1)
+        self.assertTrue(self.manager._semantic_ready)
+
     def test_semantic_retrieval_failure_is_not_silently_ignored(self) -> None:
         class RagStub:
             def retrieve(self, **kwargs):
@@ -194,6 +220,42 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertIn("mem_new", prompt)
         self.assertIn("src=sess_new/msg_new", prompt)
 
+    def test_prepare_context_excludes_user_model_backed_by_inactive_event(self) -> None:
+        (self.memory_root / "semantic_events.jsonl").write_text(
+            json.dumps(
+                {
+                    "id": "evt_cancelled",
+                    "type": "semantic_event",
+                    "description": "用户周日看牙。",
+                    "status": "inactive",
+                    "inactive_reason": "cancelled",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        (self.memory_root / "guga_user_model.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "updated_at": "2026-07-13T00:00:00+08:00",
+                    "insights": [
+                        {
+                            "id": "gum_cancelled",
+                            "statement": "用户正在安排看牙。",
+                            "source_event_ids": ["evt_cancelled"],
+                            "status": "active",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        context = self.manager.prepare_context("最近有什么安排", "sess_current")
+
+        self.assertEqual(context.user_portrait, "")
+
     def test_compose_prompt_explicitly_handles_no_hit(self) -> None:
         context = self.manager.prepare_context("完全不相关问题", session_id="sess_none")
         prompt = self.manager.compose_system_prompt("你是一个助手", context)
@@ -215,8 +277,16 @@ class MemoryManagerTest(unittest.TestCase):
 
     def test_history_prompt_renders_summary_and_source_messages(self) -> None:
         session_id = "sess_history"
-        user_id = self.manager.record_user_message(session_id, "我之前问你推荐过一部悬疑网剧。")
-        assistant_id = self.manager.record_assistant_message(session_id, "我推荐过《隐秘的角落》。")
+        user_id = self.manager.record_user_message(
+            session_id,
+            "我之前问你推荐过一部悬疑网剧。",
+            created_at="2026-07-12T09:00:00+08:00",
+        )
+        assistant_id = self.manager.record_assistant_message(
+            session_id,
+            "我推荐过《隐秘的角落》。",
+            created_at="2026-07-12T09:01:00+08:00",
+        )
         event = {
             "id": "evt_daily_20260628",
             "type": "event_summary",
@@ -250,6 +320,22 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertNotIn("[Historical Conversation Context]", prompt)
 
     def test_profile_prompt_renders_portrait_without_event_summary(self) -> None:
+        (self.memory_root / "semantic_events.jsonl").write_text(
+            json.dumps(
+                {
+                    "id": "evt_identity",
+                    "type": "semantic_event",
+                    "event_kind": "state_change",
+                    "subject": "user",
+                    "entity": "identity",
+                    "description": "用户自称叔本明。",
+                    "status": "active",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         (self.memory_root / "guga_user_model.json").write_text(
             json.dumps(
                 {

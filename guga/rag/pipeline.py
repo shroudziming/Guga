@@ -4,6 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
+from guga.memory_source_validity import active_event_ids, uses_only_active_event_sources
 from guga.rag.chunker import chunk_text
 from guga.rag.embedder import BaseEmbedder, build_embedder
 from guga.rag.faiss_store import VectorStore
@@ -93,19 +94,25 @@ class RagPipeline:
             "total_chunks": len(all_chunks),
         }
 
-    def add_memory_record(self, payload: dict) -> None:
+    def add_memory_record(self, payload: dict, active_event_ids: set[str] | None = None) -> None:
         """Incrementally append one new memory record into vector index."""
         self.ensure_loaded()
-        chunks = self._memory_chunks_from_payload(payload)
-        if not chunks:
-            return
-        vectors = self.embedder.encode([chunk.text for chunk in chunks])
         source_id = str(payload.get("id", ""))
+        chunks = self._memory_chunks_from_payload(payload, active_event_ids=active_event_ids)
+        vectors = self.embedder.encode([chunk.text for chunk in chunks]) if chunks else []
         if source_id:
             self.store.replace_by_source_id(source_id, chunks, vectors)
-        else:
+        elif chunks:
             self.store.add(chunks, vectors)
         self.store.save()
+
+    def prune_invalid_memory_records(self, memory_root: Path) -> int:
+        self.ensure_loaded()
+        valid_source_ids = {chunk.source_id for chunk in self._collect_memory_chunks(memory_root)}
+        removed = self.store.prune_memory_sources(valid_source_ids)
+        if removed:
+            self.store.save()
+        return removed
 
     def retrieve(self, query: str, memory_top_k: int, document_top_k: int) -> tuple[list[RetrievalHit], list[RetrievalHit]]:
         """Retrieve semantic hits for memory and documents with one query.
@@ -151,6 +158,9 @@ class RagPipeline:
     def _collect_memory_chunks(self, memory_root: Path) -> list[DocumentChunk]:
         """Collect chunked memory texts from archival and session user messages."""
         chunks: list[DocumentChunk] = []
+        semantic_event_file = memory_root / "semantic_events.jsonl"
+        event_rows = self._read_jsonl_payloads(semantic_event_file)
+        current_event_ids = active_event_ids(event_rows)
         session_memory_file = memory_root / "session_memories.jsonl"
         for jsonl_file in (
             memory_root / "archival_memory.jsonl",
@@ -159,15 +169,8 @@ class RagPipeline:
             memory_root / "semantic_events.jsonl",
         ):
             if jsonl_file.exists():
-                for line in jsonl_file.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    chunks.extend(self._memory_chunks_from_payload(payload))
+                for payload in self._read_jsonl_payloads(jsonl_file):
+                    chunks.extend(self._memory_chunks_from_payload(payload, active_event_ids=current_event_ids))
 
         if session_memory_file.exists():
             return chunks
@@ -199,7 +202,11 @@ class RagPipeline:
 
         return chunks
 
-    def _memory_chunks_from_payload(self, payload: dict) -> list[DocumentChunk]:
+    def _memory_chunks_from_payload(
+        self,
+        payload: dict,
+        active_event_ids: set[str] | None = None,
+    ) -> list[DocumentChunk]:
         """Convert one archival memory payload into chunk list (if active/valid)."""
         if payload.get("exclude_from_retrieval") is True:
             return []
@@ -208,6 +215,8 @@ class RagPipeline:
 
         status = str(payload.get("status", "active"))
         if status != "active":
+            return []
+        if active_event_ids is not None and not uses_only_active_event_sources(payload, active_event_ids):
             return []
 
         summary = str(payload.get("summary") or payload.get("raw_excerpt") or "").strip()
@@ -237,6 +246,22 @@ class RagPipeline:
                 "memory_strength": str(payload.get("memory_strength", "")),
             },
         )
+
+    def _read_jsonl_payloads(self, path: Path) -> list[dict]:
+        if not path.exists():
+            return []
+        rows: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                rows.append(payload)
+        return rows
 
     def _semantic_event_text(self, payload: dict) -> str:
         description = str(payload.get("description", "")).strip()

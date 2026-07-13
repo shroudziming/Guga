@@ -213,6 +213,65 @@ class MemoryConsolidationTest(unittest.TestCase):
             persisted = json.loads((Path(tmp) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(packet["semantic_events"][-1]["id"], persisted["id"])
 
+    def test_high_level_packet_excludes_inactive_events_and_stale_derived_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manager = MemoryManager(memory_root=root, enable_semantic=False)
+            active_id = manager.semantic_event_store.apply_operations(
+                operations=[
+                    {
+                        "operation": "create",
+                        "event_kind": "state_change",
+                        "subject": "user",
+                        "entity": "mortgage preapproval",
+                        "description": "用户当前的房贷预批额度为四十万美元。",
+                        "end_unknown": True,
+                    }
+                ],
+                session_id="sess_current",
+                include_guga_reflection=False,
+            ).created_event_ids[0]
+            cancelled_id = manager.semantic_event_store.apply_operations(
+                operations=[
+                    {
+                        "operation": "create",
+                        "event_kind": "appointment",
+                        "subject": "user",
+                        "entity": "dentist appointment",
+                        "description": "用户周日看牙。",
+                        "end_unknown": False,
+                    }
+                ],
+                session_id="sess_cancelled",
+                include_guga_reflection=False,
+            ).created_event_ids[0]
+            manager.semantic_event_store.apply_operations(
+                operations=[{"operation": "cancel", "target_event_id": cancelled_id}],
+                session_id="sess_cancelled",
+                include_guga_reflection=False,
+            )
+            (root / "archival_memory.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"id": "mem_current", "summary": "当前额度", "source_event_ids": [active_id], "status": "active"}),
+                        json.dumps({"id": "mem_cancelled", "summary": "周日看牙", "source_event_ids": [cancelled_id], "status": "active"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "event_summaries.jsonl").write_text(
+                json.dumps({"id": "summary_cancelled", "type": "event_summary", "summary": "周日看牙", "covered_event_ids": [cancelled_id], "deactivated_event_ids": [cancelled_id], "status": "active"})
+                + "\n",
+                encoding="utf-8",
+            )
+
+            packet = manager._build_high_level_packet()
+
+            self.assertEqual([event["id"] for event in packet["semantic_events"]], [active_id])
+            self.assertEqual([memory["id"] for memory in packet["archival_memory"]], ["mem_current"])
+            self.assertEqual(packet["event_summaries"], [])
+
     def test_low_level_packet_uses_rag_event_ids_without_keyword_expansion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
@@ -284,6 +343,51 @@ class MemoryConsolidationTest(unittest.TestCase):
             relevant_ids = {event["id"] for event in packet["relevant_active_events"]}
             self.assertIn(rag_selected, relevant_ids)
             self.assertNotIn(relevant, relevant_ids)
+
+    def test_consolidation_rag_context_rejects_inactive_source_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+            event_id = manager.semantic_event_store.apply_operations(
+                operations=[
+                    {
+                        "operation": "create",
+                        "event_kind": "appointment",
+                        "subject": "user",
+                        "entity": "dentist appointment",
+                        "description": "用户周日看牙。",
+                        "end_unknown": False,
+                    }
+                ],
+                session_id="sess_old",
+                include_guga_reflection=False,
+            ).created_event_ids[0]
+            manager.semantic_event_store.apply_operations(
+                operations=[{"operation": "cancel", "target_event_id": event_id}],
+                session_id="sess_old",
+                include_guga_reflection=False,
+            )
+
+            class RagStub:
+                def retrieve(self, query, memory_top_k, document_top_k):
+                    _ = query, memory_top_k, document_top_k
+                    return [
+                        type(
+                            "Hit",
+                            (),
+                            {
+                                "source_id": event_id,
+                                "source_type": "memory",
+                                "text": "用户周日看牙。",
+                                "source_session_id": "sess_old",
+                                "source_message_id": "",
+                                "score": 0.9,
+                            },
+                        )()
+                    ], []
+
+            manager.rag_pipeline = RagStub()
+
+            self.assertEqual(manager._consolidation_retrieved_context("看牙安排"), [])
 
     def test_high_level_noop_leaves_high_level_files_absent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

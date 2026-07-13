@@ -87,6 +87,113 @@ class RagPipelineTest(unittest.TestCase):
         chunks = chunk_text(text, chunk_size=4, chunk_overlap=2)
         self.assertEqual(chunks, ["abcd", "cdef", "efgh", "ghij", "ij"])
 
+    def test_rebuild_excludes_records_derived_from_inactive_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_root = root / "memory"
+            memory_root.mkdir()
+            (memory_root / "semantic_events.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"id": "evt_active", "type": "semantic_event", "description": "当前额度为四十万美元", "status": "active"}),
+                        json.dumps({"id": "evt_old", "type": "semantic_event", "description": "旧额度为三十五万美元", "status": "inactive", "inactive_reason": "replaced"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (memory_root / "event_summaries.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"id": "summary_current", "type": "event_summary", "summary": "当前额度", "covered_event_ids": ["evt_active"], "deactivated_event_ids": [], "status": "active"}),
+                        json.dumps({"id": "summary_old", "type": "event_summary", "summary": "旧额度", "covered_event_ids": ["evt_old"], "deactivated_event_ids": ["evt_old"], "status": "active"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (memory_root / "archival_memory.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"id": "mem_current", "summary": "当前额度", "source_event_ids": ["evt_active"], "status": "active"}),
+                        json.dumps({"id": "mem_old", "summary": "旧额度", "source_event_ids": ["evt_old"], "status": "active"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            pipeline = RagPipeline(
+                index_dir=root / "index",
+                documents_dir=root / "documents",
+                embedding_model="test-hashing",
+                chunk_size=64,
+                chunk_overlap=8,
+                embedder=HashingEmbedder(dim=64),
+            )
+
+            pipeline.rebuild_indexes(memory_root)
+
+            source_ids = {chunk.source_id for chunk in pipeline.store.chunks}
+            self.assertTrue({"evt_active", "summary_current", "mem_current"}.issubset(source_ids))
+            self.assertTrue({"evt_old", "summary_old", "mem_old"}.isdisjoint(source_ids))
+
+    def test_adding_inactive_payload_removes_existing_vector(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pipeline = RagPipeline(
+                index_dir=root / "index",
+                documents_dir=root / "documents",
+                embedding_model="test-hashing",
+                chunk_size=64,
+                chunk_overlap=8,
+                embedder=HashingEmbedder(dim=64),
+            )
+            active = {
+                "id": "evt_cancelled",
+                "type": "semantic_event",
+                "description": "用户周日看牙",
+                "status": "active",
+            }
+            pipeline.add_memory_record(active)
+            self.assertIn("evt_cancelled", {chunk.source_id for chunk in pipeline.store.chunks})
+
+            pipeline.add_memory_record({**active, "status": "inactive", "inactive_reason": "cancelled"})
+
+            self.assertNotIn("evt_cancelled", {chunk.source_id for chunk in pipeline.store.chunks})
+
+    def test_prune_removes_existing_derived_vectors_after_event_deactivation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            memory_root = root / "memory"
+            memory_root.mkdir()
+            event_path = memory_root / "semantic_events.jsonl"
+            event_path.write_text(
+                json.dumps({"id": "evt_old", "type": "semantic_event", "description": "旧安排", "status": "active"}) + "\n",
+                encoding="utf-8",
+            )
+            (memory_root / "archival_memory.jsonl").write_text(
+                json.dumps({"id": "mem_old", "summary": "旧安排", "source_event_ids": ["evt_old"], "status": "active"}) + "\n",
+                encoding="utf-8",
+            )
+            pipeline = RagPipeline(
+                index_dir=root / "index",
+                documents_dir=root / "documents",
+                embedding_model="test-hashing",
+                chunk_size=64,
+                chunk_overlap=8,
+                embedder=HashingEmbedder(dim=64),
+            )
+            pipeline.rebuild_indexes(memory_root)
+            self.assertTrue({"evt_old", "mem_old"}.issubset({chunk.source_id for chunk in pipeline.store.chunks}))
+            event_path.write_text(
+                json.dumps({"id": "evt_old", "type": "semantic_event", "description": "旧安排", "status": "inactive", "inactive_reason": "cancelled"}) + "\n",
+                encoding="utf-8",
+            )
+
+            pipeline.prune_invalid_memory_records(memory_root)
+
+            self.assertTrue({"evt_old", "mem_old"}.isdisjoint({chunk.source_id for chunk in pipeline.store.chunks}))
+
     def test_rebuild_and_retrieve_dual_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
