@@ -35,3 +35,26 @@ python -m unittest test_analyze_scores.py
 The current tool deliberately accepts only 128-dimensional indexes produced by
 the fallback `HashingEmbedder`. It fails explicitly for other dimensions instead
 of pretending to reproduce a Sentence Transformer index with a different model.
+
+## Compare Current Hashing With Controls
+
+`compare_retrievers.py` compares the persisted hashing scores against an
+isolated BM25 control and a per-source chunk cap. This does not change the
+production retriever.
+
+```powershell
+python tools\rag_diagnostics\compare_retrievers.py `
+  --index-dir data\benchmarks\longmemeval\runs\live_api_semantic_events_003\cases\852ce960\memory\rag\index `
+  --query "What was the amount I was pre-approved for when I got my mortgage from Wells Fargo?" `
+  --expect '$350,000' `
+  --expect '$400,000' `
+  --expect "The regulation does not purport" `
+  --top-k 10 `
+  --max-per-source 1
+```
+
+For this case, persisted hashing ranks the old `$350,000` evidence first, the
+new `$400,000` evidence third, and a GDPR chunk fourth. BM25 ranks the two
+mortgage passages first and second while moving that GDPR chunk below rank 400.
+BM25 still needs lifecycle/time resolution to choose the later `$400,000`
+statement over the earlier `$350,000` statement.
