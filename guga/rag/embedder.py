@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from math import sqrt
 from typing import Protocol
@@ -54,14 +55,18 @@ class SentenceTransformerEmbedder:
         self._model = None
 
     def encode(self, texts: list[str]) -> list[list[float]]:
-        model = self._load_model()
-        vectors = model.encode(texts, normalize_embeddings=True)
+        try:
+            model = self._load_model()
+            vectors = model.encode(texts, normalize_embeddings=True)
+        except Exception as exc:
+            raise RuntimeError(f"failed to load or run embedding model {self.model_name}: {exc}") from exc
         return [list(map(float, row)) for row in vectors]
 
     def _load_model(self):
         if self._model is not None:
             return self._model
 
+        os.environ.setdefault("USE_TF", "0")
         from sentence_transformers import SentenceTransformer
 
         self._model = SentenceTransformer(self.model_name)
@@ -69,9 +74,4 @@ class SentenceTransformerEmbedder:
 
 
 def build_embedder(model_name: str) -> BaseEmbedder:
-    try:
-        import sentence_transformers  # noqa: F401
-
-        return SentenceTransformerEmbedder(model_name=model_name)
-    except Exception:
-        return HashingEmbedder()
+    return SentenceTransformerEmbedder(model_name=model_name)

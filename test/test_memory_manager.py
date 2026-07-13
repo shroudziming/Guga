@@ -8,6 +8,7 @@ from pathlib import Path
 
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
+from guga.rag.faiss_store import IncompatibleIndexError
 from guga.rag.schemas import RetrievalHit
 from guga.types import DocumentHit, MemoryContext, MemoryHit
 
@@ -104,6 +105,43 @@ class MemoryManagerTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_incompatible_persisted_index_is_rebuilt(self) -> None:
+        class StoreStub:
+            def has_persisted_index(self) -> bool:
+                return True
+
+        class RagStub:
+            def __init__(self) -> None:
+                self.store = StoreStub()
+                self.rebuild_calls = 0
+
+            def ensure_loaded(self) -> None:
+                raise IncompatibleIndexError("old embedding model")
+
+            def rebuild_indexes(self, memory_root):
+                self.rebuild_calls += 1
+                return {"memory_chunks": 1, "document_chunks": 0, "total_chunks": 1}
+
+        rag = RagStub()
+        self.manager.rag_pipeline = rag
+
+        self.manager._ensure_semantic_index("sess_rebuild")
+
+        self.assertEqual(rag.rebuild_calls, 1)
+        self.assertTrue(self.manager._semantic_ready)
+
+    def test_semantic_retrieval_failure_is_not_silently_ignored(self) -> None:
+        class RagStub:
+            def retrieve(self, **kwargs):
+                _ = kwargs
+                raise RuntimeError("BGE-M3 unavailable")
+
+        self.manager.rag_pipeline = RagStub()
+        self.manager._semantic_ready = True
+
+        with self.assertRaisesRegex(RuntimeError, "BGE-M3 unavailable"):
+            self.manager._retrieve_semantic("query", "sess_failure")
 
     def test_prepare_context_returns_provenance_hits(self) -> None:
         archival = self.memory_root / "archival_memory.jsonl"

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import builtins
+import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from guga.config import DEFAULT_RAG_EMBEDDING_MODEL
 from guga.rag.chunker import chunk_text
-from guga.rag.embedder import HashingEmbedder
-from guga.rag.faiss_store import VectorStore
+from guga.rag.embedder import HashingEmbedder, SentenceTransformerEmbedder, build_embedder
+from guga.rag.faiss_store import IncompatibleIndexError, VectorStore
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import DocumentChunk
 
@@ -37,6 +41,47 @@ class FakeFaiss:
 
 
 class RagPipelineTest(unittest.TestCase):
+    def test_production_embedding_model_is_bge_m3(self) -> None:
+        self.assertEqual(DEFAULT_RAG_EMBEDDING_MODEL, "BAAI/bge-m3")
+
+    def test_sentence_transformer_failure_does_not_fall_back_to_hashing(self) -> None:
+        embedder = build_embedder("BAAI/bge-m3")
+        self.assertIsInstance(embedder, SentenceTransformerEmbedder)
+
+        with patch.object(embedder, "_load_model", side_effect=OSError("model unavailable")):
+            with self.assertRaisesRegex(RuntimeError, "BAAI/bge-m3"):
+                embedder.encode(["query"])
+
+    def test_vector_store_requires_faiss(self) -> None:
+        original_import = builtins.__import__
+
+        def rejecting_import(name, *args, **kwargs):
+            if name == "faiss":
+                raise ImportError("faiss unavailable")
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=rejecting_import):
+            with self.assertRaisesRegex(RuntimeError, "FAISS"):
+                VectorStore(Path("unused"), embedding_model="BAAI/bge-m3")
+
+    def test_persisted_index_rejects_different_embedding_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_dir = Path(tmp)
+            (index_dir / "chunks.jsonl").write_text(
+                json.dumps(DocumentChunk(id="memory:m1:c0", text="x", source_type="memory", source_id="m1").to_dict())
+                + "\n",
+                encoding="utf-8",
+            )
+            (index_dir / "vectors.json").write_text("[[1.0, 0.0]]", encoding="utf-8")
+            (index_dir / "index_meta.json").write_text(
+                json.dumps({"schema_version": 1, "embedding_model": "old/model", "dimension": 2}),
+                encoding="utf-8",
+            )
+
+            store = VectorStore(index_dir, embedding_model="BAAI/bge-m3")
+            with self.assertRaisesRegex(IncompatibleIndexError, "old/model"):
+                store.load()
+
     def test_chunk_text_with_overlap(self) -> None:
         text = "abcdefghij"
         chunks = chunk_text(text, chunk_size=4, chunk_overlap=2)

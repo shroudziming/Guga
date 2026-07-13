@@ -47,7 +47,7 @@ class RagPipeline:
         self.chunk_overlap = chunk_overlap
         self.debug_hook = debug_hook
         self.embedder = embedder or build_embedder(embedding_model)
-        self.store = VectorStore(index_dir)
+        self.store = VectorStore(index_dir, embedding_model=embedding_model)
         self._loaded = False
 
     def ensure_loaded(self) -> None:

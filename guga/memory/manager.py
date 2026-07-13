@@ -34,6 +34,7 @@ from guga.memory.semantic_events import SemanticEventStore
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso, parse_datetime
 from guga.memory.user_model import GugaUserModelStore
+from guga.rag.faiss_store import IncompatibleIndexError
 from guga.rag.pipeline import RagPipeline
 from guga.rag.schemas import RetrievalHit
 from guga.types import DocumentHit, MemoryContext, MemoryHit
@@ -1181,14 +1182,24 @@ class MemoryManager:
             )
         except Exception as exc:
             self._debug(session_id, f"retrieve_semantic_failed reason={exc}")
-            return [], []
+            raise RuntimeError(f"semantic retrieval failed: {exc}") from exc
 
     def _ensure_semantic_index(self, session_id: str) -> None:
         """Ensure semantic index is loaded; build it once if persisted data is absent."""
         if self.rag_pipeline is None or self._semantic_ready:
             return
 
-        self.rag_pipeline.ensure_loaded()
+        try:
+            self.rag_pipeline.ensure_loaded()
+        except IncompatibleIndexError as exc:
+            self._debug(session_id, f"index_rebuild reason={exc}")
+            result = self.rag_pipeline.rebuild_indexes(memory_root=self.memory_root)
+            self._debug(
+                session_id,
+                f"index_update memory_chunks={result['memory_chunks']} document_chunks={result['document_chunks']} total_chunks={result['total_chunks']}",
+            )
+            self._semantic_ready = True
+            return
         if not self.rag_pipeline.store.has_persisted_index():
             result = self.rag_pipeline.rebuild_indexes(memory_root=self.memory_root)
             self._debug(
