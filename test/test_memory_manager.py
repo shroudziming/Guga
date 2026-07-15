@@ -543,6 +543,28 @@ class MemoryManagerTest(unittest.TestCase):
             {"semantic_event", "episodic", "event_summary", "conversation_turn"},
         )
 
+    def test_context_selection_keeps_three_hits_per_memory_layer(self) -> None:
+        self.manager.top_k = 3
+        memory_types = ("semantic_event", "episodic", "event_summary", "conversation_turn")
+        hits = [
+            MemoryHit(
+                id=f"{memory_type}_{index}",
+                summary=f"{memory_type} {index}",
+                score=1.0 - (index * 0.01),
+                memory_type=memory_type,
+            )
+            for memory_type in memory_types
+            for index in range(4)
+        ]
+
+        selected = self.manager._filter_memory_hits(hits)
+
+        self.assertEqual(len(selected), 12)
+        for memory_type in memory_types:
+            layer_hits = [hit for hit in selected if hit.memory_type == memory_type]
+            self.assertEqual(len(layer_hits), 3)
+            self.assertEqual([hit.id for hit in layer_hits], [f"{memory_type}_{index}" for index in range(3)])
+
     def test_finalize_turn_writes_archival_and_session_schema(self) -> None:
         session_id = "sess_schema"
         self.manager.record_user_message(session_id, "我叫小明，我在深圳工作")

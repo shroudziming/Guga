@@ -121,7 +121,7 @@ class MemoryManager:
             model: Reserved for future use (kept for API compatibility).
             debug: Whether to emit debug traces.
             debug_sink: Optional debug output sink callback.
-            top_k: Max memory hits returned to prompt context.
+            top_k: Max memory hits retained per prompt memory layer.
             document_top_k: Max document hits returned to prompt context.
             enable_semantic: Whether to enable vector-based retrieval pipeline.
             documents_dir: Root directory for document retrieval.
@@ -1384,25 +1384,24 @@ class MemoryManager:
         if historical:
             selected: list[MemoryHit] = []
             selected_ids: set[str] = set()
+            layer_counts: dict[str, int] = {}
             for memory_type in ("semantic_event", "episodic", "event_summary", "conversation_turn"):
-                candidate = next((hit for hit in historical if hit.memory_type == memory_type), None)
-                if candidate is not None:
-                    selected.append(candidate)
-                    selected_ids.add(candidate.id)
-                if len(selected) >= self.top_k:
-                    return selected
-            for hit in historical:
-                if hit.id in selected_ids:
-                    continue
-                selected.append(hit)
-                selected_ids.add(hit.id)
-                if len(selected) >= self.top_k:
-                    break
+                layer_count = 0
+                for hit in historical:
+                    if hit.memory_type != memory_type or hit.id in selected_ids:
+                        continue
+                    selected.append(hit)
+                    selected_ids.add(hit.id)
+                    layer_count += 1
+                    if layer_count >= self.top_k:
+                        break
+                layer_counts[memory_type] = layer_count
             for hit in current_hits:
-                if hit.id in selected_ids or len(selected) >= self.top_k:
+                if hit.id in selected_ids or layer_counts.get(hit.memory_type, 0) >= self.top_k:
                     continue
                 selected.append(hit)
                 selected_ids.add(hit.id)
+                layer_counts[hit.memory_type] = layer_counts.get(hit.memory_type, 0) + 1
             return selected
         fallback_current = current_hits or [hit for hit in hits if hit.is_current_turn]
         return fallback_current[:1]
