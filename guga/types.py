@@ -17,6 +17,7 @@ class Persona:
     reflection_context: str = ""
     source_path: str = ""
     persona_fingerprint: str = ""
+    expression_tags: tuple[str, ...] = ()
 
 
 @dataclass
