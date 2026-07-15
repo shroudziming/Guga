@@ -436,6 +436,84 @@ class VoiceToolModeTest(unittest.TestCase):
 
 
 class VoiceChatRunnerTest(unittest.TestCase):
+    def test_cancel_after_worker_check_cannot_publish_audio_or_pollute_reuse(self) -> None:
+        class ReusableSession:
+            def __init__(self) -> None:
+                self.turns = iter((["第一轮。"], ["第二轮。"], ["第三轮。"]))
+
+            def reply_stream(
+                self,
+                user_input: str,
+                cancel_event: threading.Event | None = None,
+            ) -> Iterator[str]:
+                _ = user_input, cancel_event
+                yield from next(self.turns)
+
+        class PublishBarrierMetrics(VoiceMetrics):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first_publish_started = threading.Event()
+                self.release_first_publish = threading.Event()
+                self._tts_finished_calls = 0
+
+            def tts_finished(
+                self,
+                sequence_id: int,
+                text: str,
+                elapsed_seconds: float,
+                audio_seconds: float,
+            ) -> None:
+                self._tts_finished_calls += 1
+                if self._tts_finished_calls == 1:
+                    self.first_publish_started.set()
+                    self.release_first_publish.wait(timeout=2.0)
+                super().tts_finished(sequence_id, text, elapsed_seconds, audio_seconds)
+
+        cancel_event = threading.Event()
+        metrics = PublishBarrierMetrics()
+        player = FakeAudioPlayer()
+        runner = VoiceChatRunner(
+            session=ReusableSession(),
+            tts_client=FakeTtsClient(),
+            audio_player=player,
+            text_sink=lambda chunk: None,
+            metrics=metrics,
+        )
+        first_result: list[object] = []
+
+        def run_cancelled_turn() -> None:
+            try:
+                first_result.append(runner.run_turn("first", cancel_event=cancel_event))
+            except BaseException as exc:
+                first_result.append(exc)
+
+        first_thread = threading.Thread(target=run_cancelled_turn, daemon=True)
+        first_thread.start()
+        self.assertTrue(metrics.first_publish_started.wait(timeout=0.5))
+        cancel_event.set()
+        try:
+            player.cancelled.wait(timeout=0.2)
+            metrics.release_first_publish.set()
+            first_thread.join(timeout=0.5)
+            self.assertFalse(first_thread.is_alive(), "cancelled turn did not finish after publish barrier released")
+            self.assertEqual(len(first_result), 1)
+            self.assertFalse(isinstance(first_result[0], BaseException))
+            self.assertTrue(player.cancelled.wait(timeout=0.5))
+            self.assertEqual(player.items, [])
+
+            second_summary = runner.run_turn("second")
+            third_summary = runner.run_turn("third")
+
+            self.assertEqual(second_summary.sentences, 1)
+            self.assertEqual(third_summary.sentences, 1)
+            self.assertEqual(
+                player.items,
+                ["audio:第二轮。".encode("utf-8"), "audio:第三轮。".encode("utf-8")],
+            )
+        finally:
+            metrics.release_first_publish.set()
+            first_thread.join(timeout=2.0)
+
     def test_cancel_does_not_wait_for_blocked_tts_and_late_worker_cannot_pollute_reuse(self) -> None:
         class ReusableSession:
             def __init__(self) -> None:

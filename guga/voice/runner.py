@@ -80,9 +80,18 @@ class VoiceChatRunner:
         tts_queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=self.max_queue_size)
         errors: list[BaseException] = []
         worker_done = threading.Event()
+        publish_gate = threading.Lock()
+        publish_closed = threading.Event()
         worker = threading.Thread(
             target=self._tts_worker,
-            args=(cancel_event, tts_queue, errors, worker_done),
+            args=(
+                cancel_event,
+                tts_queue,
+                errors,
+                worker_done,
+                publish_gate,
+                publish_closed,
+            ),
             name="guga-tts-worker",
             daemon=True,
         )
@@ -140,7 +149,14 @@ class VoiceChatRunner:
             cancel_event.set()
             raise
         finally:
-            self._finish_tts_turn(cancel_event, tts_queue, worker, worker_done)
+            self._finish_tts_turn(
+                cancel_event,
+                tts_queue,
+                worker,
+                worker_done,
+                publish_gate,
+                publish_closed,
+            )
             self.metrics.turn_finished()
 
         if errors and self.raise_tts_errors:
@@ -171,6 +187,8 @@ class VoiceChatRunner:
         tts_queue: queue.Queue[_TtsJob | None],
         errors: list[BaseException],
         worker_done: threading.Event,
+        publish_gate: threading.Lock,
+        publish_closed: threading.Event,
     ) -> None:
         try:
             while True:
@@ -184,17 +202,20 @@ class VoiceChatRunner:
                     started = time.perf_counter()
                     audio = self.tts_client.synthesize(job.text)
                     elapsed = time.perf_counter() - started
-                    if cancel_event.is_set():
-                        continue
-                    self.metrics.tts_finished(
-                        sequence_id=job.sequence_id,
-                        text=job.text,
-                        elapsed_seconds=elapsed,
-                        audio_seconds=audio.duration_seconds,
-                    )
-                    self._debug_voice_playback_start(job)
-                    self.audio_player.enqueue(audio)
-                    self.metrics.audio_enqueued(job.sequence_id)
+                    with publish_gate:
+                        if publish_closed.is_set() or cancel_event.is_set():
+                            continue
+                        self.metrics.tts_finished(
+                            sequence_id=job.sequence_id,
+                            text=job.text,
+                            elapsed_seconds=elapsed,
+                            audio_seconds=audio.duration_seconds,
+                        )
+                        if publish_closed.is_set() or cancel_event.is_set():
+                            continue
+                        self._debug_voice_playback_start(job)
+                        self.audio_player.enqueue(audio)
+                        self.metrics.audio_enqueued(job.sequence_id)
                 except BaseException as exc:
                     if not cancel_event.is_set():
                         errors.append(exc)
@@ -210,9 +231,16 @@ class VoiceChatRunner:
         tts_queue: queue.Queue[_TtsJob | None],
         worker: threading.Thread,
         worker_done: threading.Event,
+        publish_gate: threading.Lock,
+        publish_closed: threading.Event,
     ) -> None:
         if cancel_event.is_set():
-            self._cancel_tts_turn(tts_queue)
+            self._cancel_tts_turn(
+                cancel_event,
+                tts_queue,
+                publish_gate,
+                publish_closed,
+            )
             return
 
         while not cancel_event.is_set():
@@ -222,25 +250,47 @@ class VoiceChatRunner:
             except queue.Full:
                 continue
         if cancel_event.is_set():
-            self._cancel_tts_turn(tts_queue)
+            self._cancel_tts_turn(
+                cancel_event,
+                tts_queue,
+                publish_gate,
+                publish_closed,
+            )
             return
 
         while not worker_done.wait(timeout=0.05):
             if cancel_event.is_set():
-                self._cancel_tts_turn(tts_queue)
+                self._cancel_tts_turn(
+                    cancel_event,
+                    tts_queue,
+                    publish_gate,
+                    publish_closed,
+                )
                 return
 
         tts_queue.join()
         worker.join()
         if cancel_event.is_set():
-            self.audio_player.stop(clear=True)
+            with publish_gate:
+                cancel_event.set()
+                publish_closed.set()
+                self.audio_player.stop(clear=True)
             return
         self.audio_player.join()
         self.audio_player.stop(clear=False)
 
-    def _cancel_tts_turn(self, tts_queue: queue.Queue[_TtsJob | None]) -> None:
+    def _cancel_tts_turn(
+        self,
+        cancel_event: threading.Event,
+        tts_queue: queue.Queue[_TtsJob | None],
+        publish_gate: threading.Lock,
+        publish_closed: threading.Event,
+    ) -> None:
         try:
-            self.audio_player.stop(clear=True)
+            with publish_gate:
+                cancel_event.set()
+                publish_closed.set()
+                self.audio_player.stop(clear=True)
         finally:
             while True:
                 try:
