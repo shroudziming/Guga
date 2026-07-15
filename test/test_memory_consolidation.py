@@ -629,6 +629,43 @@ class MemoryConsolidationTest(unittest.TestCase):
         self.assertEqual(model.calls, 2)
         self.assertEqual(summarizer.last_structured_attempts[0]["error_type"], "schema")
 
+    def test_create_discards_model_supplied_target_event_id(self) -> None:
+        class CreateModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return json.dumps(
+                    {
+                        "semantic_event_operations": [
+                            {
+                                "operation": "create",
+                                "target_event_id": "evt_model_invented",
+                                "event_kind": "task",
+                                "subject": "user",
+                                "entity": "project report",
+                                "description": "The user will submit the project report.",
+                                "time_expression": "tomorrow",
+                                "start_at": "2026-07-16T00:00:00+08:00",
+                                "end_at": "2026-07-16T00:00:00+08:00",
+                                "end_unknown": False,
+                                "source_message_ids": [],
+                                "confidence": 0.9,
+                            }
+                        ],
+                        "event_summaries": [],
+                    }
+                )
+
+        summarizer = MemoryBankSummarizer(model=CreateModel(), use_llm=True, retry_delays=())
+
+        result = summarizer.consolidate_low_level_memory(
+            {"new_turns": [], "recent_active_events": [], "relevant_active_events": []},
+            include_guga_reflection=False,
+        )
+
+        operation = result["semantic_event_operations"][0]
+        self.assertEqual(operation["operation"], "create")
+        self.assertNotIn("target_event_id", operation)
+
 
 if __name__ == "__main__":
     unittest.main()

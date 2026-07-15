@@ -202,7 +202,7 @@ class MemoryBankSummarizer:
             "Output schema:\n"
             "{"
             "\"semantic_event_operations\": [{\"operation\": \"create|update|replace|cancel|ignore\", "
-            "\"target_event_id\": string, \"event_kind\": string, \"subject\": \"user\", \"entity\": string, "
+            "\"event_kind\": string, \"subject\": \"user\", \"entity\": string, "
             "\"description\": string, \"time_expression\": string, \"start_at\": string|null, "
             "\"end_at\": string|null, \"end_unknown\": boolean, "
             "\"source_message_ids\": [string], \"confidence\": number, "
@@ -221,6 +221,7 @@ class MemoryBankSummarizer:
             "- If the event is completed within one day and no end time is stated, set end_at equal to start_at and end_unknown=false.\n"
             "- If the event normally spans multiple days but its end is not known, set end_at=null and end_unknown=true.\n"
             "- If the start time cannot be determined, set start_at=null, end_at=null, and end_unknown=true.\n"
+            "- For create, omit target_event_id. The application assigns the new event id.\n"
             "- For update/replace/cancel, target_event_id must be one of the supplied conflict candidates.\n"
             "- At most 1 event_summary. Keep it compact and factual; summarize the batch in no more than 80 words.\n"
             "- guga_reflection is a role-specific interpretation, never factual evidence.\n"
@@ -421,10 +422,7 @@ class MemoryBankSummarizer:
             if action in {"create", "update", "replace"} and str(operation.get("subject", "user")) != "user":
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].subject must be user")
             if action == "create":
-                if str(operation.get("target_event_id", "")).strip():
-                    raise SummaryGenerationError(
-                        f"semantic_event_operations[{index}].target_event_id is forbidden for create"
-                    )
+                operation.pop("target_event_id", None)
                 for field in ("event_kind", "entity", "description"):
                     if not str(operation.get(field, "")).strip():
                         raise SummaryGenerationError(f"semantic_event_operations[{index}].{field} is required")
