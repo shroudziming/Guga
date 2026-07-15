@@ -29,7 +29,17 @@ class AgentMemoryIsolationTest(unittest.TestCase):
             with self.subTest(persona=persona_name):
                 payload = json.loads((personas_dir() / f"{persona_name}.json").read_text(encoding="utf-8"))
                 self.assertEqual(payload["agent_id"], persona_name)
-                self.assertTrue(str(payload["reflection_context"]).strip())
+                if persona_name == "default":
+                    self.assertTrue(str(payload["skill_path"]).strip())
+                else:
+                    self.assertTrue(str(payload["reflection_context"]).strip())
+
+    def test_default_persona_config_uses_repository_skill(self) -> None:
+        payload = json.loads((personas_dir() / "default.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["skill_path"], "default/SKILL.md")
+        persona = PersonaManager(personas_dir()).load("default")
+        self.assertEqual(persona.system_prompt, persona.reflection_context)
+        self.assertIn("## Reflection 写作协议", persona.system_prompt)
 
     def test_agent_identity_rejects_unsafe_agent_ids(self) -> None:
         for bad_agent_id in ("", "../escape", "two words", "semi;colon", "slash/name"):
@@ -55,7 +65,10 @@ class AgentMemoryIsolationTest(unittest.TestCase):
                     persona = persona_manager.load(persona_name)
                     self.assertTrue(persona.agent_id)
                     self.assertTrue(persona.reflection_context)
-                    self.assertNotEqual(persona.reflection_context, persona.system_prompt)
+                    if persona_name == "default":
+                        self.assertEqual(persona.reflection_context, persona.system_prompt)
+                    else:
+                        self.assertNotEqual(persona.reflection_context, persona.system_prompt)
 
                     identity = AgentIdentity(
                         agent_id=persona.agent_id,
@@ -80,13 +93,17 @@ class AgentMemoryIsolationTest(unittest.TestCase):
                     self.assertTrue(any(debug_root.glob("*.log")))
 
                     manifest = json.loads((expected_root / "agent_manifest.json").read_text(encoding="utf-8"))
-                    self.assertEqual(
-                        set(manifest),
-                        {"schema_version", "agent_id", "persona_source", "persona_fingerprint", "created_at"},
-                    )
+                    self.assertEqual(set(manifest), {"schema_version", "agent_id", "created_at"})
+                    self.assertEqual(manifest["schema_version"], 2)
                     self.assertEqual(manifest["agent_id"], identity.agent_id)
-                    self.assertEqual(manifest["persona_source"], identity.persona_source)
-                    self.assertEqual(manifest["persona_fingerprint"], identity.persona_fingerprint)
+
+                    revisions = [
+                        json.loads(line)
+                        for line in (expected_root / "persona_revisions.jsonl")
+                        .read_text(encoding="utf-8")
+                        .splitlines()
+                    ]
+                    self.assertEqual([row["fingerprint"] for row in revisions], [identity.persona_fingerprint])
 
             self.assertEqual(len(session_dirs), 3)
             self.assertEqual(len(rag_dirs), 3)
@@ -142,6 +159,93 @@ class AgentMemoryIsolationTest(unittest.TestCase):
             self.assertEqual(context.hits, [])
             self.assertEqual(context.archival_memories, [])
             self.assertFalse((memory_base / "agents" / "default" / "sessions" / "sess_legacy.jsonl").exists())
+
+    def test_schema_one_manifest_migrates_without_moving_existing_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_base = Path(tmp_dir) / "data" / "memory"
+            root = memory_base / "agents" / "default"
+            (root / "sessions").mkdir(parents=True)
+            (root / "sessions" / "existing.jsonl").write_text("{}\n", encoding="utf-8")
+            (root / "agent_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "agent_id": "default",
+                        "persona_source": "config/personas/default.json",
+                        "persona_fingerprint": "inline-v1",
+                        "created_at": "2026-07-10T10:00:00+08:00",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self._patch_memory_roots(memory_base):
+                manager = MemoryManager(
+                    agent_identity=AgentIdentity(
+                        "default", "skill", "config/personas/default/SKILL.md", "skill-v2"
+                    ),
+                    model=_ReplyOnlyModel(),
+                    enable_semantic=False,
+                )
+
+            manifest = json.loads((manager.memory_root / "agent_manifest.json").read_text(encoding="utf-8"))
+            revisions = [
+                json.loads(line)
+                for line in (manager.memory_root / "persona_revisions.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(set(manifest), {"schema_version", "agent_id", "created_at"})
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertTrue((manager.memory_root / "sessions" / "existing.jsonl").exists())
+            self.assertEqual([row["fingerprint"] for row in revisions], ["inline-v1", "skill-v2"])
+
+    def test_new_skill_revision_appends_once_and_reuses_same_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_base = Path(tmp_dir) / "data" / "memory"
+            with self._patch_memory_roots(memory_base):
+                first = MemoryManager(
+                    agent_identity=AgentIdentity("default", "skill", "skill.md", "v1"),
+                    model=_ReplyOnlyModel(),
+                    enable_semantic=False,
+                )
+                second = MemoryManager(
+                    agent_identity=AgentIdentity("default", "skill", "skill.md", "v2"),
+                    model=_ReplyOnlyModel(),
+                    enable_semantic=False,
+                )
+                MemoryManager(
+                    agent_identity=AgentIdentity("default", "skill", "skill.md", "v2"),
+                    model=_ReplyOnlyModel(),
+                    enable_semantic=False,
+                )
+
+            rows = [
+                json.loads(line)
+                for line in (first.memory_root / "persona_revisions.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(first.memory_root, second.memory_root)
+            self.assertEqual([row["fingerprint"] for row in rows], ["v1", "v2"])
+
+    def test_different_agent_id_cannot_claim_existing_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / "shared-agent-root"
+            MemoryManager(
+                memory_root=root,
+                agent_identity=AgentIdentity("default", "default", "default.md", "v1"),
+                model=_ReplyOnlyModel(),
+                enable_semantic=False,
+            )
+
+            with self.assertRaisesRegex(ValueError, "agent manifest mismatch for agent_id"):
+                MemoryManager(
+                    memory_root=root,
+                    agent_identity=AgentIdentity("other", "other", "other.md", "v1"),
+                    model=_ReplyOnlyModel(),
+                    enable_semantic=False,
+                )
 
     def _patch_memory_roots(self, memory_base: Path):
         stack = ExitStack()

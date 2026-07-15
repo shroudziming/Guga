@@ -210,25 +210,66 @@ class MemoryManager:
         if self.agent_identity is None:
             return
         manifest_path = self.memory_root / "agent_manifest.json"
-        expected = {
-            "schema_version": 1,
-            "agent_id": self.agent_identity.agent_id,
-            "persona_source": self.agent_identity.persona_source,
-            "persona_fingerprint": self.agent_identity.persona_fingerprint,
-        }
-        allowed_keys = {*expected.keys(), "created_at"}
+        legacy_revision = None
         if manifest_path.exists():
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if set(payload) != allowed_keys:
-                raise ValueError(f"invalid agent manifest keys in {manifest_path}")
-            for key, value in expected.items():
-                if payload.get(key) != value:
-                    raise ValueError(f"agent manifest mismatch for {key}")
-            return
+            if payload.get("agent_id") != self.agent_identity.agent_id:
+                raise ValueError("agent manifest mismatch for agent_id")
+            created_at = str(payload.get("created_at") or now_beijing_iso())
+            if int(payload.get("schema_version", 0)) == 1:
+                legacy_revision = (
+                    str(payload.get("persona_source", "")),
+                    str(payload.get("persona_fingerprint", "")),
+                    created_at,
+                )
+        else:
+            created_at = now_beijing_iso()
+        self._write_json_atomically(
+            manifest_path,
+            {
+                "schema_version": 2,
+                "agent_id": self.agent_identity.agent_id,
+                "created_at": created_at,
+            },
+        )
+        if legacy_revision and legacy_revision[1]:
+            self._record_persona_revision(*legacy_revision)
+        self._record_persona_revision()
 
-        payload = dict(expected)
-        payload["created_at"] = now_beijing_iso()
-        manifest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    def _write_json_atomically(self, path: Path, payload: dict) -> None:
+        temp_path = path.with_name(f"{path.name}.tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temp_path.replace(path)
+
+    def _record_persona_revision(
+        self,
+        source: str | None = None,
+        fingerprint: str | None = None,
+        activated_at: str | None = None,
+    ) -> None:
+        if self.agent_identity is None:
+            return
+        source = source if source is not None else self.agent_identity.persona_source
+        fingerprint = fingerprint if fingerprint is not None else self.agent_identity.persona_fingerprint
+        activated_at = activated_at if activated_at is not None else now_beijing_iso()
+        revisions_path = self.memory_root / "persona_revisions.jsonl"
+        rows = []
+        if revisions_path.exists():
+            rows = [json.loads(line) for line in revisions_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if any(row.get("fingerprint") == fingerprint for row in rows):
+            return
+        with revisions_path.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "source": source,
+                        "fingerprint": fingerprint,
+                        "activated_at": activated_at,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
     def prepare_context(self, user_text: str, session_id: str) -> MemoryContext:
         """Retrieve context for current user input and return structured hits.
