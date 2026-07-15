@@ -40,7 +40,6 @@ class MemoryHit:
     invalid_at: str = ""
     time_source: str = ""
     semantic_score: float = 0.0
-    lexical_score: float = 0.0
     score_source: str = ""
     score_components: dict[str, float | str | bool] = field(default_factory=dict)
     is_current_turn: bool = False

@@ -109,7 +109,7 @@ class MemoryMigrationTest(unittest.TestCase):
                     "status": "active",
                 },
             )
-            manager = MemoryManager(memory_root=root, top_k=4, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=root, top_k=4, enable_semantic=False)
 
             context = manager.prepare_context("刚才没有输出 bug", session_id="sess_probe")
 
@@ -131,7 +131,7 @@ class MemoryMigrationTest(unittest.TestCase):
                     "status": "active",
                 },
             )
-            manager = MemoryManager(memory_root=root, top_k=4, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=root, top_k=4, enable_semantic=False)
             stale_hit = RetrievalHit(
                 chunk_id="chunk_mem_bug",
                 text="用户指出助手刚才没有输出，有 bug。",
@@ -145,7 +145,6 @@ class MemoryMigrationTest(unittest.TestCase):
 
             hits = manager._merge_memory_hits(
                 [stale_hit],
-                [],
                 manager._load_archival_records(),
                 current_turn_ids=set(),
                 time_hints={},

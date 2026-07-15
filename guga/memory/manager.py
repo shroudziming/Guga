@@ -19,7 +19,6 @@ from guga.config import (
     DEFAULT_MEMORY_DECAY_MIN_AGE_DAYS,
     DEFAULT_MEMORY_DECAY_THRESHOLD,
     DEFAULT_MEMORY_MIN_SCORE,
-    DEFAULT_MEMORY_RECENCY_WEIGHT,
     DEFAULT_MEMORY_TOP_K,
     DEFAULT_RAG_CHUNK_OVERLAP,
     DEFAULT_RAG_CHUNK_SIZE,
@@ -110,12 +109,11 @@ class MemoryManager:
         debug_sink: Callable[[str], None] | None = None,
         top_k: int = DEFAULT_MEMORY_TOP_K,
         document_top_k: int = DEFAULT_DOCUMENT_TOP_K,
-        recency_weight: float = DEFAULT_MEMORY_RECENCY_WEIGHT,
         enable_semantic: bool = DEFAULT_RAG_ENABLE_SEMANTIC,
         documents_dir: Path | None = None,
         consolidation_config: MemoryConsolidationConfig | None = None,
     ) -> None:
-        """Create manager with lexical + optional semantic retrieval capabilities.
+        """Create manager with BGE-M3 semantic retrieval capabilities.
 
         Args:
             memory_root: Root directory for memory files and indexes.
@@ -125,7 +123,6 @@ class MemoryManager:
             debug_sink: Optional debug output sink callback.
             top_k: Max memory hits returned to prompt context.
             document_top_k: Max document hits returned to prompt context.
-            recency_weight: Weight for recency term in lexical scoring.
             enable_semantic: Whether to enable vector-based retrieval pipeline.
             documents_dir: Root directory for document retrieval.
         """
@@ -144,7 +141,6 @@ class MemoryManager:
         self.debug_sink = debug_sink
         self.top_k = max(1, top_k)
         self.document_top_k = max(1, document_top_k)
-        self.recency_weight = max(0.0, recency_weight)
         self.decay_enabled = self._env_bool("Guga_MEMORY_DECAY_ENABLED", DEFAULT_MEMORY_DECAY_ENABLED)
         self.decay_threshold = self._env_float(
             "Guga_MEMORY_DECAY_THRESHOLD",
@@ -241,9 +237,9 @@ class MemoryManager:
             Called by ChatSession before model generation.
 
         Retrieval steps:
-            1) Load archival records for lexical matching.
-            2) Retrieve semantic hits from RagPipeline (memory + documents).
-            3) Compute lexical scores and merge with semantic memory hits.
+            1) Load active records used to resolve semantic hit metadata.
+            2) Retrieve BGE-M3 chunk hits from RagPipeline (memory + documents).
+            3) Apply deterministic lifecycle, time, and prompt-noise filters.
 
         Args:
             user_text: Current user query text.
@@ -271,18 +267,8 @@ class MemoryManager:
 
         semantic_memory_hits, semantic_document_hits = self._retrieve_semantic(user_text=user_text, session_id=session_id)
 
-        lexical_hits: list[MemoryHit] = []
-        for record in records:
-            score, components = self._score_components(record, user_text)
-            score, temporal_components = self._apply_time_score_components(score, record, time_hints, session_id)
-            components.update(temporal_components)
-            if score <= 0:
-                continue
-            lexical_hits.append(self._to_hit(record, score, score_components=components))
-
         merged_memory_hits = self._merge_memory_hits(
             semantic_memory_hits,
-            lexical_hits,
             records,
             current_turn_ids=current_turn_ids,
             time_hints=time_hints,
@@ -318,7 +304,6 @@ class MemoryManager:
                 "invalid_at": hit.invalid_at,
                 "time_source": hit.time_source,
                 "semantic_score": hit.semantic_score,
-                "lexical_score": hit.lexical_score,
                 "score_source": hit.score_source,
                 "score_components": hit.score_components,
                 "is_current_turn": hit.is_current_turn,
@@ -1258,13 +1243,12 @@ class MemoryManager:
     def _merge_memory_hits(
         self,
         semantic_hits: list[RetrievalHit],
-        lexical_hits: list[MemoryHit],
         records: list[dict],
         current_turn_ids: set[str],
         time_hints: dict[str, str | bool],
         session_id: str,
     ) -> list[MemoryHit]:
-        """Merge semantic and lexical routes by id, then filter prompt noise."""
+        """Map BGE-M3 chunk hits to memory records, then filter prompt noise."""
         candidates: dict[str, MemoryHit] = {}
         record_by_id = {str(record.get("id", "")): record for record in records}
 
@@ -1327,13 +1311,8 @@ class MemoryManager:
                 ),
             )
 
-        lexical_hits.sort(key=lambda item: item.score, reverse=True)
-        for hit in lexical_hits:
-            self._store_memory_candidate(candidates, hit)
-
         merged = []
         for hit in candidates.values():
-            self._finalize_route_scores(hit)
             if self._is_current_turn_hit(hit, current_turn_ids):
                 self._weaken_current_turn_hit(hit)
             merged.append(hit)
@@ -1380,64 +1359,20 @@ class MemoryManager:
             candidates[hit.id] = hit
             return
 
-        semantic_score = max(existing.semantic_score, hit.semantic_score)
-        lexical_score = max(existing.lexical_score, hit.lexical_score)
         keep = hit if hit.score > existing.score else existing
         candidates[hit.id] = keep
-        keep.semantic_score = semantic_score
-        keep.lexical_score = lexical_score
+        keep.semantic_score = max(existing.semantic_score, hit.semantic_score)
         keep.source_message_ids = list(dict.fromkeys(existing.source_message_ids + hit.source_message_ids))
         keep.day = keep.day or existing.day or hit.day
         keep.valid_at = keep.valid_at or existing.valid_at or hit.valid_at
         keep.invalid_at = keep.invalid_at or existing.invalid_at or hit.invalid_at
         keep.time_source = keep.time_source or existing.time_source or hit.time_source
-        keep.score_components = self._merge_score_components(existing.score_components, hit.score_components, keep.score_components)
-
-    def _merge_score_components(
-        self,
-        existing: dict[str, float | str | bool],
-        incoming: dict[str, float | str | bool],
-        selected: dict[str, float | str | bool],
-    ) -> dict[str, float | str | bool]:
-        merged = dict(selected)
-        for prefix, components in (("semantic", existing), ("lexical", incoming)):
-            route = str(components.get("route", ""))
-            if route not in {"semantic", "lexical"}:
-                continue
-            target_prefix = route
-            for key, value in components.items():
-                if key == "route":
-                    continue
-                merged[f"{target_prefix}_{key}"] = value
-        return merged
-
-    def _finalize_route_scores(self, hit: MemoryHit) -> None:
-        semantic_score = round(max(0.0, hit.semantic_score), 4)
-        lexical_score = round(max(0.0, hit.lexical_score), 4)
-        hit.semantic_score = semantic_score
-        hit.lexical_score = lexical_score
-        if semantic_score <= 0 and lexical_score <= 0:
-            hit.score = round(max(0.0, hit.score), 4)
-            return
-        hit.score = max(semantic_score, lexical_score)
-        if semantic_score > 0 and lexical_score > 0 and semantic_score == lexical_score:
-            hit.score_source = "semantic+lexical"
-        elif lexical_score >= semantic_score:
-            hit.score_source = "lexical"
-        else:
-            hit.score_source = "semantic"
-        hit.score_components = dict(hit.score_components)
-        hit.score_components["semantic_score"] = semantic_score
-        hit.score_components["lexical_score"] = lexical_score
-        hit.score_components["final_score"] = round(hit.score, 4)
-        hit.score_components["score_source"] = hit.score_source
 
     def _weaken_current_turn_hit(self, hit: MemoryHit) -> None:
         hit.is_current_turn = True
         original_score = hit.score
         hit.score = round(hit.score * self.current_turn_score_factor, 4)
         hit.semantic_score = round(hit.semantic_score * self.current_turn_score_factor, 4)
-        hit.lexical_score = round(hit.lexical_score * self.current_turn_score_factor, 4)
         hit.score_components = dict(hit.score_components)
         hit.score_components["current_turn_factor"] = round(self.current_turn_score_factor, 4)
         hit.score_components["score_before_current_turn_factor"] = round(original_score, 4)
@@ -1939,91 +1874,6 @@ class MemoryManager:
             "status": str(payload.get("status", "active")),
         }
 
-    def _to_hit(
-        self,
-        item: dict,
-        score: float,
-        score_components: dict[str, float | str | bool] | None = None,
-    ) -> MemoryHit:
-        """Convert normalized archival dict to MemoryHit with rounded score."""
-        return MemoryHit(
-            id=item["id"],
-            summary=item["summary"],
-            raw_excerpt=item["raw_excerpt"],
-            score=round(score, 4),
-            memory_type=item["type"],
-            source_session_id=item["source_session_id"],
-            source_message_ids=item["source_message_ids"],
-            created_at=item["created_at"],
-            last_recalled_at=item["last_recalled_at"],
-            memory_strength=item["memory_strength"],
-            retention=item["retention"],
-            importance=item["importance"],
-            confidence=item["confidence"],
-            day=item.get("day", ""),
-            valid_at=item.get("valid_at", ""),
-            invalid_at=item.get("invalid_at", ""),
-            time_source=item.get("time_source", ""),
-            lexical_score=round(score, 4),
-            score_source="lexical",
-            score_components=score_components or {},
-        )
-
-    def _score(self, item: dict, query: str) -> float:
-        score, _ = self._score_components(item, query)
-        return score
-
-    def _score_components(self, item: dict, query: str) -> tuple[float, dict[str, float | str | bool]]:
-        """Compute lexical relevance score for one archival memory record.
-
-        Score terms:
-            overlap(query_tokens, memory_text) + recency term + small priors
-            for importance/confidence.
-        """
-        text = f"{item.get('summary', '')} {item.get('raw_excerpt', '')}"
-        query_tokens = self._tokens(query)
-        components: dict[str, float | str | bool] = {
-            "route": "lexical",
-            "query_token_count": len(query_tokens),
-        }
-        if not query_tokens:
-            components["lexical_base_score"] = 0.0
-            return 0.0, components
-
-        matches = sum(1 for token in query_tokens if token in text)
-        overlap_score = matches / max(1, len(query_tokens))
-        components["lexical_matches"] = matches
-        components["lexical_overlap"] = round(overlap_score, 4)
-        if overlap_score <= 0:
-            components["lexical_base_score"] = 0.0
-            return 0.0, components
-
-        recency_score = self._recency_score(item.get("created_at", ""))
-        importance = max(0.0, min(float(item.get("importance", 0.0) or 0.0), 1.0))
-        confidence = max(0.0, min(float(item.get("confidence", 0.0) or 0.0), 1.0))
-
-        retention = max(0.0, min(float(item.get("retention", 1.0) or 1.0), 1.0))
-        retained_overlap = overlap_score * retention
-        recency_bonus = self.recency_weight * recency_score
-        importance_bonus = 0.05 * importance
-        confidence_bonus = 0.05 * confidence
-        score = retained_overlap + recency_bonus + importance_bonus + confidence_bonus
-        components.update(
-            {
-                "retention": round(retention, 4),
-                "retained_overlap": round(retained_overlap, 4),
-                "recency": round(recency_score, 4),
-                "recency_weight": round(self.recency_weight, 4),
-                "recency_bonus": round(recency_bonus, 4),
-                "importance": round(importance, 4),
-                "importance_bonus": round(importance_bonus, 4),
-                "confidence": round(confidence, 4),
-                "confidence_bonus": round(confidence_bonus, 4),
-                "lexical_base_score": round(score, 4),
-            }
-        )
-        return score, components
-
     def _env_float(self, name: str, default: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
         raw = os.environ.get(name, "").strip()
         if not raw:
@@ -2058,35 +1908,6 @@ class MemoryManager:
         if age_days >= 30:
             return 0.0
         return 1.0 - (age_days / 30)
-
-    def _tokens(self, text: str) -> list[str]:
-        """Tokenize query for lexical matching (word split + CJK n-gram fallback)."""
-        compact = text.replace("，", " ").replace("。", " ").replace("？", " ").strip()
-        pieces = [item for item in compact.split() if item]
-        if len(pieces) >= 2:
-            return pieces[:12]
-
-        if len(pieces) == 1:
-            piece = pieces[0]
-            if piece.isascii():
-                return [piece]
-            return self._char_ngrams(piece)
-
-        compact = compact.replace(" ", "")
-        if len(compact) < 2:
-            return [compact] if compact else []
-        return self._char_ngrams(compact)
-
-    def _char_ngrams(self, text: str) -> list[str]:
-        """Build 2/3-gram token list for short CJK/ascii text matching."""
-        if len(text) < 2:
-            return [text] if text else []
-
-        tokens: list[str] = []
-        for size in (2, 3):
-            for index in range(0, max(0, len(text) - size + 1)):
-                tokens.append(text[index : index + size])
-        return tokens[:20]
 
     def _debug_pipeline(self, message: str) -> None:
         if not self.debug:

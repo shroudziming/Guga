@@ -98,7 +98,6 @@ class MemoryManagerTest(unittest.TestCase):
             memory_root=self.memory_root,
             model=SummaryModel(),
             top_k=2,
-            recency_weight=0.2,
             enable_semantic=False,
             consolidation_config=MemoryConsolidationConfig(batch_turns=1),
         )
@@ -205,6 +204,21 @@ class MemoryManagerTest(unittest.TestCase):
             },
         ]
         archival.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in rows) + "\n", encoding="utf-8")
+        self.manager._retrieve_semantic = lambda **_: (
+            [
+                RetrievalHit(
+                    chunk_id="memory:mem_new:c0",
+                    text="用户提到：我现在在上海工作",
+                    score=0.8,
+                    source_type="memory",
+                    source_id="mem_new",
+                    source_session_id="sess_new",
+                    source_message_id="msg_new",
+                    created_at="2099-01-01T00:00:00+00:00",
+                )
+            ],
+            [],
+        )
 
         context = self.manager.prepare_context("你记得我在哪工作吗", session_id="sess_test")
 
@@ -305,6 +319,31 @@ class MemoryManagerTest(unittest.TestCase):
         (self.memory_root / "event_summaries.jsonl").write_text(
             json.dumps(event, ensure_ascii=False) + "\n",
             encoding="utf-8",
+        )
+        self.manager._retrieve_semantic = lambda **_: (
+            [
+                RetrievalHit(
+                    chunk_id="memory:evt_daily_20260628:c0",
+                    text=event["summary"],
+                    score=0.8,
+                    source_type="memory",
+                    source_id=event["id"],
+                    source_session_id=session_id,
+                    source_message_id=user_id,
+                    created_at=event["created_at"],
+                ),
+                RetrievalHit(
+                    chunk_id=f"memory:turn_{user_id}:c0",
+                    text="我之前问你推荐过一部悬疑网剧。",
+                    score=0.7,
+                    source_type="memory",
+                    source_id=f"turn_{user_id}",
+                    source_session_id=session_id,
+                    source_message_id=user_id,
+                    created_at="2026-07-12T09:00:00+08:00",
+                ),
+            ],
+            [],
         )
 
         context = self.manager.prepare_context("上次我们聊了什么", session_id="sess_now")
@@ -477,7 +516,6 @@ class MemoryManagerTest(unittest.TestCase):
 
         hits = self.manager._merge_memory_hits(
             [semantic_hit],
-            [],
             [record],
             current_turn_ids=set(),
             time_hints={},

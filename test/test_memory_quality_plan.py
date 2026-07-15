@@ -16,6 +16,19 @@ def _append_jsonl(path: Path, payload: dict) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _semantic_hit(record: dict, score: float) -> RetrievalHit:
+    return RetrievalHit(
+        chunk_id=f"chunk_{record['id']}",
+        text=str(record.get("summary") or record.get("raw_excerpt") or ""),
+        score=score,
+        source_type="memory",
+        source_id=str(record["id"]),
+        source_session_id=str(record.get("source_session_id", "")),
+        source_message_id=str((record.get("source_message_ids") or [""])[0]),
+        created_at=str(record.get("created_at", "")),
+    )
+
+
 class PromptSummaryModel:
     def generate_reply(self, messages, gen):
         _ = gen
@@ -40,13 +53,38 @@ class PromptSummaryModel:
 
 
 class MemoryQualityPlanTest(unittest.TestCase):
-    def test_current_turn_is_weakened_and_not_reinforced(self) -> None:
+    def test_prepare_context_does_not_fallback_to_lexical_matches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, top_k=4, recency_weight=0.0, enable_semantic=False)
             _append_jsonl(
                 memory_root / "archival_memory.jsonl",
                 {
+                    "id": "mem_lexical_only",
+                    "type": "episodic",
+                    "summary": "Wells Fargo mortgage pre-approval",
+                    "raw_excerpt": "Wells Fargo mortgage pre-approval",
+                    "created_at": "2026-05-09T12:00:00+08:00",
+                    "last_recalled_at": "2026-05-09T12:00:00+08:00",
+                    "memory_strength": 1,
+                    "retention": 1.0,
+                    "source_session_id": "sess_old",
+                    "source_message_ids": ["msg_old"],
+                    "importance": 1.0,
+                    "confidence": 1.0,
+                    "status": "active",
+                },
+            )
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
+
+            context = manager.prepare_context("Wells Fargo mortgage pre-approval", session_id="sess_probe")
+
+            self.assertEqual(context.hits, [])
+
+    def test_current_turn_is_weakened_and_not_reinforced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_root = Path(tmp)
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
+            archival = {
                     "id": "mem_advisor",
                     "type": "episodic",
                     "summary": "用户下周三要和导师见面。",
@@ -59,11 +97,16 @@ class MemoryQualityPlanTest(unittest.TestCase):
                     "importance": 0.8,
                     "confidence": 0.9,
                     "status": "active",
-                },
-            )
+                }
+            _append_jsonl(memory_root / "archival_memory.jsonl", archival)
 
             session_id = "sess_current"
             manager.record_user_message(session_id, "你记得我下周三要去做什么吗")
+            current = json.loads((memory_root / "session_memories.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            manager._retrieve_semantic = lambda **_: (
+                [_semantic_hit(archival, 0.8), _semantic_hit(current, 0.9)],
+                [],
+            )
             context = manager.prepare_context("你记得我下周三要去做什么吗", session_id=session_id)
 
             self.assertEqual(context.hits[0].id, "mem_advisor")
@@ -77,11 +120,9 @@ class MemoryQualityPlanTest(unittest.TestCase):
     def test_low_score_memories_are_filtered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, top_k=4, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
             manager.memory_min_score = 0.3
-            _append_jsonl(
-                memory_root / "archival_memory.jsonl",
-                {
+            weak = {
                     "id": "mem_weak",
                     "type": "episodic",
                     "summary": "alpha detail",
@@ -94,8 +135,9 @@ class MemoryQualityPlanTest(unittest.TestCase):
                     "importance": 0.0,
                     "confidence": 0.0,
                     "status": "active",
-                },
-            )
+                }
+            _append_jsonl(memory_root / "archival_memory.jsonl", weak)
+            manager._retrieve_semantic = lambda **_: ([_semantic_hit(weak, 0.2)], [])
 
             context = manager.prepare_context("alpha beta gamma delta epsilon", session_id="sess_probe")
 
@@ -108,14 +150,11 @@ class MemoryQualityPlanTest(unittest.TestCase):
             manager = MemoryManager(
                 memory_root=memory_root,
                 top_k=4,
-                recency_weight=0.2,
                 enable_semantic=False,
                 debug=True,
                 debug_sink=logs.append,
             )
-            _append_jsonl(
-                memory_root / "event_summaries.jsonl",
-                {
+            event_summary = {
                     "id": "evt_daily_20260509",
                     "type": "event_summary",
                     "scope": "daily",
@@ -130,8 +169,9 @@ class MemoryQualityPlanTest(unittest.TestCase):
                     "importance": 0.75,
                     "confidence": 0.8,
                     "status": "active",
-                },
-            )
+                }
+            _append_jsonl(memory_root / "event_summaries.jsonl", event_summary)
+            manager._retrieve_semantic = lambda **_: ([_semantic_hit(event_summary, 0.6)], [])
 
             manager.prepare_context("2026-05-09那天的导师安排", session_id="sess_probe")
 
@@ -139,17 +179,15 @@ class MemoryQualityPlanTest(unittest.TestCase):
             memory_raw = retrieve_done.split("memory_raw=", 1)[1].rsplit(" latency_ms=", 1)[0]
             payload = json.loads(memory_raw)
             components = payload[0]["score_components"]
-            self.assertIn("lexical_overlap", components)
-            self.assertIn("recency_bonus", components)
-            self.assertIn("importance_bonus", components)
-            self.assertIn("confidence_bonus", components)
+            self.assertEqual(components["route"], "semantic")
+            self.assertEqual(components["semantic_raw_score"], 0.6)
+            self.assertNotIn("lexical_score", payload[0])
             self.assertIn("temporal_adjustment", components)
-            self.assertIn("final_score", components)
 
-    def test_semantic_and_lexical_hits_are_fused_by_max_score(self) -> None:
+    def test_best_bge_chunk_score_is_used_for_duplicate_memory_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, top_k=2, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=memory_root, top_k=2, enable_semantic=False)
             record = {
                 "id": "mem_mix",
                 "type": "episodic",
@@ -165,21 +203,12 @@ class MemoryQualityPlanTest(unittest.TestCase):
                 "confidence": 0.0,
                 "status": "active",
             }
-            lexical_hit = manager._to_hit(record, 0.8)
-            semantic_hit = RetrievalHit(
-                chunk_id="chunk_mem_mix",
-                text="semantic beta",
-                score=0.2,
-                source_type="episodic",
-                source_id="mem_mix",
-                source_session_id="sess_old",
-                source_message_id="msg_old",
-                created_at="2099-01-01T00:00:00+00:00",
-            )
+            semantic_hit = _semantic_hit(record, 0.2)
+            stronger_chunk = _semantic_hit(record, 0.8)
+            stronger_chunk.chunk_id = "chunk_mem_mix_2"
 
             hits = manager._merge_memory_hits(
-                [semantic_hit],
-                [lexical_hit],
+                [semantic_hit, stronger_chunk],
                 [record],
                 current_turn_ids=set(),
                 time_hints={},
@@ -188,14 +217,13 @@ class MemoryQualityPlanTest(unittest.TestCase):
 
             self.assertEqual(hits[0].id, "mem_mix")
             self.assertEqual(hits[0].score, 0.8)
-            self.assertEqual(hits[0].semantic_score, 0.2)
-            self.assertEqual(hits[0].lexical_score, 0.8)
-            self.assertEqual(hits[0].score_source, "lexical")
+            self.assertEqual(hits[0].semantic_score, 0.8)
+            self.assertEqual(hits[0].score_source, "semantic")
 
     def test_explicit_date_query_prioritizes_daily_event_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, top_k=4, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
             _append_jsonl(
                 memory_root / "event_summaries.jsonl",
                 {
@@ -248,6 +276,9 @@ class MemoryQualityPlanTest(unittest.TestCase):
                 },
             )
 
+            records = manager._load_archival_records()
+            manager._retrieve_semantic = lambda **_: ([_semantic_hit(record, 0.6) for record in records], [])
+
             context = manager.prepare_context("2026-05-09那天的对话", session_id="sess_probe")
             hit_ids = [hit.id for hit in context.hits]
 
@@ -257,7 +288,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
     def test_recent_and_last_session_time_references_are_prioritized(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
-            manager = MemoryManager(memory_root=memory_root, top_k=4, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
             _append_jsonl(
                 memory_root / "event_summaries.jsonl",
                 {
@@ -288,6 +319,8 @@ class MemoryQualityPlanTest(unittest.TestCase):
                     "status": "active",
                 },
             )
+            historical = manager._load_archival_records()
+            manager._retrieve_semantic = lambda **_: ([_semantic_hit(record, 0.6) for record in historical], [])
             last_context = manager.prepare_context("上次我们聊了什么", session_id="sess_now")
             self.assertEqual(last_context.hits[0].id, "evt_daily_20260510")
             self.assertEqual([hit.id for hit in last_context.hits], ["evt_daily_20260510"])
@@ -295,6 +328,14 @@ class MemoryQualityPlanTest(unittest.TestCase):
             manager.record_user_message("sess_now", "我们先聊蝴蝶刀")
             manager.record_assistant_message("sess_now", "刚才你说什么：蝴蝶刀练习安排")
             manager.record_user_message("sess_now", "刚才你说什么")
+            session_records = manager._load_session_message_records("sess_now")
+            manager._retrieve_semantic = lambda **_: (
+                [
+                    _semantic_hit(record, 0.9 if str(record.get("summary", "")).startswith("assistant:") else 0.4)
+                    for record in session_records
+                ],
+                [],
+            )
             recent_context = manager.prepare_context("刚才你说什么", session_id="sess_now")
 
             self.assertTrue(recent_context.hits[0].summary.startswith("assistant:"))
@@ -343,7 +384,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
                     "status": "active",
                 },
             )
-            manager = MemoryManager(memory_root=memory_root, top_k=4, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
 
             context = manager.prepare_context("你觉得我是谁？", session_id="sess_probe")
 

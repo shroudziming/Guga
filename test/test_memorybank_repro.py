@@ -11,6 +11,7 @@ from pathlib import Path
 from guga.memory.forgetting import retention_score
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
+from guga.rag.schemas import RetrievalHit
 
 
 class SummaryModel:
@@ -210,6 +211,21 @@ class MemoryBankReproTest(unittest.TestCase):
                 encoding="utf-8",
             )
             manager = MemoryManager(memory_root=memory_root, enable_semantic=False)
+            manager._retrieve_semantic = lambda **_: (
+                [
+                    RetrievalHit(
+                        chunk_id="memory:mem_work:c0",
+                        text="用户提到：我在杭州做后端开发",
+                        score=0.8,
+                        source_type="memory",
+                        source_id="mem_work",
+                        source_session_id="sess_seed",
+                        source_message_id="msg_seed",
+                        created_at="2099-01-01T00:00:00+00:00",
+                    )
+                ],
+                [],
+            )
 
             context = manager.prepare_context("你记得我在杭州做什么吗", session_id="sess_probe")
 
@@ -370,6 +386,24 @@ class MemoryBankReproTest(unittest.TestCase):
             batch_event = next(row for row in event_rows if row["source_of_truth"] is False)
             self.assertEqual(batch_event["type"], "event_summary")
             self.assertIn("深圳工作", batch_event["summary"])
+
+            records = manager._load_archival_records()
+            manager._retrieve_semantic = lambda **_: (
+                [
+                    RetrievalHit(
+                        chunk_id=f"memory:{record['id']}:c0",
+                        text=str(record.get("summary") or record.get("raw_excerpt") or ""),
+                        score=0.8,
+                        source_type="memory",
+                        source_id=str(record["id"]),
+                        source_session_id=str(record.get("source_session_id", "")),
+                        source_message_id=str((record.get("source_message_ids") or [""])[0]),
+                        created_at=str(record.get("created_at", "")),
+                    )
+                    for record in records
+                ],
+                [],
+            )
 
             context = manager.prepare_context("你记得我在深圳工作的事吗", session_id="sess_probe")
             prompt = manager.compose_system_prompt("你是助手", context)

@@ -10,6 +10,7 @@ from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.manager import MemoryManager
 from guga.memory.summarizer import MemoryBankSummarizer
 from guga.memory.time_utils import extract_semantic_time
+from guga.rag.schemas import RetrievalHit
 
 
 class SummaryModel:
@@ -125,7 +126,18 @@ class MemoryTimeUtilsTest(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
-            manager = MemoryManager(memory_root=memory_root, top_k=4, recency_weight=0.0, enable_semantic=False)
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
+            semantic_hit = RetrievalHit(
+                chunk_id="chunk_mem_meeting",
+                text="用户将在2026年6月20日与导师见面。",
+                score=0.8,
+                source_type="memory",
+                source_id="mem_meeting",
+                source_session_id="sess_time",
+                source_message_id="msg_time",
+                created_at="2026-06-12T17:09:37+08:00",
+            )
+            manager._retrieve_semantic = lambda **_: ([semantic_hit], [])
 
             context = manager.prepare_context("你记得我2026年6月20日要做什么吗？", session_id="sess_probe")
 
