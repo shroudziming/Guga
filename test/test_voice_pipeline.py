@@ -149,19 +149,25 @@ class FakeAudioPlayer:
         self.items: list[bytes] = []
         self.started = False
         self.stopped = False
+        self.audio_enqueued = threading.Event()
+        self.cleanup_calls: list[str] = []
 
     def start(self) -> None:
         self.started = True
 
     def enqueue(self, audio: AudioData) -> None:
         self.items.append(audio.data)
+        self.audio_enqueued.set()
 
     def stop(self, clear: bool = False) -> None:
-        _ = clear
+        self.cleanup_calls.append(f"stop:{clear}")
+        if clear:
+            self.items.clear()
         self.stopped = True
 
     def join(self, timeout: float | None = None) -> None:
         _ = timeout
+        self.cleanup_calls.append("join")
 
 
 class GptSoVitsHttpClientTest(unittest.TestCase):
@@ -285,6 +291,34 @@ class VoiceToolModeTest(unittest.TestCase):
 
 
 class VoiceChatRunnerTest(unittest.TestCase):
+    def test_cancel_clears_audio_already_queued_without_waiting_for_playback(self) -> None:
+        player = FakeAudioPlayer()
+
+        class CancelAfterAudioQueuedSession:
+            def reply_stream(
+                self,
+                user_input: str,
+                cancel_event: threading.Event | None = None,
+            ) -> Iterator[str]:
+                _ = user_input
+                yield "已经入队。"
+                if not player.audio_enqueued.wait(timeout=1.0):
+                    raise AssertionError("audio was not enqueued before cancellation")
+                if cancel_event is not None:
+                    cancel_event.set()
+
+        runner = VoiceChatRunner(
+            session=CancelAfterAudioQueuedSession(),
+            tts_client=FakeTtsClient(),
+            audio_player=player,
+            text_sink=lambda chunk: None,
+        )
+
+        runner.run_turn("hi", cancel_event=threading.Event())
+
+        self.assertEqual(player.items, [])
+        self.assertEqual(player.cleanup_calls, ["stop:True"])
+
     def test_filters_expression_tags_and_emits_expression_events(self) -> None:
         session = FakeSession(["[hap", "py]你好。[side]（挥手）继续。"])
         printed: list[str] = []
@@ -338,6 +372,21 @@ class VoiceChatRunnerTest(unittest.TestCase):
 
         self.assertEqual(printed, ["[hap", "py]你好。"])
 
+    def test_spoken_text_filter_state_does_not_leak_after_cancelled_turn(self) -> None:
+        session = MultiTurnSession([["（未闭合"], ["下一轮。"]])
+        tts = FakeTtsClient()
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=tts,
+            audio_player=FakeAudioPlayer(),
+            text_sink=lambda chunk: None,
+        )
+
+        runner.run_turn("first", cancel_event=threading.Event())
+        runner.run_turn("second", cancel_event=threading.Event())
+
+        self.assertEqual(tts.requests, ["下一轮。"])
+
     def test_streams_text_and_synthesizes_sentences_in_order(self) -> None:
         session = FakeSession(["你好，", "我是咕嘎。", "今天继续。"])
         tts = FakeTtsClient()
@@ -356,6 +405,7 @@ class VoiceChatRunnerTest(unittest.TestCase):
         self.assertEqual(printed, ["你好，", "我是咕嘎。", "今天继续。"])
         self.assertEqual(tts.requests, ["你好，我是咕嘎。", "今天继续。"])
         self.assertEqual(player.items, [b"audio:\xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x8c\xe6\x88\x91\xe6\x98\xaf\xe5\x92\x95\xe5\x98\x8e\xe3\x80\x82", b"audio:\xe4\xbb\x8a\xe5\xa4\xa9\xe7\xbb\xa7\xe7\xbb\xad\xe3\x80\x82"])
+        self.assertEqual(player.cleanup_calls, ["join", "stop:False"])
         self.assertEqual(summary.sentences, 2)
 
     def test_text_sink_is_not_blocked_by_slow_tts(self) -> None:

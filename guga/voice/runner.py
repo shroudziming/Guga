@@ -61,7 +61,6 @@ class VoiceChatRunner:
         self.audio_player = audio_player
         self.text_sink = text_sink
         self.sentence_buffer = sentence_buffer or TextSentenceBuffer()
-        self.spoken_text_filter = SpokenTextFilter()
         self.metrics = metrics or VoiceMetrics()
         self.raise_tts_errors = raise_tts_errors
         self.expression_tags = expression_tags
@@ -84,6 +83,7 @@ class VoiceChatRunner:
 
         sequence_id = 0
         persona_parser = PersonaOutputParser(self.expression_tags)
+        spoken_text_filter = SpokenTextFilter()
 
         def route_persona_events(events, *, spoken: bool = True) -> None:
             nonlocal sequence_id
@@ -96,7 +96,7 @@ class VoiceChatRunner:
                     self.text_sink(event.text)
                     if not spoken:
                         continue
-                    spoken_chunk = self.spoken_text_filter.feed(event.text)
+                    spoken_chunk = spoken_text_filter.feed(event.text)
                     for segment in self.sentence_buffer.feed_segments(spoken_chunk):
                         sequence_id += 1
                         self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
@@ -119,14 +119,16 @@ class VoiceChatRunner:
                 self.sentence_buffer.flush()
         except BaseException:
             cancel_event.set()
-            self.audio_player.stop(clear=True)
             raise
         finally:
             self._queue.put(None)
             self._queue.join()
             worker.join(timeout=2.0)
-            self.audio_player.join()
-            self.audio_player.stop(clear=False)
+            if cancel_event.is_set():
+                self.audio_player.stop(clear=True)
+            else:
+                self.audio_player.join()
+                self.audio_player.stop(clear=False)
             self.metrics.turn_finished()
 
         if self._errors and self.raise_tts_errors:
