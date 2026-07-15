@@ -150,6 +150,7 @@ class FakeAudioPlayer:
         self.started = False
         self.stopped = False
         self.audio_enqueued = threading.Event()
+        self.cancelled = threading.Event()
         self.cleanup_calls: list[str] = []
 
     def start(self) -> None:
@@ -163,6 +164,7 @@ class FakeAudioPlayer:
         self.cleanup_calls.append(f"stop:{clear}")
         if clear:
             self.items.clear()
+            self.cancelled.set()
         self.stopped = True
 
     def join(self, timeout: float | None = None) -> None:
@@ -434,6 +436,86 @@ class VoiceToolModeTest(unittest.TestCase):
 
 
 class VoiceChatRunnerTest(unittest.TestCase):
+    def test_cancel_does_not_wait_for_blocked_tts_and_late_worker_cannot_pollute_reuse(self) -> None:
+        class ReusableSession:
+            def __init__(self) -> None:
+                self.turns = iter((["第一轮。"], ["第二轮。"], ["第三轮。"]))
+
+            def reply_stream(
+                self,
+                user_input: str,
+                cancel_event: threading.Event | None = None,
+            ) -> Iterator[str]:
+                _ = user_input, cancel_event
+                yield from next(self.turns)
+
+        class BlockingFirstTts(FakeTtsClient):
+            def __init__(self) -> None:
+                super().__init__()
+                self.first_started = threading.Event()
+                self.release_first = threading.Event()
+                self.first_finished = threading.Event()
+
+            def synthesize(self, text: str) -> AudioData:
+                self.requests.append(text)
+                if len(self.requests) == 1:
+                    self.first_started.set()
+                    self.release_first.wait(timeout=3.0)
+                    self.first_finished.set()
+                    raise RuntimeError("late cancelled TTS failure")
+                return AudioData(
+                    data=f"audio:{text}".encode("utf-8"),
+                    sample_rate=32000,
+                    channels=1,
+                    sample_width=2,
+                    duration_seconds=0.5,
+                    media_type="wav",
+                )
+
+        cancel_event = threading.Event()
+        tts = BlockingFirstTts()
+        player = FakeAudioPlayer()
+        runner = VoiceChatRunner(
+            session=ReusableSession(),
+            tts_client=tts,
+            audio_player=player,
+            text_sink=lambda chunk: None,
+        )
+        first_result: list[object] = []
+
+        def run_cancelled_turn() -> None:
+            try:
+                first_result.append(runner.run_turn("first", cancel_event=cancel_event))
+            except BaseException as exc:
+                first_result.append(exc)
+
+        first_thread = threading.Thread(target=run_cancelled_turn, daemon=True)
+        first_thread.start()
+        self.assertTrue(tts.first_started.wait(timeout=0.5))
+        cancel_event.set()
+        try:
+            self.assertTrue(player.cancelled.wait(timeout=0.3), "cancel did not stop playback immediately")
+            first_thread.join(timeout=0.3)
+            self.assertFalse(first_thread.is_alive(), "cancel waited for synchronous TTS")
+            self.assertEqual(len(first_result), 1)
+            self.assertFalse(isinstance(first_result[0], BaseException))
+
+            second_summary = runner.run_turn("second")
+            self.assertEqual(second_summary.sentences, 1)
+            self.assertEqual(player.items, ["audio:第二轮。".encode("utf-8")])
+
+            tts.release_first.set()
+            self.assertTrue(tts.first_finished.wait(timeout=0.5))
+            third_summary = runner.run_turn("third")
+            self.assertEqual(third_summary.sentences, 1)
+            self.assertEqual(
+                player.items,
+                ["audio:第二轮。".encode("utf-8"), "audio:第三轮。".encode("utf-8")],
+            )
+        finally:
+            tts.release_first.set()
+            first_thread.join(timeout=3.0)
+
     def test_cancel_clears_audio_already_queued_without_waiting_for_playback(self) -> None:
         player = FakeAudioPlayer()
 
@@ -550,6 +632,26 @@ class VoiceChatRunnerTest(unittest.TestCase):
         self.assertEqual(player.items, [b"audio:\xe4\xbd\xa0\xe5\xa5\xbd\xef\xbc\x8c\xe6\x88\x91\xe6\x98\xaf\xe5\x92\x95\xe5\x98\x8e\xe3\x80\x82", b"audio:\xe4\xbb\x8a\xe5\xa4\xa9\xe7\xbb\xa7\xe7\xbb\xad\xe3\x80\x82"])
         self.assertEqual(player.cleanup_calls, ["join", "stop:False"])
         self.assertEqual(summary.sentences, 2)
+
+    def test_reports_tts_errors_after_worker_cleanup(self) -> None:
+        class FailingTts(FakeTtsClient):
+            def synthesize(self, text: str) -> AudioData:
+                _ = text
+                raise ValueError("synthesis failed")
+
+        player = FakeAudioPlayer()
+        runner = VoiceChatRunner(
+            session=FakeSession(["失败。"]),
+            tts_client=FailingTts(),
+            audio_player=player,
+            text_sink=lambda chunk: None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "TTS worker failed") as caught:
+            runner.run_turn("hi")
+
+        self.assertIsInstance(caught.exception.__cause__, ValueError)
+        self.assertEqual(player.cleanup_calls, ["stop:True"])
 
     def test_text_sink_is_not_blocked_by_slow_tts(self) -> None:
         class SlowTts(FakeTtsClient):

@@ -65,8 +65,7 @@ class VoiceChatRunner:
         self.raise_tts_errors = raise_tts_errors
         self.expression_tags = expression_tags
         self.expression_sink = expression_sink
-        self._queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=max_queue_size)
-        self._errors: list[BaseException] = []
+        self.max_queue_size = max_queue_size
 
     def run_turn(
         self,
@@ -78,7 +77,15 @@ class VoiceChatRunner:
         self.metrics.turn_started()
         self.audio_player.start()
 
-        worker = threading.Thread(target=self._tts_worker, args=(cancel_event,), name="guga-tts-worker", daemon=True)
+        tts_queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=self.max_queue_size)
+        errors: list[BaseException] = []
+        worker_done = threading.Event()
+        worker = threading.Thread(
+            target=self._tts_worker,
+            args=(cancel_event, tts_queue, errors, worker_done),
+            name="guga-tts-worker",
+            daemon=True,
+        )
         worker.start()
 
         sequence_id = 0
@@ -99,7 +106,13 @@ class VoiceChatRunner:
                     spoken_chunk = spoken_text_filter.feed(event.text)
                     for segment in self.sentence_buffer.feed_segments(spoken_chunk):
                         sequence_id += 1
-                        self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
+                        self._enqueue_sentence(
+                            tts_queue,
+                            cancel_event,
+                            sequence_id,
+                            segment.text,
+                            segment.split_reason,
+                        )
 
         stream = self.session.reply_stream(user_input, cancel_event=cancel_event)
         try:
@@ -113,7 +126,13 @@ class VoiceChatRunner:
                 route_persona_events(persona_parser.flush())
                 for segment in self.sentence_buffer.flush_segments():
                     sequence_id += 1
-                    self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
+                    self._enqueue_sentence(
+                        tts_queue,
+                        cancel_event,
+                        sequence_id,
+                        segment.text,
+                        segment.split_reason,
+                    )
             else:
                 route_persona_events(persona_parser.flush(), spoken=False)
                 self.sentence_buffer.flush()
@@ -121,53 +140,116 @@ class VoiceChatRunner:
             cancel_event.set()
             raise
         finally:
-            self._queue.put(None)
-            self._queue.join()
-            worker.join(timeout=2.0)
-            if cancel_event.is_set():
-                self.audio_player.stop(clear=True)
-            else:
-                self.audio_player.join()
-                self.audio_player.stop(clear=False)
+            self._finish_tts_turn(cancel_event, tts_queue, worker, worker_done)
             self.metrics.turn_finished()
 
-        if self._errors and self.raise_tts_errors:
-            raise RuntimeError("TTS worker failed") from self._errors[0]
+        if errors and self.raise_tts_errors:
+            raise RuntimeError("TTS worker failed") from errors[0]
 
         return self.metrics.summary()
 
-    def _enqueue_sentence(self, sequence_id: int, sentence: str, split_reason: str) -> None:
-        self.metrics.sentence_queued(sentence)
-        self._queue.put(_TtsJob(sequence_id=sequence_id, text=sentence, split_reason=split_reason))
-
-    def _tts_worker(self, cancel_event: threading.Event) -> None:
-        while True:
-            job = self._queue.get()
+    def _enqueue_sentence(
+        self,
+        tts_queue: queue.Queue[_TtsJob | None],
+        cancel_event: threading.Event,
+        sequence_id: int,
+        sentence: str,
+        split_reason: str,
+    ) -> None:
+        job = _TtsJob(sequence_id=sequence_id, text=sentence, split_reason=split_reason)
+        while not cancel_event.is_set():
             try:
-                if job is None:
-                    return
-                if cancel_event.is_set():
-                    continue
+                tts_queue.put(job, timeout=0.05)
+            except queue.Full:
+                continue
+            self.metrics.sentence_queued(sentence)
+            return
 
-                started = time.perf_counter()
-                audio = self.tts_client.synthesize(job.text)
-                elapsed = time.perf_counter() - started
-                self.metrics.tts_finished(
-                    sequence_id=job.sequence_id,
-                    text=job.text,
-                    elapsed_seconds=elapsed,
-                    audio_seconds=audio.duration_seconds,
-                )
-                if cancel_event.is_set():
-                    continue
-                self._debug_voice_playback_start(job)
-                self.audio_player.enqueue(audio)
-                self.metrics.audio_enqueued(job.sequence_id)
-            except BaseException as exc:
-                self._errors.append(exc)
-                cancel_event.set()
-            finally:
-                self._queue.task_done()
+    def _tts_worker(
+        self,
+        cancel_event: threading.Event,
+        tts_queue: queue.Queue[_TtsJob | None],
+        errors: list[BaseException],
+        worker_done: threading.Event,
+    ) -> None:
+        try:
+            while True:
+                job = tts_queue.get()
+                try:
+                    if job is None:
+                        return
+                    if cancel_event.is_set():
+                        continue
+
+                    started = time.perf_counter()
+                    audio = self.tts_client.synthesize(job.text)
+                    elapsed = time.perf_counter() - started
+                    if cancel_event.is_set():
+                        continue
+                    self.metrics.tts_finished(
+                        sequence_id=job.sequence_id,
+                        text=job.text,
+                        elapsed_seconds=elapsed,
+                        audio_seconds=audio.duration_seconds,
+                    )
+                    self._debug_voice_playback_start(job)
+                    self.audio_player.enqueue(audio)
+                    self.metrics.audio_enqueued(job.sequence_id)
+                except BaseException as exc:
+                    if not cancel_event.is_set():
+                        errors.append(exc)
+                        cancel_event.set()
+                finally:
+                    tts_queue.task_done()
+        finally:
+            worker_done.set()
+
+    def _finish_tts_turn(
+        self,
+        cancel_event: threading.Event,
+        tts_queue: queue.Queue[_TtsJob | None],
+        worker: threading.Thread,
+        worker_done: threading.Event,
+    ) -> None:
+        if cancel_event.is_set():
+            self._cancel_tts_turn(tts_queue)
+            return
+
+        while not cancel_event.is_set():
+            try:
+                tts_queue.put(None, timeout=0.05)
+                break
+            except queue.Full:
+                continue
+        if cancel_event.is_set():
+            self._cancel_tts_turn(tts_queue)
+            return
+
+        while not worker_done.wait(timeout=0.05):
+            if cancel_event.is_set():
+                self._cancel_tts_turn(tts_queue)
+                return
+
+        tts_queue.join()
+        worker.join()
+        if cancel_event.is_set():
+            self.audio_player.stop(clear=True)
+            return
+        self.audio_player.join()
+        self.audio_player.stop(clear=False)
+
+    def _cancel_tts_turn(self, tts_queue: queue.Queue[_TtsJob | None]) -> None:
+        try:
+            self.audio_player.stop(clear=True)
+        finally:
+            while True:
+                try:
+                    tts_queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    tts_queue.task_done()
+            tts_queue.put_nowait(None)
 
     def _debug_voice_playback_start(self, job: _TtsJob) -> None:
         if not bool(getattr(self.session, "debug", False)):
