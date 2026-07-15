@@ -56,8 +56,6 @@ class SemanticEventStoreTest(unittest.TestCase):
                         "guga_reflection": {
                             "appraisal": "我会在意这件事。",
                             "felt_response": "有点挂心。",
-                            "relational_intent": "之后自然关心。",
-                            "interpretation_confidence": 0.7,
                         },
                     }
                 ],
@@ -187,8 +185,6 @@ class SemanticEventStoreTest(unittest.TestCase):
                         "guga_reflection": {
                             "appraisal": "这是一项重要的财务状态更新。",
                             "felt_response": "我会认真对待。",
-                            "relational_intent": "之后以新额度为准。",
-                            "interpretation_confidence": 0.8,
                         },
                     }
                 ],
@@ -221,6 +217,50 @@ class SemanticEventStoreTest(unittest.TestCase):
             self.assertEqual(cancelled["inactive_reason"], "cancelled")
             self.assertIn("msg_cancel", cancelled["source_message_ids"])
             self.assertEqual(store.load_active(), [])
+
+    def test_new_write_persists_exactly_two_reflection_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
+            store.apply_operations(
+                operations=[
+                    {
+                        "operation": "create",
+                        "event_kind": "task",
+                        "subject": "user",
+                        "entity": "report",
+                        "description": "用户计划提交报告。",
+                        "source_message_ids": ["msg_user"],
+                        "guga_reflection": {
+                            "appraisal": "这件事很重要。",
+                            "felt_response": "我会挂心。",
+                        },
+                    }
+                ],
+                session_id="sess_reflection",
+                include_guga_reflection=True,
+            )
+
+            reflection = store.load_all()[0]["guga_reflection"]
+            self.assertEqual(set(reflection), {"appraisal", "felt_response"})
+            self.assertTrue(all(isinstance(value, str) and value for value in reflection.values()))
+
+    def test_load_all_preserves_legacy_four_field_reflection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "semantic_events.jsonl"
+            legacy = {
+                "id": "evt_legacy",
+                "type": "semantic_event",
+                "status": "active",
+                "guga_reflection": {
+                    "appraisal": "重要",
+                    "felt_response": "在意",
+                    "relational_intent": "继续关心",
+                    "interpretation_confidence": 0.8,
+                },
+            }
+            path.write_text(json.dumps(legacy, ensure_ascii=False) + "\n", encoding="utf-8")
+
+            self.assertEqual(SemanticEventStore(path).load_all(), [legacy])
 
 
 if __name__ == "__main__":

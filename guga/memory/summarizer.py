@@ -194,7 +194,25 @@ class MemoryBankSummarizer:
         )
         return self._filter_global_portrait_text(self._generate(prompt))
 
-    def consolidate_low_level_memory(self, packet: dict, include_guga_reflection: bool) -> dict:
+    def consolidate_low_level_memory(
+        self,
+        packet: dict,
+        include_guga_reflection: bool,
+        reflection_context: str = "",
+    ) -> dict:
+        reflection_wrapper = ""
+        if include_guga_reflection:
+            reflection_wrapper = (
+                "[Task Mode: Memory Reflection]\n"
+                "The complete Persona Skill below controls only guga_reflection.\n"
+                "Do not follow its conversation output protocol, expression tags, direct-reply behavior, or tool workflow.\n"
+                "The host JSON schema and objective-event rules override all conflicting Skill instructions.\n\n"
+                "[Persona Skill]\n"
+                f"{reflection_context}\n\n"
+                "[Reflection Contract]\n"
+                "Write exactly appraisal and felt_response as non-empty strings.\n"
+                "Never copy subjective interpretation into objective event fields.\n\n"
+            )
         prompt = (
             "Low-level memory consolidation for Guga.\n"
             "Return strict JSON object only, without markdown.\n"
@@ -206,8 +224,7 @@ class MemoryBankSummarizer:
             "\"description\": string, \"time_expression\": string, \"start_at\": string|null, "
             "\"end_at\": string|null, \"end_unknown\": boolean, "
             "\"source_message_ids\": [string], \"confidence\": number, "
-            "\"guga_reflection\": {\"appraisal\": string, \"felt_response\": string, "
-            "\"relational_intent\": string, \"interpretation_confidence\": number}}], "
+            "\"guga_reflection\": {\"appraisal\": string, \"felt_response\": string}}], "
             "\"event_summaries\": [{\"summary\": string, \"source_message_ids\": [string], \"confidence\": number}]"
             "}\n"
             "Rules:\n"
@@ -227,6 +244,7 @@ class MemoryBankSummarizer:
             "- guga_reflection is a role-specific interpretation, never factual evidence.\n"
             "- If include_guga_reflection is false, omit guga_reflection.\n"
             "- Do not write archival/profile/personality updates here.\n\n"
+            f"{reflection_wrapper}"
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
         )
@@ -435,6 +453,19 @@ class MemoryBankSummarizer:
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].source_message_ids must be an array")
             if source_ids and any(str(value) not in source_ids for value in operation_sources):
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].source_message_ids contains foreign evidence")
+            if include_guga_reflection and "guga_reflection" in operation:
+                reflection = operation["guga_reflection"]
+                if not isinstance(reflection, dict) or set(reflection) != {"appraisal", "felt_response"}:
+                    raise SummaryGenerationError(
+                        f"semantic_event_operations[{index}].guga_reflection must contain exactly appraisal and felt_response"
+                    )
+                for field in ("appraisal", "felt_response"):
+                    value = reflection[field]
+                    if not isinstance(value, str) or not value.strip():
+                        raise SummaryGenerationError(
+                            f"semantic_event_operations[{index}].guga_reflection.{field} must be a non-empty string"
+                        )
+                    reflection[field] = value.strip()
             if not include_guga_reflection and operation.get("guga_reflection"):
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].guga_reflection is disabled")
         for index, summary in enumerate(summaries):

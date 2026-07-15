@@ -283,7 +283,9 @@ class MemoryManagerTest(unittest.TestCase):
         context = self.manager.prepare_context("你撒个娇看看", session_id="sess_social")
         prompt = self.manager.compose_system_prompt("你是一个助手", context)
 
-        self.assertIn("[Base Persona]", prompt)
+        self.assertIn("[Task Mode: Conversation]", prompt)
+        self.assertIn("[Persona Skill]", prompt)
+        self.assertIn("你是一个助手", prompt)
         self.assertNotIn("[Relevant Event Summaries]", prompt)
         self.assertNotIn("[Historical Conversation Context]", prompt)
         self.assertNotIn("[Relevant Documents]", prompt)

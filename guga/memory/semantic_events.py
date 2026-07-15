@@ -11,7 +11,7 @@ from guga.memory.time_utils import format_beijing, now_beijing_iso, parse_dateti
 
 _OPERATIONS = {"create", "update", "replace", "cancel", "ignore"}
 _INACTIVE_REASONS = {"replaced", "cancelled", "expired", "invalidated"}
-_REFLECTION_KEYS = {"appraisal", "felt_response", "relational_intent", "interpretation_confidence"}
+_REFLECTION_KEYS = {"appraisal", "felt_response"}
 
 
 @dataclass(frozen=True)
@@ -278,9 +278,7 @@ def _reflection(value: object, include: bool) -> dict | None:
         return None
     if set(value) != _REFLECTION_KEYS:
         raise ValueError("guga_reflection has unsupported fields")
-    return {
-        "appraisal": str(value["appraisal"]).strip(),
-        "felt_response": str(value["felt_response"]).strip(),
-        "relational_intent": str(value["relational_intent"]).strip(),
-        "interpretation_confidence": _clamp(value["interpretation_confidence"], 0.5),
-    }
+    reflection = {key: str(value[key]).strip() for key in ("appraisal", "felt_response")}
+    if not all(reflection.values()):
+        raise ValueError("guga_reflection fields must be non-empty strings")
+    return reflection

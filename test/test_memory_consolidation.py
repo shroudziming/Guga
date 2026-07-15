@@ -8,7 +8,7 @@ from pathlib import Path
 from guga.chat.session import ChatSession
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
-from guga.memory.summarizer import MemoryBankSummarizer
+from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
 from guga.types import GenerationConfig
 
 
@@ -27,8 +27,6 @@ class ConsolidationModel:
             reflection = {
                 "appraisal": "Guga thinks this is important.",
                 "felt_response": "Guga feels attentive.",
-                "relational_intent": "Guga should remember the plan gently.",
-                "interpretation_confidence": 0.8,
             }
             if not include_reflection:
                 reflection = {}
@@ -138,12 +136,105 @@ class AlwaysBadLowModel(ConsolidationModel):
         return "chat answer"
 
 
+def _reflection_packet() -> dict:
+    return {
+        "new_turns": [
+            {
+                "user_message_id": "msg_user",
+                "assistant_message_id": "msg_assistant",
+                "user_text": "我计划明天交报告。",
+                "assistant_text": "记住了。",
+                "created_at": "2026-07-15T12:00:00+08:00",
+            }
+        ],
+        "recent_active_events": [],
+        "relevant_active_events": [],
+        "retrieved_context": [],
+    }
+
+
+class FixedLowLevelModel:
+    def __init__(self, reflection: dict) -> None:
+        self.reflection = reflection
+
+    def generate_reply(self, messages, gen):
+        _ = messages, gen
+        return json.dumps(
+            {
+                "semantic_event_operations": [
+                    {
+                        "operation": "create",
+                        "event_kind": "task",
+                        "subject": "user",
+                        "entity": "report",
+                        "description": "用户计划提交报告。",
+                        "time_expression": "明天",
+                        "start_at": "2026-07-16T00:00:00+08:00",
+                        "end_at": "2026-07-16T00:00:00+08:00",
+                        "end_unknown": False,
+                        "source_message_ids": ["msg_user"],
+                        "confidence": 0.9,
+                        "guga_reflection": self.reflection,
+                    }
+                ],
+                "event_summaries": [],
+            },
+            ensure_ascii=False,
+        )
+
+
 class MemoryConsolidationTest(unittest.TestCase):
     def _record_turns(self, manager: MemoryManager, session_id: str, count: int) -> None:
         for index in range(count):
             manager.record_user_message(session_id, f"turn {index}: submit project report on 2026-07-03")
             manager.record_assistant_message(session_id, "noted")
             manager.finalize_turn(session_id)
+
+    def test_low_level_prompt_injects_complete_skill_only_for_enabled_reflection(self) -> None:
+        model = ConsolidationModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
+        skill = "# Complete Skill\n## Reflection 写作协议\n只保留两个字段"
+
+        result = summarizer.consolidate_low_level_memory(
+            _reflection_packet(), include_guga_reflection=True, reflection_context=skill
+        )
+
+        self.assertIn("[Task Mode: Memory Reflection]", model.prompts[0])
+        self.assertIn(skill, model.prompts[0])
+        self.assertEqual(
+            set(result["semantic_event_operations"][0]["guga_reflection"]),
+            {"appraisal", "felt_response"},
+        )
+        self.assertEqual(len(model.prompts), 1)
+
+    def test_disabled_reflection_does_not_inject_skill(self) -> None:
+        model = ConsolidationModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
+
+        summarizer.consolidate_low_level_memory(
+            _reflection_packet(),
+            include_guga_reflection=False,
+            reflection_context="UNIQUE_SKILL_MARKER",
+        )
+
+        self.assertNotIn("UNIQUE_SKILL_MARKER", model.prompts[0])
+
+    def test_reflection_rejects_missing_empty_or_extra_fields(self) -> None:
+        invalid_reflections = (
+            {"felt_response": "在意"},
+            {"appraisal": "重要", "felt_response": ""},
+            {"appraisal": "重要", "felt_response": "在意", "relational_intent": "extra"},
+        )
+        for reflection in invalid_reflections:
+            with self.subTest(reflection=reflection):
+                model = FixedLowLevelModel(reflection)
+                summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
+                with self.assertRaises(SummaryGenerationError):
+                    summarizer.consolidate_low_level_memory(
+                        _reflection_packet(),
+                        include_guga_reflection=True,
+                        reflection_context="skill",
+                    )
 
     def test_pending_turns_do_not_call_llm_until_batch_threshold(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

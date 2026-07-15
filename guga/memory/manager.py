@@ -375,7 +375,7 @@ class MemoryManager:
         Returns:
             A single system prompt string consumed by the chat model.
         """
-        sections = ["[Base Persona]", base_prompt]
+        sections = ["[Task Mode: Conversation]", "[Persona Skill]", base_prompt]
         semantic_events = [hit for hit in memory_context.hits if hit.memory_type == "semantic_event"]
         derived_summaries = [hit for hit in memory_context.hits if hit.memory_type == "event_summary"]
         raw_evidence = [
@@ -681,6 +681,11 @@ class MemoryManager:
             low_result = self.summarizer.consolidate_low_level_memory(
                 low_packet,
                 include_guga_reflection=self.consolidation_config.include_guga_reflection,
+                reflection_context=(
+                    self.agent_identity.reflection_context
+                    if self.consolidation_config.include_guga_reflection and self.agent_identity is not None
+                    else ""
+                ),
             )
             self._debug_structured_attempts(session_id, batch_seq=batch_seq, stage="low")
             low_counts = self._apply_low_level_consolidation(
