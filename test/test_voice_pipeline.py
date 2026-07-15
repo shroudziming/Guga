@@ -333,6 +333,87 @@ class WavAudioPlayerTest(unittest.TestCase):
         self.assertFalse(graceful_thread.is_alive(), "graceful stop did not drain queued playback")
         self.assertEqual(player.played, [b"cancelled", b"next", b"queued"])
 
+    def test_cancel_retries_interrupt_when_playback_starts_after_first_attempt(self) -> None:
+        class WindowedWavAudioPlayer(WavAudioPlayer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.before_playback = threading.Event()
+                self.allow_playback = threading.Event()
+                self.underlying_playing = threading.Event()
+                self.release_current = threading.Event()
+                self.interrupt_attempted = threading.Event()
+                self.interrupted = threading.Event()
+                self.interrupt_attempts = 0
+                self.played: list[bytes] = []
+
+            def _play(self, audio: AudioData) -> None:
+                self.played.append(audio.data)
+                if len(self.played) > 1:
+                    return
+                self.before_playback.set()
+                if not self.allow_playback.wait(timeout=2.0):
+                    return
+                self.underlying_playing.set()
+                try:
+                    self.release_current.wait(timeout=2.0)
+                finally:
+                    self.underlying_playing.clear()
+
+            def _stop_current_playback(self) -> None:
+                self.interrupt_attempts += 1
+                self.interrupt_attempted.set()
+                if self.underlying_playing.is_set():
+                    self.interrupted.set()
+                    self.release_current.set()
+
+        def audio(label: str) -> AudioData:
+            return AudioData(
+                data=label.encode("ascii"),
+                sample_rate=32000,
+                channels=1,
+                sample_width=2,
+                duration_seconds=1.0,
+            )
+
+        player = WindowedWavAudioPlayer()
+        player.start()
+        player.enqueue(audio("cancelled-window"))
+        self.assertTrue(player.before_playback.wait(timeout=0.5))
+        cancelled_worker = player._thread
+        self.assertIsNotNone(cancelled_worker)
+        stop_errors: list[BaseException] = []
+
+        def stop_cancelled_playback() -> None:
+            try:
+                player.stop(clear=True)
+            except BaseException as exc:
+                stop_errors.append(exc)
+
+        stop_thread = threading.Thread(target=stop_cancelled_playback, daemon=True)
+        stop_thread.start()
+        self.assertTrue(player.interrupt_attempted.wait(timeout=0.5))
+        player.allow_playback.set()
+        stop_thread.join(timeout=0.75)
+        stopped_before_deadline = not stop_thread.is_alive()
+        try:
+            self.assertTrue(stopped_before_deadline, "cancel did not retry a missed playback interrupt")
+        finally:
+            player.allow_playback.set()
+            player.release_current.set()
+            stop_thread.join(timeout=2.5)
+
+        self.assertEqual(stop_errors, [])
+        self.assertGreaterEqual(player.interrupt_attempts, 2)
+        self.assertTrue(player.interrupted.is_set())
+        self.assertFalse(cancelled_worker.is_alive())
+
+        player.start()
+        player.enqueue(audio("next"))
+        player.join()
+        player.stop(clear=False)
+
+        self.assertEqual(player.played, [b"cancelled-window", b"next"])
+
 
 class VoiceToolModeTest(unittest.TestCase):
     def test_voice_chat_disables_tool_path_by_default(self) -> None:

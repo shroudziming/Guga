@@ -4,6 +4,7 @@ import io
 import queue
 import tempfile
 import threading
+import time
 import wave
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -90,13 +91,30 @@ class WavAudioPlayer:
         if clear:
             self._stop_requested.set()
             self._clear_queue()
-            self._stop_current_playback()
         self._queue.put(None)
-        thread.join(timeout=2.0 if clear else None)
+        if clear:
+            self._stop_cancelled_thread(thread)
+        else:
+            thread.join()
         if thread.is_alive():
             raise RuntimeError("audio playback thread did not stop after cancellation")
         self._stop_requested.set()
         self._thread = None
+
+    def _stop_cancelled_thread(self, thread: threading.Thread) -> None:
+        deadline = time.monotonic() + 2.0
+        interrupt_error: Exception | None = None
+        while thread.is_alive():
+            try:
+                self._stop_current_playback()
+            except Exception as exc:
+                interrupt_error = exc
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=min(0.05, remaining))
+        if thread.is_alive():
+            raise RuntimeError("audio playback thread did not stop after cancellation") from interrupt_error
 
     def _run(self) -> None:
         while True:
