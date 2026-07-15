@@ -26,11 +26,21 @@ ProgressCallback = Callable[[dict[str, Any]], None]
 
 
 class ConsolidationExhaustedError(RuntimeError):
-    def __init__(self, session_index: int, session_id: str, diagnostics: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        session_index: int,
+        session_id: str,
+        diagnostics: dict[str, Any],
+        *,
+        resume_stats: dict[str, int],
+        partial_stats: dict[str, int],
+    ) -> None:
         super().__init__(f"memory consolidation failed for {session_id}")
         self.session_index = session_index
         self.session_id = session_id
         self.diagnostics = diagnostics
+        self.resume_stats = resume_stats
+        self.partial_stats = partial_stats
 
 
 @dataclass(frozen=True)
@@ -148,6 +158,29 @@ def ingest_longmemeval_case_replay(
     stats = _initial_ingest_stats("replay", initial_stats)
     for session_index, session in enumerate(case.sessions[start_session_index:], start=start_session_index):
         session_id = _case_session_id(case, session_index)
+        session_start_stats = dict(stats)
+        if manager.has_active_consolidation(session_id):
+            flush_stats = manager.consolidate_until_settled(
+                session_id,
+                max_retry_cycles=3,
+                retry_delays=retry_delays,
+                progress=on_stage_progress,
+            )
+            if not bool(flush_stats.get("memory_complete", False)):
+                raise ConsolidationExhaustedError(
+                    session_index,
+                    session_id,
+                    flush_stats,
+                    resume_stats=session_start_stats,
+                    partial_stats=_stats_with_replayed_session(session_start_stats, session),
+                )
+            stats = _stats_with_replayed_session(stats, session)
+            for key in ("consolidation_batches", "low_level_updates", "high_level_updates", "high_level_noops"):
+                stats[key] += int(flush_stats.get(key, 0))
+            stats["sessions"] += 1
+            if on_session_completed is not None:
+                on_session_completed(session_index + 1, dict(stats))
+            continue
         has_open_user_turn = False
         for message in session:
             role = _normalize_role(message.role)
@@ -189,7 +222,13 @@ def ingest_longmemeval_case_replay(
             progress=on_stage_progress,
         )
         if not bool(flush_stats.get("memory_complete", False)):
-            raise ConsolidationExhaustedError(session_index, session_id, flush_stats)
+            raise ConsolidationExhaustedError(
+                session_index,
+                session_id,
+                flush_stats,
+                resume_stats=session_start_stats,
+                partial_stats=dict(stats),
+            )
         for key in ("consolidation_batches", "low_level_updates", "high_level_updates", "high_level_noops"):
             stats[key] += int(flush_stats.get(key, 0))
         stats["sessions"] += 1
@@ -293,7 +332,9 @@ def run_longmemeval_case(
                 ),
             )
         except ConsolidationExhaustedError as exc:
-            failed_stats = dict(initial_stats or _initial_ingest_stats("replay"))
+            failed_stats = dict(exc.partial_stats)
+            for key in ("consolidation_batches", "low_level_updates", "high_level_updates", "high_level_noops"):
+                failed_stats[key] = int(exc.resume_stats.get(key, 0)) + int(exc.diagnostics.get(key, 0))
             failed_result = {
                 "case_id": case.case_id,
                 "question_type": case.question_type,
@@ -315,7 +356,7 @@ def run_longmemeval_case(
                     "case_id": case.case_id,
                     "ingest_mode": ingest_mode,
                     "next_session_index": exc.session_index,
-                    "ingest": failed_stats,
+                    "ingest": exc.resume_stats,
                     "phase": "consolidation_failed",
                 },
             )
@@ -510,6 +551,15 @@ def _initial_ingest_stats(mode: str, initial_stats: dict[str, int] | None) -> di
         )
     initial_stats = initial_stats or {}
     return {key: int(initial_stats.get(key, 0)) for key in keys}
+
+
+def _stats_with_replayed_session(stats: dict[str, int], session: list[LongMemEvalMessage]) -> dict[str, int]:
+    updated = dict(stats)
+    completed_turns = sum(1 for message in session if _normalize_role(message.role) != "assistant")
+    updated["messages"] += len(session)
+    updated["finalized_turns"] += completed_turns
+    updated["completed_turns"] += completed_turns
+    return updated
 
 
 def _load_checkpoint(path: Path) -> dict[str, Any] | None:

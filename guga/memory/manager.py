@@ -806,6 +806,13 @@ class MemoryManager:
             "high_level_noops": int(session_state.get("high_level_noops", 0) or 0),
         }
 
+    def has_active_consolidation(self, session_id: str) -> bool:
+        """Return whether a persisted batch must be resumed before accepting replay input."""
+        with self._turn_state_lock:
+            payload = self._read_consolidation_state()
+            session_state = (payload.get("sessions", {}) or {}).get(session_id, {})
+            return isinstance(session_state.get("active_batch"), dict)
+
     def _build_low_level_packet(self, *, session_id: str, pending_turns: list[dict]) -> dict:
         new_turns = self._load_pending_turn_messages(session_id=session_id, pending_turns=pending_turns)
         query = "\n".join(

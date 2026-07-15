@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from guga.benchmark.longmemeval import (
     LONGMEMEVAL_SYSTEM_PROMPT,
@@ -534,6 +535,108 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             ]
             self.assertIn("ingest_session_completed", progress_phases)
             self.assertIn("case_completed", progress_phases)
+
+    def test_replay_resumes_failed_active_batch_without_reingesting_session(self) -> None:
+        class RecoveringModel:
+            def __init__(self) -> None:
+                self.fail_low_stage = True
+
+            def generate_reply(self, messages, gen):
+                _ = gen
+                prompt = messages[-1]["content"]
+                if "Low-level memory consolidation" in prompt:
+                    if self.fail_low_stage:
+                        return json.dumps({"semantic_event_operations": {}, "event_summaries": []})
+                    return json.dumps(
+                        {
+                            "semantic_event_operations": [
+                                {
+                                    "operation": "create",
+                                    "target_event_id": "evt_model_invented",
+                                    "event_kind": "state_change",
+                                    "subject": "user",
+                                    "entity": "notebook preference",
+                                    "description": "The user likes blue notebooks.",
+                                    "time_expression": "",
+                                    "start_at": None,
+                                    "end_at": None,
+                                    "end_unknown": True,
+                                    "source_message_ids": [],
+                                    "confidence": 0.9,
+                                }
+                            ],
+                            "event_summaries": [],
+                        }
+                    )
+                if "High-level memory consolidation" in prompt:
+                    return json.dumps(
+                        {
+                            "decision": "no_high_level_update",
+                            "reason": "No stable long-term memory found.",
+                        }
+                    )
+                return "blue notebooks"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "longmemeval_resume_failed.json"
+            dataset.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question_id": "q_resume_failed",
+                            "question": "What does the user like?",
+                            "answer": "blue notebooks",
+                            "haystack_session_ids": ["history_1"],
+                            "haystack_dates": ["2026/01/01 (Thu) 09:30"],
+                            "haystack_sessions": [
+                                [
+                                    {"role": "user", "content": "I like blue notebooks."},
+                                    {"role": "assistant", "content": "I will remember that."},
+                                ]
+                            ],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            workspace = benchmark_workspace("longmemeval", root=root, run_id="resume_failed_001")
+            model = RecoveringModel()
+
+            with patch("guga.memory.manager.sleep", return_value=None):
+                failed = run_longmemeval_benchmark(
+                    dataset_path=dataset,
+                    model=model,
+                    workspace=workspace,
+                    generation=GenerationConfig(),
+                    enable_semantic=False,
+                    ingest_mode="replay",
+                )[0]
+
+            self.assertEqual(failed["status"], "consolidation_failed")
+            self.assertEqual(failed["ingest"]["messages"], 2)
+            self.assertEqual(failed["ingest"]["completed_turns"], 1)
+            session_file = workspace.case_memory_root("q_resume_failed") / "sessions" / "history_1.jsonl"
+            self.assertEqual(len(session_file.read_text(encoding="utf-8").splitlines()), 2)
+
+            model.fail_low_stage = False
+            with patch("guga.memory.manager.sleep", return_value=None):
+                completed = run_longmemeval_benchmark(
+                    dataset_path=dataset,
+                    model=model,
+                    workspace=workspace,
+                    generation=GenerationConfig(),
+                    enable_semantic=False,
+                    ingest_mode="replay",
+                )[0]
+
+            self.assertEqual(completed["status"], "complete")
+            self.assertEqual(completed["prediction"], "blue notebooks")
+            self.assertEqual(completed["ingest"]["sessions"], 1)
+            self.assertEqual(completed["ingest"]["messages"], 2)
+            self.assertEqual(completed["ingest"]["completed_turns"], 1)
+            self.assertEqual(len(session_file.read_text(encoding="utf-8").splitlines()), 2)
+            self.assertFalse(workspace.case_checkpoint_file("q_resume_failed").exists())
 
 
 if __name__ == "__main__":
