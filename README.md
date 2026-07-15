@@ -305,7 +305,7 @@ python -B -m unittest discover -s test
 
 ```powershell
 $env:GUGA_RUN_LIVE_API_TESTS = "1"
-python -m unittest test.test_persona_skill_live_api
+python -m unittest discover -s test -p test_persona_skill_live_api.py
 ```
 
 真实记忆 API 小场景验证脚本位于 `scripts/live_memory_api_validation.py`；
