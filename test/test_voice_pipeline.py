@@ -113,6 +113,21 @@ class DebugFakeSession(FakeSession):
         self.session_id = "debug_session"
 
 
+class MultiTurnSession:
+    def __init__(self, turns: list[list[str]]) -> None:
+        self.turns = turns
+        self.turn_index = 0
+
+    def reply_stream(self, user_input: str, cancel_event: threading.Event | None = None) -> Iterator[str]:
+        _ = user_input
+        chunks = self.turns[self.turn_index]
+        self.turn_index += 1
+        for chunk in chunks:
+            yield chunk
+            if self.turn_index == 1 and cancel_event is not None:
+                cancel_event.set()
+
+
 class FakeTtsClient:
     def __init__(self) -> None:
         self.requests: list[str] = []
@@ -270,6 +285,59 @@ class VoiceToolModeTest(unittest.TestCase):
 
 
 class VoiceChatRunnerTest(unittest.TestCase):
+    def test_filters_expression_tags_and_emits_expression_events(self) -> None:
+        session = FakeSession(["[hap", "py]你好。[side]（挥手）继续。"])
+        printed: list[str] = []
+        expressions: list[str] = []
+        tts = FakeTtsClient()
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=tts,
+            audio_player=FakeAudioPlayer(),
+            text_sink=printed.append,
+            expression_tags=("happy", "side"),
+            expression_sink=expressions.append,
+        )
+
+        runner.run_turn("hi")
+
+        self.assertEqual("".join(printed), "你好。（挥手）继续。")
+        self.assertEqual(tts.requests, ["你好。", "继续。"])
+        self.assertEqual(expressions, ["happy", "side"])
+
+    def test_keeps_unknown_and_unterminated_tags_as_visible_text(self) -> None:
+        session = FakeSession(["[unknown]你好。[hap"])
+        printed: list[str] = []
+        tts = FakeTtsClient()
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=tts,
+            audio_player=FakeAudioPlayer(),
+            text_sink=printed.append,
+            expression_tags=("happy",),
+        )
+
+        runner.run_turn("hi")
+
+        self.assertEqual("".join(printed), "[unknown]你好。[hap")
+        self.assertEqual(tts.requests, ["[unknown]你好。", "[hap"])
+
+    def test_partial_tag_state_does_not_leak_after_cancelled_turn(self) -> None:
+        session = MultiTurnSession([["[hap"], ["py]你好。"]])
+        printed: list[str] = []
+        runner = VoiceChatRunner(
+            session=session,
+            tts_client=FakeTtsClient(),
+            audio_player=FakeAudioPlayer(),
+            text_sink=printed.append,
+            expression_tags=("happy",),
+        )
+
+        runner.run_turn("first", cancel_event=threading.Event())
+        runner.run_turn("second", cancel_event=threading.Event())
+
+        self.assertEqual(printed, ["[hap", "py]你好。"])
+
     def test_streams_text_and_synthesizes_sentences_in_order(self) -> None:
         session = FakeSession(["你好，", "我是咕嘎。", "今天继续。"])
         tts = FakeTtsClient()

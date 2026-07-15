@@ -122,6 +122,7 @@ def main() -> None:
             text_sink=lambda chunk: print(chunk, end="", flush=True),
             sentence_buffer=sentence_buffer_from_env(os.environ),
             raise_tts_errors=False,
+            expression_tags=persona.expression_tags,
         )
 
         try:

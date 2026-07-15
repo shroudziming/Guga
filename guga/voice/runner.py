@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass
 from typing import Protocol
 
+from guga.persona import PersonaExpression, PersonaOutputParser, PersonaText
 from guga.voice.audio_player import AudioData
 from guga.voice.metrics import VoiceMetrics, VoiceMetricsSummary
 from guga.voice.sentence_buffer import TextSentenceBuffer
@@ -52,6 +53,8 @@ class VoiceChatRunner:
         metrics: VoiceMetrics | None = None,
         max_queue_size: int = 8,
         raise_tts_errors: bool = True,
+        expression_tags: tuple[str, ...] = (),
+        expression_sink=None,
     ) -> None:
         self.session = session
         self.tts_client = tts_client
@@ -61,6 +64,8 @@ class VoiceChatRunner:
         self.spoken_text_filter = SpokenTextFilter()
         self.metrics = metrics or VoiceMetrics()
         self.raise_tts_errors = raise_tts_errors
+        self.expression_tags = expression_tags
+        self.expression_sink = expression_sink
         self._queue: queue.Queue[_TtsJob | None] = queue.Queue(maxsize=max_queue_size)
         self._errors: list[BaseException] = []
 
@@ -78,23 +83,39 @@ class VoiceChatRunner:
         worker.start()
 
         sequence_id = 0
+        persona_parser = PersonaOutputParser(self.expression_tags)
+
+        def route_persona_events(events, *, spoken: bool = True) -> None:
+            nonlocal sequence_id
+            for event in events:
+                if isinstance(event, PersonaExpression):
+                    if self.expression_sink is not None:
+                        self.expression_sink(event.tag)
+                    continue
+                if isinstance(event, PersonaText):
+                    self.text_sink(event.text)
+                    if not spoken:
+                        continue
+                    spoken_chunk = self.spoken_text_filter.feed(event.text)
+                    for segment in self.sentence_buffer.feed_segments(spoken_chunk):
+                        sequence_id += 1
+                        self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
+
         stream = self.session.reply_stream(user_input, cancel_event=cancel_event)
         try:
             for chunk in stream:
                 if cancel_event.is_set():
                     break
                 self.metrics.text_chunk_received()
-                self.text_sink(chunk)
-                spoken_chunk = self.spoken_text_filter.feed(chunk)
-                for segment in self.sentence_buffer.feed_segments(spoken_chunk):
-                    sequence_id += 1
-                    self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
+                route_persona_events(persona_parser.feed(chunk))
 
             if not cancel_event.is_set():
+                route_persona_events(persona_parser.flush())
                 for segment in self.sentence_buffer.flush_segments():
                     sequence_id += 1
                     self._enqueue_sentence(sequence_id, segment.text, segment.split_reason)
             else:
+                route_persona_events(persona_parser.flush(), spoken=False)
                 self.sentence_buffer.flush()
         except BaseException:
             cancel_event.set()

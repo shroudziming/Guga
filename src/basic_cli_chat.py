@@ -14,7 +14,7 @@ from guga.config import DEFAULT_CACHE_DIR, DEFAULT_MODEL_ID, default_generation_
 from guga.memory.agent_identity import identity_from_persona
 from guga.memory.manager import MemoryManager
 from guga.models import create_chat_model
-from guga.persona import PersonaManager
+from guga.persona import PersonaExpression, PersonaManager, PersonaOutputParser, PersonaText
 from guga.utils.debug_reporter import FileDebugSink
 from guga.utils.paths import debug_reports_dir, personas_dir
 
@@ -98,17 +98,30 @@ def main() -> None:
 
         cancel_event = Event()
         stream = session.reply_stream(user_text, cancel_event=cancel_event)
+        output_parser = PersonaOutputParser(persona.expression_tags)
 
         print("小咕嘎> ", end="", flush=True)
         try:
             for chunk in stream:
-                print(chunk, end="", flush=True)
+                _render_persona_events(output_parser.feed(chunk), debug_enabled=debug_enabled)
+            _render_persona_events(output_parser.flush(), debug_enabled=debug_enabled)
             print("\n")
         except KeyboardInterrupt:
             cancel_event.set()
             for _ in stream:
                 pass
+            _render_persona_events(output_parser.flush(), debug_enabled=debug_enabled)
             print("\n[已停止生成]\n")
+
+
+def _render_persona_events(events, *, debug_enabled: bool) -> None:
+    for event in events:
+        if isinstance(event, PersonaExpression):
+            if debug_enabled:
+                print(f"[DEBUG][persona_expression] tag={event.tag}", file=sys.stderr)
+            continue
+        if isinstance(event, PersonaText):
+            print(event.text, end="", flush=True)
 
 
 if __name__ == "__main__":
