@@ -247,6 +247,60 @@ class AgentMemoryIsolationTest(unittest.TestCase):
                     enable_semantic=False,
                 )
 
+    def test_invalid_manifest_is_rejected_without_rewriting_identity_files(self) -> None:
+        valid_schema_one = {
+            "schema_version": 1,
+            "agent_id": "default",
+            "persona_source": "config/personas/default.json",
+            "persona_fingerprint": "inline-v1",
+            "created_at": "2026-07-10T10:00:00+08:00",
+        }
+        valid_schema_two = {
+            "schema_version": 2,
+            "agent_id": "default",
+            "created_at": "2026-07-10T10:00:00+08:00",
+        }
+        invalid_payloads = {
+            "non_object": [],
+            "unknown_schema": {**valid_schema_two, "schema_version": 3},
+            "schema_one_missing_field": {
+                key: value for key, value in valid_schema_one.items() if key != "persona_source"
+            },
+            "schema_one_extra_field": {**valid_schema_one, "extra": True},
+            "schema_two_missing_field": {
+                key: value for key, value in valid_schema_two.items() if key != "created_at"
+            },
+            "schema_two_extra_field": {**valid_schema_two, "extra": True},
+            "invalid_schema_type": {**valid_schema_two, "schema_version": "2"},
+            "invalid_agent_id": {**valid_schema_two, "agent_id": "other"},
+            "invalid_created_at": {**valid_schema_two, "created_at": ""},
+            "malformed_created_at": {**valid_schema_two, "created_at": "not-a-date"},
+            "invalid_persona_source": {**valid_schema_one, "persona_source": ""},
+            "invalid_persona_fingerprint": {**valid_schema_one, "persona_fingerprint": ""},
+        }
+
+        for label, payload in invalid_payloads.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir) / "agent-root"
+                root.mkdir()
+                manifest_path = root / "agent_manifest.json"
+                revisions_path = root / "persona_revisions.jsonl"
+                manifest_before = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+                revisions_before = b'{"source":"old","fingerprint":"old","activated_at":"old"}\n'
+                manifest_path.write_bytes(manifest_before)
+                revisions_path.write_bytes(revisions_before)
+
+                with self.assertRaises(ValueError):
+                    MemoryManager(
+                        memory_root=root,
+                        agent_identity=AgentIdentity("default", "skill", "skill.md", "v2"),
+                        model=_ReplyOnlyModel(),
+                        enable_semantic=False,
+                    )
+
+                self.assertEqual(manifest_path.read_bytes(), manifest_before)
+                self.assertEqual(revisions_path.read_bytes(), revisions_before)
+
     def _patch_memory_roots(self, memory_base: Path):
         stack = ExitStack()
         stack.enter_context(patch("guga.memory.manager.memory_data_dir", lambda: memory_base))

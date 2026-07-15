@@ -213,13 +213,35 @@ class MemoryManager:
         legacy_revision = None
         if manifest_path.exists():
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if payload.get("agent_id") != self.agent_identity.agent_id:
+            if not isinstance(payload, dict):
+                raise ValueError(f"agent manifest must be an object: {manifest_path}")
+            schema_version = payload.get("schema_version")
+            if type(schema_version) is not int or schema_version not in {1, 2}:
+                raise ValueError(f"unsupported agent manifest schema in {manifest_path}")
+            expected_keys = (
+                {"schema_version", "agent_id", "persona_source", "persona_fingerprint", "created_at"}
+                if schema_version == 1
+                else {"schema_version", "agent_id", "created_at"}
+            )
+            if set(payload) != expected_keys:
+                raise ValueError(f"invalid agent manifest keys in {manifest_path}")
+            required_strings = {"agent_id", "created_at"}
+            if schema_version == 1:
+                required_strings.update({"persona_source", "persona_fingerprint"})
+            if any(
+                not isinstance(payload[key], str) or not payload[key].strip()
+                for key in required_strings
+            ):
+                raise ValueError(f"invalid agent manifest value in {manifest_path}")
+            if parse_datetime(payload["created_at"]) is None:
+                raise ValueError(f"invalid agent manifest created_at in {manifest_path}")
+            if payload["agent_id"] != self.agent_identity.agent_id:
                 raise ValueError("agent manifest mismatch for agent_id")
-            created_at = str(payload.get("created_at") or now_beijing_iso())
-            if int(payload.get("schema_version", 0)) == 1:
+            created_at = payload["created_at"]
+            if schema_version == 1:
                 legacy_revision = (
-                    str(payload.get("persona_source", "")),
-                    str(payload.get("persona_fingerprint", "")),
+                    payload["persona_source"],
+                    payload["persona_fingerprint"],
                     created_at,
                 )
         else:
