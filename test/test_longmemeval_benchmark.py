@@ -253,6 +253,10 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                                     "time_expression": "",
                                     "end_unknown": True,
                                     "source_message_ids": [],
+                                    "guga_reflection": {
+                                        "appraisal": "This preference is worth remembering.",
+                                        "felt_response": "I will keep it in mind.",
+                                    },
                                 }
                             ],
                             "event_summaries": [

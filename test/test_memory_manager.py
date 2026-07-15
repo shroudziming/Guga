@@ -30,6 +30,10 @@ class SummaryModel:
                             "time_expression": "",
                             "end_unknown": True,
                             "source_message_ids": [],
+                            "guga_reflection": {
+                                "appraisal": "这项工作地点信息值得记住。",
+                                "felt_response": "我会认真留意。",
+                            },
                         }
                     ],
                     "event_summaries": [

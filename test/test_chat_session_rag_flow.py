@@ -35,6 +35,10 @@ class FakeChatModel:
                             "time_expression": "",
                             "end_unknown": True,
                             "source_message_ids": [],
+                            "guga_reflection": {
+                                "appraisal": "这项工作背景值得记住。",
+                                "felt_response": "我会认真留意。",
+                            },
                         }
                     ],
                     "event_summaries": [
@@ -167,6 +171,10 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                                     "time_expression": "",
                                     "end_unknown": True,
                                     "source_message_ids": [],
+                                    "guga_reflection": {
+                                        "appraisal": "This work context is worth remembering.",
+                                        "felt_response": "I will keep it in mind.",
+                                    },
                                 }
                             ],
                             "event_summaries": [

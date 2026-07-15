@@ -25,7 +25,7 @@ class SummaryModel:
             return json.dumps(
                 {
                     "semantic_event_operations": [
-                        {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "user context", "description": summary, "time_expression": "", "end_unknown": True, "source_message_ids": []}
+                        {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "user context", "description": summary, "time_expression": "", "end_unknown": True, "source_message_ids": [], "guga_reflection": {"appraisal": "这项用户背景值得记住。", "felt_response": "我会认真留意。"}}
                     ],
                     "event_summaries": [
                         {
@@ -127,7 +127,7 @@ class MemoryBankReproTest(unittest.TestCase):
                     return json.dumps(
                         {
                             "semantic_event_operations": [
-                                {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "work", "description": "The user works as a backend engineer in Hangzhou.", "time_expression": "", "end_unknown": True, "source_message_ids": []}
+                                {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "work", "description": "The user works as a backend engineer in Hangzhou.", "time_expression": "", "end_unknown": True, "source_message_ids": [], "guga_reflection": {"appraisal": "This work context is worth remembering.", "felt_response": "I will keep it in mind."}}
                             ],
                             "event_summaries": [
                                 {
