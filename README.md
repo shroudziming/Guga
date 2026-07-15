@@ -61,6 +61,17 @@ session 消息中检索核验。
 
 日常 agent 的 event 可包含角色化 `guga_reflection`，但该字段不参与事实真值、
 时间字段或冲突处理。LongMemEval replay 会关闭 reflection 和 user model 更新。
+新写入的 `guga_reflection` 只包含非空的 `appraisal` 和 `felt_response` 两个字段。
+
+### Persona Skill 与修订审计
+
+`config/personas/default/SKILL.md` 是默认 persona 的来源。加载时会去掉
+frontmatter，并把完整 Skill body 同时作为对话 system prompt，以及启用角色反思时
+低层记忆整理 prompt 的人格上下文。
+
+修改默认 Skill 不会切换记忆身份：只要 `agent_id=default` 保持不变，就会继续使用
+`data/memory/agents/default/` 中的既有记忆；每个新的 Skill fingerprint 会在该目录的
+`persona_revisions.jsonl` 中追加一条修订审计记录。
 
 ### 两阶段批量整理
 
@@ -196,6 +207,9 @@ python -B src\voice_cli_chat.py
 ```
 
 语音层位于 `guga/voice/`，不修改 `ChatSession` 的记忆和 RAG 边界。
+允许的 persona 表情标签会在送入 TTS 前从正文中过滤，并按顺序暴露给
+`VoiceChatRunner` 的 `expression_sink` 回调；这只是未来接入 Live2D 的 seam，
+当前尚未实现 Live2D transport。
 
 ## Tool Calling
 
@@ -284,6 +298,14 @@ test/                   unittest 测试
 
 ```powershell
 python -B -m unittest discover -s test
+```
+
+真实 API 的 Persona Skill 验收测试默认跳过。显式设置
+`GUGA_RUN_LIVE_API_TESTS=1` 后可运行，测试会发起真实 API 请求并可能产生费用：
+
+```powershell
+$env:GUGA_RUN_LIVE_API_TESTS = "1"
+python -m unittest test.test_persona_skill_live_api
 ```
 
 真实记忆 API 小场景验证脚本位于 `scripts/live_memory_api_validation.py`；
