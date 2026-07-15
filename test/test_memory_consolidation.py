@@ -154,15 +154,12 @@ def _reflection_packet() -> dict:
 
 
 class FixedLowLevelModel:
-    def __init__(self, reflection: dict) -> None:
+    def __init__(self, reflection: dict | None) -> None:
         self.reflection = reflection
 
     def generate_reply(self, messages, gen):
         _ = messages, gen
-        return json.dumps(
-            {
-                "semantic_event_operations": [
-                    {
+        operation = {
                         "operation": "create",
                         "event_kind": "task",
                         "subject": "user",
@@ -174,9 +171,12 @@ class FixedLowLevelModel:
                         "end_unknown": False,
                         "source_message_ids": ["msg_user"],
                         "confidence": 0.9,
-                        "guga_reflection": self.reflection,
                     }
-                ],
+        if self.reflection is not None:
+            operation["guga_reflection"] = self.reflection
+        return json.dumps(
+            {
+                "semantic_event_operations": [operation],
                 "event_summaries": [],
             },
             ensure_ascii=False,
@@ -221,6 +221,7 @@ class MemoryConsolidationTest(unittest.TestCase):
 
     def test_reflection_rejects_missing_empty_or_extra_fields(self) -> None:
         invalid_reflections = (
+            None,
             {"felt_response": "在意"},
             {"appraisal": "重要", "felt_response": ""},
             {"appraisal": "重要", "felt_response": "在意", "relational_intent": "extra"},

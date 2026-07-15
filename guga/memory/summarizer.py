@@ -453,6 +453,14 @@ class MemoryBankSummarizer:
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].source_message_ids must be an array")
             if source_ids and any(str(value) not in source_ids for value in operation_sources):
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].source_message_ids contains foreign evidence")
+            if (
+                include_guga_reflection
+                and action in {"create", "update", "replace"}
+                and "guga_reflection" not in operation
+            ):
+                raise SummaryGenerationError(
+                    f"semantic_event_operations[{index}].guga_reflection is required for {action}"
+                )
             if include_guga_reflection and "guga_reflection" in operation:
                 reflection = operation["guga_reflection"]
                 if not isinstance(reflection, dict) or set(reflection) != {"appraisal", "felt_response"}:
