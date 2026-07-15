@@ -6,7 +6,7 @@ import time
 import unittest
 from collections.abc import Iterator
 
-from guga.voice.audio_player import AudioData, NullAudioPlayer, audio_player_from_env
+from guga.voice.audio_player import AudioData, NullAudioPlayer, WavAudioPlayer, audio_player_from_env
 from guga.voice.metrics import VoiceMetrics
 from guga.voice.runner import VoiceChatRunner
 from guga.voice.sentence_buffer import TextSentenceBuffer, sentence_buffer_from_env
@@ -270,6 +270,68 @@ class AudioPlayerFactoryTest(unittest.TestCase):
         player = audio_player_from_env({"GUGA_TTS_PLAY_AUDIO": "0"})
 
         self.assertIsInstance(player, NullAudioPlayer)
+
+
+class WavAudioPlayerTest(unittest.TestCase):
+    def test_cancel_interrupts_current_playback_and_player_can_be_reused(self) -> None:
+        class ControllableWavAudioPlayer(WavAudioPlayer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.playback_started = threading.Event()
+                self.release_current = threading.Event()
+                self.played: list[bytes] = []
+
+            def _play(self, audio: AudioData) -> None:
+                self.played.append(audio.data)
+                self.playback_started.set()
+                self.release_current.wait(timeout=3.0)
+
+            def _stop_current_playback(self) -> None:
+                self.release_current.set()
+
+        def audio(label: str) -> AudioData:
+            return AudioData(
+                data=label.encode("ascii"),
+                sample_rate=32000,
+                channels=1,
+                sample_width=2,
+                duration_seconds=1.0,
+            )
+
+        player = ControllableWavAudioPlayer()
+        player.start()
+        player.enqueue(audio("cancelled"))
+        self.assertTrue(player.playback_started.wait(timeout=0.5))
+        cancelled_worker = player._thread
+        self.assertIsNotNone(cancelled_worker)
+
+        cancel_thread = threading.Thread(target=player.stop, kwargs={"clear": True}, daemon=True)
+        cancel_thread.start()
+        try:
+            cancel_thread.join(timeout=0.5)
+            self.assertFalse(cancel_thread.is_alive(), "cancel stop waited for synchronous playback")
+            self.assertFalse(cancelled_worker.is_alive())
+        finally:
+            player.release_current.set()
+            cancel_thread.join(timeout=2.5)
+
+        player.playback_started.clear()
+        player.release_current.clear()
+        player.start()
+        player.enqueue(audio("next"))
+        self.assertTrue(player.playback_started.wait(timeout=0.5))
+        player.enqueue(audio("queued"))
+
+        graceful_thread = threading.Thread(target=player.stop, kwargs={"clear": False}, daemon=True)
+        graceful_thread.start()
+        deadline = time.monotonic() + 0.5
+        while player._queue.qsize() < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        player.release_current.set()
+        graceful_thread.join(timeout=1.0)
+
+        self.assertFalse(graceful_thread.is_alive(), "graceful stop did not drain queued playback")
+        self.assertEqual(player.played, [b"cancelled", b"next", b"queued"])
 
 
 class VoiceToolModeTest(unittest.TestCase):

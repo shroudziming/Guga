@@ -84,12 +84,19 @@ class WavAudioPlayer:
         self._queue.join()
 
     def stop(self, clear: bool = False) -> None:
+        thread = self._thread
+        if thread is None:
+            return
         if clear:
+            self._stop_requested.set()
             self._clear_queue()
-        self._stop_requested.set()
+            self._stop_current_playback()
         self._queue.put(None)
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
+        thread.join(timeout=2.0 if clear else None)
+        if thread.is_alive():
+            raise RuntimeError("audio playback thread did not stop after cancellation")
+        self._stop_requested.set()
+        self._thread = None
 
     def _run(self) -> None:
         while True:
@@ -121,6 +128,11 @@ class WavAudioPlayer:
                     temp_path.unlink(missing_ok=True)
                 except OSError:
                     pass
+
+    def _stop_current_playback(self) -> None:
+        import winsound
+
+        winsound.PlaySound(None, 0)
 
     def _clear_queue(self) -> None:
         while True:
