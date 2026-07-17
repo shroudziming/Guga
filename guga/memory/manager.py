@@ -454,10 +454,17 @@ class MemoryManager:
         if hit.memory_type == "conversation_turn" and not hit.chunk_id and len(text) > DEFAULT_RAG_CHUNK_SIZE:
             text = text[:DEFAULT_RAG_CHUNK_SIZE].rstrip() + "..."
         chunk_ref = f" | chunk={hit.chunk_id}" if hit.chunk_id else ""
-        return (
+        rendered = (
             f"- ({hit.id} | score={hit.score:.2f} | retention={hit.retention:.2f} | "
             f"S={hit.memory_strength} | at={timestamp} | src={source_ref}{chunk_ref}) {text}"
         )
+        if hit.memory_type == "semantic_event" and hit.guga_reflection:
+            rendered += (
+                "\n  [Guga Reflection — subjective, not factual evidence]"
+                f" appraisal={hit.guga_reflection.get('appraisal', '')!r};"
+                f" felt_response={hit.guga_reflection.get('felt_response', '')!r}"
+            )
+        return rendered
 
     def _format_beijing_minute(self, value: str) -> str:
         if not value:
@@ -1376,6 +1383,11 @@ class MemoryManager:
                     semantic_score=round(score, 4),
                     score_source="semantic",
                     score_components=components,
+                    guga_reflection={
+                        str(key): str(value).strip()
+                        for key, value in (record.get("guga_reflection", {}) or {}).items()
+                        if key in {"appraisal", "felt_response"} and str(value).strip()
+                    },
                 ),
             )
 
@@ -1938,6 +1950,7 @@ class MemoryManager:
             "retention": retention_score(normalized),
             "importance": float(payload.get("importance", 0.0) or 0.0),
             "confidence": float(payload.get("confidence", 0.0) or 0.0),
+            "guga_reflection": dict(payload.get("guga_reflection", {}) or {}),
             "status": str(payload.get("status", "active")),
         }
 
