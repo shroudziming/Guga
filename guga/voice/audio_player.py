@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 import wave
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,6 +19,7 @@ class AudioData:
     sample_width: int
     duration_seconds: float
     media_type: str = "wav"
+    sequence_id: int | None = None
 
     @classmethod
     def from_wav_bytes(cls, data: bytes) -> "AudioData":
@@ -65,10 +66,20 @@ class NullAudioPlayer:
 class WavAudioPlayer:
     """Background WAV player using Windows winsound."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        playback_event_callback: Callable[[str, int | None, int], None] | None = None,
+    ) -> None:
         self._queue: queue.Queue[AudioData | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._stop_requested = threading.Event()
+        self._playback_event_callback = playback_event_callback
+
+    def set_playback_event_callback(
+        self,
+        playback_event_callback: Callable[[str, int | None, int], None] | None,
+    ) -> None:
+        self._playback_event_callback = playback_event_callback
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -124,9 +135,19 @@ class WavAudioPlayer:
                     return
                 if self._stop_requested.is_set():
                     continue
-                self._play(audio)
+                queue_depth = self._queue.qsize()
+                self._emit_playback_event("playback_started", audio, queue_depth)
+                try:
+                    self._play(audio)
+                finally:
+                    self._emit_playback_event("playback_finished", audio, self._queue.qsize())
             finally:
                 self._queue.task_done()
+
+    def _emit_playback_event(self, event: str, audio: AudioData, queue_depth: int) -> None:
+        callback = self._playback_event_callback
+        if callback is not None:
+            callback(event, audio.sequence_id, queue_depth)
 
     def _play(self, audio: AudioData) -> None:
         if audio.media_type.lower() != "wav":

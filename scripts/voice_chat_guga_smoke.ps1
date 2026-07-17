@@ -6,7 +6,7 @@ param(
     [string]$SoVitsWeightPath = "D:\work\LLM\external\GPT-SoVITS\SoVITS_weights_v2\guga_voice_e8_e8_s800.pth",
     [string]$MediaType = "raw",
     [string]$StreamingMode = "1",
-    [int]$SentenceMaxChars = 16,
+    [int]$SentenceMaxChars = 48,
     [switch]$NoAudio,
     [switch]$NoPrewarm,
     [switch]$WithTools,
