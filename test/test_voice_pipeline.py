@@ -31,6 +31,14 @@ class SentenceBufferTest(unittest.TestCase):
         self.assertEqual(buffer.feed("一二三四五六七八"), ["一二三四五六"])
         self.assertEqual(buffer.flush(), ["七八"])
 
+    def test_forced_split_includes_immediately_following_terminal_boundary(self) -> None:
+        buffer = TextSentenceBuffer(max_chars=6)
+
+        self.assertEqual(buffer.feed("一二三四五六。后"), ["一二三四五六。"])
+
+    def test_punctuation_only_text_is_not_speakable(self) -> None:
+        self.assertEqual(TextSentenceBuffer().feed("。！？；!?;"), [])
+
     def test_reports_split_reasons_for_debugging(self) -> None:
         buffer = TextSentenceBuffer(max_chars=6)
 
@@ -45,10 +53,10 @@ class SentenceBufferTest(unittest.TestCase):
         self.assertEqual([segment.text for segment in flush_segments], ["刚看到"])
         self.assertEqual(flush_segments[0].split_reason, "flush")
 
-    def test_voice_env_defaults_to_short_latency_split(self) -> None:
+    def test_voice_env_defaults_to_48_character_split(self) -> None:
         buffer = sentence_buffer_from_env({})
 
-        self.assertEqual(buffer.feed("一二三四五六七八九十一二三四五六七八"), ["一二三四五六七八九十一二三四五六"])
+        self.assertEqual(buffer.feed("一" * 49), ["一" * 48])
 
 
 class SpokenTextFilterTest(unittest.TestCase):
