@@ -80,6 +80,8 @@ def main() -> None:
             continue
 
         if user_text == "/exit":
+            result = session.settle_memory_for_shutdown()
+            print(f"记忆整理: {result.get('status', 'unknown')}")
             print("已退出。")
             return
 

@@ -264,6 +264,23 @@ class ChatSessionRagFlowTest(unittest.TestCase):
             self.assertIn("retry answer", rows)
             manager.wait_for_background_tasks(timeout=3)
 
+    def test_settle_memory_for_shutdown_waits_then_forces_tail_consolidation(self) -> None:
+        manager = MemoryManager(memory_root=Path(tempfile.mkdtemp()), enable_semantic=False)
+        session = ChatSession(
+            model=FakeChatModel(),
+            system_prompt="You are a companion assistant.",
+            generation=GenerationConfig(max_new_tokens=64),
+            memory_manager=manager,
+            session_id="sess_shutdown",
+        )
+        calls: list[object] = []
+        expected = {"status": "complete", "memory_complete": True}
+        manager.wait_for_background_tasks = lambda: calls.append("wait")
+        manager.consolidate_until_settled = lambda session_id: calls.append(session_id) or expected
+
+        self.assertEqual(session.settle_memory_for_shutdown(), expected)
+        self.assertEqual(calls, ["wait", "sess_shutdown"])
+
 
 if __name__ == "__main__":
     unittest.main()

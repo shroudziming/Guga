@@ -215,6 +215,11 @@ class ChatSession:
         """Force consolidation of pending completed turns for this session."""
         return self.memory_manager.flush_session_memory(self.session_id)
 
+    def settle_memory_for_shutdown(self) -> dict[str, object]:
+        """Finish queued writeback and force-consolidate the session tail."""
+        self.memory_manager.wait_for_background_tasks()
+        return self.memory_manager.consolidate_until_settled(self.session_id)
+
     def clear(self) -> None:
         """Clear only in-memory short history; persisted memory files remain."""
         self.history.clear()
