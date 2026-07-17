@@ -51,7 +51,7 @@ class TextSentenceBuffer:
                     segments.append(TextSegment(text=sentence, split_reason=f"boundary:{boundary}"))
                 continue
 
-            if len(self._buffer) >= self.max_chars:
+            if len(self._buffer) > self.max_chars:
                 end = self.max_chars
                 if len(self._buffer) > end and self._buffer[end] in self.boundaries:
                     end += 1
