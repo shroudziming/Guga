@@ -11,6 +11,18 @@ from guga.utils.paths import personas_dir
 
 
 class PersonaSkillLoaderTest(unittest.TestCase):
+    def test_default_skill_uses_positive_guidance_with_compact_boundaries(self) -> None:
+        persona = PersonaManager(personas_dir()).load("default")
+        prompt = persona.system_prompt
+
+        self.assertIn("## 我是谁、如何相处", prompt)
+        self.assertIn("## 硬边界", prompt)
+        self.assertIn("事实与系统能力", prompt)
+        self.assertIn("`appraisal`", prompt)
+        self.assertIn("`felt_response`", prompt)
+        negative_markers = sum(prompt.count(marker) for marker in ("不", "无", "别", "禁止", "不得"))
+        self.assertLess(negative_markers, 18)
+
     def test_skill_backed_persona_loads_complete_body_without_frontmatter(self) -> None:
         source_skill = personas_dir() / "default" / "SKILL.md"
         with tempfile.TemporaryDirectory() as tmp:
