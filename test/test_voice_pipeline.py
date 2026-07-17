@@ -37,6 +37,9 @@ class SentenceBufferTest(unittest.TestCase):
         self.assertEqual(buffer.feed("一二三四五六"), [])
         self.assertEqual(buffer.feed("。"), ["一二三四五六。"])
 
+    def test_forced_split_keeps_terminal_boundary_in_same_chunk(self) -> None:
+        self.assertEqual(TextSentenceBuffer(max_chars=6).feed("一二三四五六。后"), ["一二三四五六。"])
+
     def test_punctuation_only_text_is_not_speakable(self) -> None:
         self.assertEqual(TextSentenceBuffer().feed("。！？；!?;"), [])
 
