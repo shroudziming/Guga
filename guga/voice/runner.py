@@ -4,6 +4,7 @@ import json
 import queue
 import threading
 import time
+import urllib.error
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -13,6 +14,12 @@ from guga.voice.metrics import VoiceMetrics, VoiceMetricsSummary
 from guga.voice.sentence_buffer import TextSentenceBuffer
 from guga.voice.text_filter import SpokenTextFilter
 from guga.voice.tts_client import TtsClient
+
+
+def is_retryable_tts_error(error: BaseException) -> bool:
+    if isinstance(error, urllib.error.HTTPError):
+        return 500 <= error.code < 600
+    return isinstance(error, urllib.error.URLError)
 
 
 class StreamingSession(Protocol):
@@ -200,7 +207,7 @@ class VoiceChatRunner:
                         continue
 
                     started = time.perf_counter()
-                    audio = self.tts_client.synthesize(job.text)
+                    audio = self._synthesize_with_retry(job.text)
                     elapsed = time.perf_counter() - started
                     with publish_gate:
                         if publish_closed.is_set() or cancel_event.is_set():
@@ -219,11 +226,19 @@ class VoiceChatRunner:
                 except BaseException as exc:
                     if not cancel_event.is_set():
                         errors.append(exc)
-                        cancel_event.set()
                 finally:
                     tts_queue.task_done()
         finally:
             worker_done.set()
+
+    def _synthesize_with_retry(self, text: str) -> AudioData:
+        try:
+            return self.tts_client.synthesize(text)
+        except BaseException as exc:
+            if not is_retryable_tts_error(exc):
+                raise
+            time.sleep(0.35)
+            return self.tts_client.synthesize(text)
 
     def _finish_tts_turn(
         self,

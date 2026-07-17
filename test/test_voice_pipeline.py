@@ -4,11 +4,13 @@ import os
 import threading
 import time
 import unittest
+import urllib.error
 from collections.abc import Iterator
+from unittest.mock import patch
 
 from guga.voice.audio_player import AudioData, NullAudioPlayer, WavAudioPlayer, audio_player_from_env
 from guga.voice.metrics import VoiceMetrics
-from guga.voice.runner import VoiceChatRunner
+from guga.voice.runner import VoiceChatRunner, is_retryable_tts_error
 from guga.voice.sentence_buffer import TextSentenceBuffer, sentence_buffer_from_env
 from guga.voice.text_filter import SpokenTextFilter
 from guga.voice.tool_mode import configure_voice_tool_mode
@@ -448,6 +450,76 @@ class VoiceToolModeTest(unittest.TestCase):
 
 
 class VoiceChatRunnerTest(unittest.TestCase):
+    def test_classifies_only_transport_and_server_errors_as_retryable(self) -> None:
+        server_error = urllib.error.HTTPError("http://tts", 503, "unavailable", None, None)
+        client_error = urllib.error.HTTPError("http://tts", 400, "bad request", None, None)
+
+        self.assertTrue(is_retryable_tts_error(urllib.error.URLError("temporary failure")))
+        self.assertTrue(is_retryable_tts_error(server_error))
+        self.assertFalse(is_retryable_tts_error(client_error))
+        self.assertFalse(is_retryable_tts_error(ValueError("invalid audio")))
+
+    def test_retries_transport_failure_once_before_synthesizing(self) -> None:
+        class FlakyTts(FakeTtsClient):
+            def synthesize(self, text: str) -> AudioData:
+                self.requests.append(text)
+                if len(self.requests) == 1:
+                    raise urllib.error.URLError("temporary failure")
+                return AudioData(
+                    data=f"audio:{text}".encode("utf-8"),
+                    sample_rate=32000,
+                    channels=1,
+                    sample_width=2,
+                    duration_seconds=0.5,
+                    media_type="wav",
+                )
+
+        tts = FlakyTts()
+        player = FakeAudioPlayer()
+        runner = VoiceChatRunner(
+            session=FakeSession(["重试。"]),
+            tts_client=tts,
+            audio_player=player,
+            text_sink=lambda chunk: None,
+        )
+
+        with patch("guga.voice.runner.time.sleep") as sleep:
+            runner.run_turn("hi")
+
+        self.assertEqual(tts.requests, ["重试。", "重试。"])
+        sleep.assert_called_once_with(0.35)
+        self.assertEqual(player.items, ["audio:重试。".encode("utf-8")])
+
+    def test_tts_job_failure_does_not_cancel_later_job(self) -> None:
+        class FirstJobFailsTts(FakeTtsClient):
+            def synthesize(self, text: str) -> AudioData:
+                self.requests.append(text)
+                if text == "失败。":
+                    raise ValueError("synthesis failed")
+                return AudioData(
+                    data=f"audio:{text}".encode("utf-8"),
+                    sample_rate=32000,
+                    channels=1,
+                    sample_width=2,
+                    duration_seconds=0.5,
+                    media_type="wav",
+                )
+
+        cancel_event = threading.Event()
+        player = FakeAudioPlayer()
+        runner = VoiceChatRunner(
+            session=FakeSession(["失败。", "继续。"]),
+            tts_client=FirstJobFailsTts(),
+            audio_player=player,
+            text_sink=lambda chunk: None,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "TTS worker failed"):
+            runner.run_turn("hi", cancel_event=cancel_event)
+
+        self.assertFalse(cancel_event.is_set())
+        self.assertEqual(player.items, ["audio:继续。".encode("utf-8")])
+
     def test_cancel_after_worker_check_cannot_publish_audio_or_pollute_reuse(self) -> None:
         class ReusableSession:
             def __init__(self) -> None:
@@ -741,7 +813,7 @@ class VoiceChatRunnerTest(unittest.TestCase):
             runner.run_turn("hi")
 
         self.assertIsInstance(caught.exception.__cause__, ValueError)
-        self.assertEqual(player.cleanup_calls, ["stop:True"])
+        self.assertEqual(player.cleanup_calls, ["join", "stop:False"])
 
     def test_text_sink_is_not_blocked_by_slow_tts(self) -> None:
         class SlowTts(FakeTtsClient):
