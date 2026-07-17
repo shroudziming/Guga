@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 import urllib.error
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 from guga.persona import PersonaExpression, PersonaOutputParser, PersonaText
@@ -73,6 +73,7 @@ class VoiceChatRunner:
         self.expression_tags = expression_tags
         self.expression_sink = expression_sink
         self.max_queue_size = max_queue_size
+        self._turn_started_monotonic: float | None = None
 
     def run_turn(
         self,
@@ -81,6 +82,10 @@ class VoiceChatRunner:
         cancel_event: threading.Event | None = None,
     ) -> VoiceMetricsSummary:
         cancel_event = cancel_event or threading.Event()
+        self._turn_started_monotonic = time.monotonic()
+        set_playback_event_callback = getattr(self.audio_player, "set_playback_event_callback", None)
+        if callable(set_playback_event_callback):
+            set_playback_event_callback(self._debug_voice_playback_event)
         self.metrics.turn_started()
         self.audio_player.start()
 
@@ -186,6 +191,13 @@ class VoiceChatRunner:
             except queue.Full:
                 continue
             self.metrics.sentence_queued(sentence)
+            self._debug_voice_event(
+                "voice_queue",
+                sequence_id=sequence_id,
+                queue_depth=tts_queue.qsize(),
+                split_reason=split_reason,
+                text=sentence,
+            )
             return
 
     def _tts_worker(
@@ -206,9 +218,23 @@ class VoiceChatRunner:
                     if cancel_event.is_set():
                         continue
 
+                    queue_depth = tts_queue.qsize()
+                    self._debug_voice_event(
+                        "voice_synthesis_started",
+                        sequence_id=job.sequence_id,
+                        queue_depth=queue_depth,
+                    )
                     started = time.perf_counter()
                     audio = self._synthesize_with_retry(job.text)
                     elapsed = time.perf_counter() - started
+                    self._debug_voice_event(
+                        "voice_synthesis_finished",
+                        sequence_id=job.sequence_id,
+                        queue_depth=tts_queue.qsize(),
+                        synthesis_ms=int(elapsed * 1000),
+                        split_reason=job.split_reason,
+                        text=job.text,
+                    )
                     with publish_gate:
                         if publish_closed.is_set() or cancel_event.is_set():
                             continue
@@ -220,8 +246,7 @@ class VoiceChatRunner:
                         )
                         if publish_closed.is_set() or cancel_event.is_set():
                             continue
-                        self._debug_voice_playback_start(job)
-                        self.audio_player.enqueue(audio)
+                        self.audio_player.enqueue(replace(audio, sequence_id=job.sequence_id))
                         self.metrics.audio_enqueued(job.sequence_id)
                 except BaseException as exc:
                     if not cancel_event.is_set():
@@ -316,17 +341,38 @@ class VoiceChatRunner:
                     tts_queue.task_done()
             tts_queue.put_nowait(None)
 
-    def _debug_voice_playback_start(self, job: _TtsJob) -> None:
+    def _debug_voice_playback_event(self, event: str, sequence_id: int | None, queue_depth: int) -> None:
+        self._debug_voice_event(
+            f"voice_{event}",
+            sequence_id=sequence_id,
+            queue_depth=queue_depth,
+        )
+
+    def _debug_voice_event(
+        self,
+        event: str,
+        *,
+        sequence_id: int | None,
+        queue_depth: int,
+        **details: object,
+    ) -> None:
         if not bool(getattr(self.session, "debug", False)):
             return
-        text = json.dumps(job.text, ensure_ascii=False)
-        message = (
-            "voice_playback_start "
-            f"sequence_id={job.sequence_id} "
-            f"token_count={len(job.text)} "
-            f"split_reason={job.split_reason} "
-            f"text={text}"
-        )
+        turn_started_monotonic = self._turn_started_monotonic
+        turn_ms = 0 if turn_started_monotonic is None else int((time.monotonic() - turn_started_monotonic) * 1000)
+        fields = [
+            event,
+            f"sequence_id={sequence_id}",
+            f"queue_depth={queue_depth}",
+            f"turn_ms={turn_ms}",
+        ]
+        for key, value in details.items():
+            if key == "text":
+                fields.append(f"token_count={len(str(value))}")
+                fields.append(f"text={json.dumps(value, ensure_ascii=False)}")
+            else:
+                fields.append(f"{key}={value}")
+        message = " ".join(fields)
         output = f"[DEBUG][VoiceChatRunner][{getattr(self.session, 'session_id', 'unknown_session')}] {message}"
         debug_sink = getattr(self.session, "debug_sink", None)
         if callable(debug_sink):

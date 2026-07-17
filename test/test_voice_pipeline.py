@@ -289,6 +289,33 @@ class AudioPlayerFactoryTest(unittest.TestCase):
 
 
 class WavAudioPlayerTest(unittest.TestCase):
+    def test_emits_actual_playback_events_with_sequence_and_queue_depth(self) -> None:
+        events: list[tuple[str, int | None, int]] = []
+
+        class RecordingWavAudioPlayer(WavAudioPlayer):
+            def _play(self, audio: AudioData) -> None:
+                _ = audio
+
+        player = RecordingWavAudioPlayer(playback_event_callback=lambda event, sequence_id, queue_depth: events.append((event, sequence_id, queue_depth)))
+        player.start()
+        player.enqueue(
+            AudioData(
+                data=b"audio",
+                sample_rate=32000,
+                channels=1,
+                sample_width=2,
+                duration_seconds=1.0,
+                sequence_id=7,
+            )
+        )
+        player.join()
+        player.stop(clear=False)
+
+        self.assertEqual(
+            events,
+            [("playback_started", 7, 0), ("playback_finished", 7, 0)],
+        )
+
     def test_cancel_interrupts_current_playback_and_player_can_be_reused(self) -> None:
         class ControllableWavAudioPlayer(WavAudioPlayer):
             def __init__(self) -> None:
@@ -450,6 +477,36 @@ class VoiceToolModeTest(unittest.TestCase):
 
 
 class VoiceChatRunnerTest(unittest.TestCase):
+    def test_debug_logs_turn_relative_queue_synthesis_and_actual_playback_events(self) -> None:
+        logs: list[str] = []
+
+        class ImmediateWavAudioPlayer(WavAudioPlayer):
+            def _play(self, audio: AudioData) -> None:
+                _ = audio
+
+        runner = VoiceChatRunner(
+            session=DebugFakeSession(["你好。"], logs),
+            tts_client=FakeTtsClient(),
+            audio_player=ImmediateWavAudioPlayer(),
+            text_sink=lambda chunk: None,
+        )
+
+        runner.run_turn("hi")
+
+        expected_events = (
+            "voice_queue",
+            "voice_synthesis_started",
+            "voice_synthesis_finished",
+            "voice_playback_started",
+            "voice_playback_finished",
+        )
+        for event in expected_events:
+            matching = [log for log in logs if event in log]
+            self.assertEqual(len(matching), 1, event)
+            self.assertIn("sequence_id=1", matching[0])
+            self.assertRegex(matching[0], r"queue_depth=\d+")
+            self.assertRegex(matching[0], r"turn_ms=\d+")
+
     def test_classifies_only_transport_and_server_errors_as_retryable(self) -> None:
         server_error = urllib.error.HTTPError("http://tts", 503, "unavailable", None, None)
         client_error = urllib.error.HTTPError("http://tts", 400, "bad request", None, None)
@@ -893,7 +950,7 @@ class VoiceChatRunnerTest(unittest.TestCase):
         self.assertEqual(printed, ["咕嘎（眼睛", "放光）好吃。"])
         self.assertEqual(tts.requests, ["咕嘎好吃。"])
 
-    def test_debug_logs_voice_playback_split_points(self) -> None:
+    def test_debug_logs_voice_synthesis_split_points(self) -> None:
         logs: list[str] = []
         session = DebugFakeSession(
             ["咕咕嘎嘎！是你是你！我刚刚看到你来就好开心呀！（摇摇摆摆跑过来）要陪我玩吗？"],
@@ -911,14 +968,16 @@ class VoiceChatRunnerTest(unittest.TestCase):
 
         runner.run_turn("hi")
 
-        playback_logs = [log for log in logs if "voice_playback_start" in log]
-        self.assertEqual(len(playback_logs), 4)
-        self.assertIn("[DEBUG][VoiceChatRunner][debug_session]", playback_logs[0])
-        self.assertIn("sequence_id=1", playback_logs[0])
-        self.assertIn("token_count=5", playback_logs[0])
-        self.assertIn("split_reason=boundary:！", playback_logs[0])
-        self.assertIn('text="咕咕嘎嘎！"', playback_logs[0])
-        self.assertIn('text="要陪我玩吗？"', playback_logs[-1])
+        synthesis_logs = [log for log in logs if "voice_synthesis_finished" in log]
+        self.assertEqual(len(synthesis_logs), 4)
+        self.assertIn("[DEBUG][VoiceChatRunner][debug_session]", synthesis_logs[0])
+        self.assertIn("sequence_id=1", synthesis_logs[0])
+        self.assertIn("queue_depth=", synthesis_logs[0])
+        self.assertIn("turn_ms=", synthesis_logs[0])
+        self.assertIn("token_count=5", synthesis_logs[0])
+        self.assertIn("split_reason=boundary:！", synthesis_logs[0])
+        self.assertIn('text="咕咕嘎嘎！"', synthesis_logs[0])
+        self.assertIn('text="要陪我玩吗？"', synthesis_logs[-1])
 
 
 if __name__ == "__main__":
