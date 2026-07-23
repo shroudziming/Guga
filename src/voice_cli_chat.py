@@ -81,7 +81,7 @@ def main() -> None:
         model=model,
         system_prompt=persona.system_prompt,
         generation=default_generation_config(),
-        max_turns=10,
+        max_turns=45,
         memory_manager=memory_manager,
         debug=debug_enabled,
         debug_sink=sink,

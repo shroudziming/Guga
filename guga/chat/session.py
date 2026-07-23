@@ -35,7 +35,7 @@ class ChatSession:
         model: ChatModel,
         system_prompt: str,
         generation: GenerationConfig,
-        max_turns: int = 10,
+        max_turns: int = 45,
         memory_manager: MemoryManager | None = None,
         session_id: str | None = None,
         debug: bool = False,

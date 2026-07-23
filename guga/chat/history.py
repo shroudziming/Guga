@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 class ChatHistory:
-    def __init__(self, max_turns: int = 10) -> None:
+    def __init__(self, max_turns: int = 45) -> None:
         self.max_turns = max_turns
         self.messages: list[dict[str, str]] = []
 
