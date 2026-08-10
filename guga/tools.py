@@ -73,11 +73,38 @@ class ToolRegistry:
             selected = [tool for tool in selected if tool.name in names]
         return [tool.to_openai_tool() for tool in selected]
 
+    def validate_arguments(self, name: str, arguments: dict[str, Any]) -> None:
+        tool = self._tools.get(name)
+        if tool is None:
+            raise ValueError(f"unknown tool: {name}")
+        if not isinstance(arguments, dict):
+            raise ValueError("tool arguments must be an object")
+        schema = tool.parameters
+        required = schema.get("required", [])
+        missing = [field for field in required if field not in arguments]
+        if missing:
+            raise ValueError(f"missing required tool argument: {missing[0]}")
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False:
+            unknown = [field for field in arguments if field not in properties]
+            if unknown:
+                raise ValueError(f"unknown tool argument: {unknown[0]}")
+        for field, value in arguments.items():
+            field_schema = properties.get(field)
+            if not isinstance(field_schema, dict):
+                continue
+            expected = field_schema.get("type")
+            if expected and not _matches_json_type(value, expected):
+                raise ValueError(f"invalid type for tool argument {field}: expected {expected}")
+            if "enum" in field_schema and value not in field_schema["enum"]:
+                raise ValueError(f"invalid value for tool argument {field}")
+
     def execute(self, call: ToolCall) -> dict[str, Any]:
         tool = self._tools.get(call.name)
         if tool is None:
             return {"ok": False, "error": f"unknown tool: {call.name}"}
         try:
+            self.validate_arguments(call.name, call.arguments)
             result = tool.handler(call.arguments)
         except Exception as exc:
             return {"ok": False, "error": str(exc), "tool": call.name}
@@ -303,3 +330,17 @@ def _clamp_int(value: object, default: int, minimum: int, maximum: int) -> int:
     except (TypeError, ValueError):
         number = default
     return max(minimum, min(maximum, number))
+
+
+def _matches_json_type(value: object, expected: str | list[str]) -> bool:
+    expected_types = [expected] if isinstance(expected, str) else expected
+    checks = {
+        "string": lambda item: isinstance(item, str),
+        "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+        "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+        "boolean": lambda item: isinstance(item, bool),
+        "object": lambda item: isinstance(item, dict),
+        "array": lambda item: isinstance(item, list),
+        "null": lambda item: item is None,
+    }
+    return any(checks.get(item, lambda _: False)(value) for item in expected_types)
