@@ -10,11 +10,15 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from guga.chat import ChatSession
+from guga.agent.cli import TaskCommandController, format_task_event
+from guga.agent.model_adapter import AgentModelAdapter
+from guga.agent.runner import AgentTaskRunner
 from guga.config import DEFAULT_CACHE_DIR, DEFAULT_MODEL_ID, default_generation_config
 from guga.memory.agent_identity import identity_from_persona
 from guga.memory.manager import MemoryManager
 from guga.models import create_chat_model
 from guga.persona import PersonaExpression, PersonaManager, PersonaOutputParser, PersonaText
+from guga.tools import conversation_tool_registry, default_tool_registry
 from guga.utils.debug_reporter import FileDebugSink
 from guga.utils.paths import debug_reports_dir, personas_dir
 
@@ -45,7 +49,10 @@ def main() -> None:
     debug_enabled = os.environ.get("Guga_DEBUG", "1") != "0"
 
     print("[Guga] 多轮 CLI 聊天")
-    print("命令: /clear 清空会话, /rag_rebuild 重建RAG索引, /exit 退出")
+    print(
+        "命令: /task <任务>, /tasks, /resume <task_id>, /approve, /reject, "
+        "/clear, /rag_rebuild, /exit"
+    )
     print("提示: 生成中按 Ctrl+C 可停止输出")
     print(f"model={model_id}")
     print(f"persona={persona_name}\n")
@@ -64,14 +71,31 @@ def main() -> None:
         debug_sink=sink,
         agent_identity=agent_identity,
     )
+    generation = default_generation_config()
+    task_tools = default_tool_registry(PROJECT_ROOT)
+    task_adapter = AgentModelAdapter(
+        model,
+        generation,
+        persona.system_prompt,
+        task_tools,
+    )
+    task_runner = AgentTaskRunner(
+        task_adapter,
+        task_tools,
+        memory_manager,
+        agent_id=agent_identity.agent_id,
+        expression_tags=persona.expression_tags,
+    )
+    task_commands = TaskCommandController(task_runner)
     session = ChatSession(
         model=model,
         system_prompt=persona.system_prompt,
-        generation=default_generation_config(),
+        generation=generation,
         max_turns=45,
         memory_manager=memory_manager,
         debug=debug_enabled,
         debug_sink=sink,
+        tool_registry=conversation_tool_registry(),
     )
 
     while True:
@@ -80,6 +104,7 @@ def main() -> None:
             continue
 
         if user_text == "/exit":
+            task_runner.close()
             result = session.settle_memory_for_shutdown()
             print(f"记忆整理: {result.get('status', 'unknown')}")
             print("已退出。")
@@ -96,6 +121,16 @@ def main() -> None:
                 f"RAG 索引已重建: memory_chunks={result['memory_chunks']}, "
                 f"document_chunks={result['document_chunks']}, total_chunks={result['total_chunks']}"
             )
+            continue
+
+        if task_commands.is_task_command(user_text):
+            try:
+                for event in task_commands.handle(user_text, session.session_id):
+                    rendered = format_task_event(event)
+                    if rendered:
+                        print(f"[任务] {rendered}")
+            except (KeyError, RuntimeError, ValueError) as exc:
+                print(f"[任务] {exc}")
             continue
 
         cancel_event = Event()
