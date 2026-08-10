@@ -8,6 +8,7 @@ from guga.agent.runner import AgentTaskRunner
 from guga.agent.trace import ExecutionTraceStore
 from guga.tools import ToolRegistry, ToolSpec
 from guga.types import MemoryContext
+from guga.workspace import WorkspaceContext
 
 
 class FakeMemoryManager:
@@ -77,6 +78,7 @@ class AgentTaskRunnerTest(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         self.memory = FakeMemoryManager()
         self.calls = 0
+        self.workspace = WorkspaceContext(self.root)
         self.tools = ToolRegistry(
             [
                 ToolSpec(
@@ -85,7 +87,8 @@ class AgentTaskRunnerTest(unittest.TestCase):
                     {"type": "object", "properties": {}},
                     self._work,
                 )
-            ]
+            ],
+            workspace=self.workspace,
         )
 
     def tearDown(self) -> None:
@@ -119,6 +122,16 @@ class AgentTaskRunnerTest(unittest.TestCase):
         self.assertEqual(0, self.calls)
         self.assertEqual("awaiting_approval", events[-1].type)
         self.assertEqual("step-1", events[-1].payload["plan"][0]["id"])
+
+    def test_start_invalidates_previous_workspace_confirmation(self) -> None:
+        self.workspace.inspect()
+        runner = self._runner()
+        try:
+            list(runner.start("new task", "session-1", task_id="task-1"))
+        finally:
+            runner.close()
+
+        self.assertFalse(self.workspace.confirmed)
 
     def test_only_one_unfinished_task_is_allowed_per_agent(self) -> None:
         runner = self._runner()
