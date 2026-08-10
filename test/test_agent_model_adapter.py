@@ -94,6 +94,31 @@ class LocalModel:
 
 
 class AgentModelAdapterTest(unittest.TestCase):
+    def test_planner_requires_workspace_inspection_before_operational_tools(self) -> None:
+        valid = json.dumps(
+            {
+                "steps": [
+                    {
+                        "id": "step_1",
+                        "description": "读取 README",
+                        "expected_result": "获得内容",
+                        "verification_method": "content 非空",
+                        "allowed_tools": ["guga_read_file"],
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        model = NativeModel([valid], ToolModelResponse(content="", tool_calls=[]))
+        adapter = AgentModelAdapter(model, GenerationConfig(), "人格", _registry())
+
+        adapter.create_plan(_state())
+
+        planner_prompt = model.messages_seen[0][0]["content"]
+        self.assertIn("guga_workspace", planner_prompt)
+        self.assertIn("inspect", planner_prompt)
+        self.assertIn("set 或 reset 后", planner_prompt)
+
     def test_plan_retries_invalid_json_without_counting_tool_attempts(self) -> None:
         valid = json.dumps(
             {
