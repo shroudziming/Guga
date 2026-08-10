@@ -181,6 +181,32 @@ class AgentModelAdapterTest(unittest.TestCase):
         self.assertTrue(action["call_id"].startswith("local_"))
         self.assertIn("guga_read_file", json.dumps(model.messages_seen[0], ensure_ascii=False))
 
+    def test_invalid_tool_arguments_are_repaired_before_execution(self) -> None:
+        model = LocalModel(
+            [
+                json.dumps(
+                    {
+                        "tool_name": "guga_read_file",
+                        "arguments": {},
+                        "reason": "missing required path",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "tool_name": "guga_read_file",
+                        "arguments": {"path": "README.md"},
+                        "reason": "repaired arguments",
+                    }
+                ),
+            ]
+        )
+        adapter = AgentModelAdapter(model, GenerationConfig(), "人格", _registry())
+
+        action = adapter.choose_action(_state())
+
+        self.assertEqual({"path": "README.md"}, action["arguments"])
+        self.assertEqual(2, model.calls)
+
     def test_verification_rejects_contradictory_result(self) -> None:
         contradictory = json.dumps(
             {
