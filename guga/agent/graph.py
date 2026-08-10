@@ -278,6 +278,7 @@ def build_agent_task_graph(
         }
 
     def revise_plan(state: AgentTaskState) -> dict[str, Any]:
+        tools.invalidate_workspace_confirmation()
         trace.append_once(
             state["task_id"],
             "plan_revision_requested",
