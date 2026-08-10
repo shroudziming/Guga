@@ -10,6 +10,7 @@ TaskStatus = Literal[
     "completed",
     "failed",
     "blocked",
+    "revised_plan",
 ]
 
 
