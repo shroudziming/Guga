@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from guga.memory.time_utils import extract_semantic_time, now_beijing, parse_datetime
+from guga.workspace import WorkspaceContext
 
 
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
@@ -55,8 +56,21 @@ class ToolSpec:
 
 
 class ToolRegistry:
-    def __init__(self, tools: list[ToolSpec] | None = None) -> None:
+    def __init__(
+        self,
+        tools: list[ToolSpec] | None = None,
+        workspace: WorkspaceContext | None = None,
+    ) -> None:
         self._tools = {tool.name: tool for tool in tools or []}
+        self._workspace = workspace
+
+    @property
+    def workspace(self) -> WorkspaceContext | None:
+        return self._workspace
+
+    def invalidate_workspace_confirmation(self) -> None:
+        if self._workspace is not None:
+            self._workspace.invalidate_confirmation()
 
     def add(self, tool: ToolSpec) -> None:
         self._tools[tool.name] = tool
@@ -115,19 +129,66 @@ class ToolRegistry:
         return result
 
 
-def default_tool_registry(project_root: Path | None = None) -> ToolRegistry:
-    root = (project_root or Path(__file__).resolve().parents[1]).resolve()
-    registry = ToolRegistry()
+def default_tool_registry(
+    project_root: Path | None = None,
+    *,
+    workspace: WorkspaceContext | None = None,
+) -> ToolRegistry:
+    active_workspace = workspace or WorkspaceContext(
+        (project_root or Path(__file__).resolve().parents[1]).resolve()
+    )
+    registry = ToolRegistry(workspace=active_workspace)
     registry.add(_time_parse_tool())
-    registry.add(_list_dir_tool(root))
-    registry.add(_read_file_tool(root))
-    registry.add(_write_file_tool(root))
-    registry.add(_run_command_tool(root))
+    registry.add(_workspace_tool(active_workspace))
+    registry.add(_list_dir_tool(active_workspace))
+    registry.add(_read_file_tool(active_workspace))
+    registry.add(_write_file_tool(active_workspace))
+    registry.add(_run_command_tool(active_workspace))
     return registry
 
 
 def conversation_tool_registry() -> ToolRegistry:
     return ToolRegistry([_time_parse_tool()])
+
+
+def _workspace_tool(workspace: WorkspaceContext) -> ToolSpec:
+    def handler(args: dict[str, Any]) -> dict[str, Any]:
+        action = str(args.get("action", ""))
+        if action == "inspect":
+            return workspace.inspect()
+        if action == "set":
+            return workspace.set(
+                str(args.get("path", "")),
+                create_if_missing=bool(args.get("create_if_missing", False)),
+            )
+        if action == "reset":
+            return workspace.reset()
+        raise ValueError(f"unsupported workspace action: {action}")
+
+    return ToolSpec(
+        name="guga_workspace",
+        description=(
+            "Inspect, change, or reset the task workspace for this process. "
+            "Inspect before using file or command tools, and inspect again after changing it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["inspect", "set", "reset"]},
+                "path": {
+                    "type": "string",
+                    "description": "Absolute path or a path relative to the current workspace.",
+                },
+                "create_if_missing": {
+                    "type": "boolean",
+                    "description": "Create a missing workspace only when session policy allows it.",
+                },
+            },
+            "required": ["action"],
+            "additionalProperties": False,
+        },
+        handler=handler,
+    )
 
 
 def _time_parse_tool() -> ToolSpec:
@@ -172,8 +233,9 @@ def _time_parse_tool() -> ToolSpec:
     )
 
 
-def _list_dir_tool(root: Path) -> ToolSpec:
+def _list_dir_tool(workspace: WorkspaceContext) -> ToolSpec:
     def handler(args: dict[str, Any]) -> dict[str, Any]:
+        root = workspace.require_confirmed()
         target = _resolve_safe_path(root, str(args.get("path", ".")))
         if not target.exists():
             return {"ok": False, "error": "path does not exist", "path": str(target)}
@@ -187,11 +249,11 @@ def _list_dir_tool(root: Path) -> ToolSpec:
 
     return ToolSpec(
         name="guga_list_dir",
-        description="List files and folders under the Guga project root.",
+        description="List files and folders under the confirmed session workspace.",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative path under the project root."},
+                "path": {"type": "string", "description": "Relative path under the session workspace."},
                 "limit": {"type": "integer", "description": "Maximum number of entries."},
             },
             "required": ["path"],
@@ -201,8 +263,9 @@ def _list_dir_tool(root: Path) -> ToolSpec:
     )
 
 
-def _read_file_tool(root: Path) -> ToolSpec:
+def _read_file_tool(workspace: WorkspaceContext) -> ToolSpec:
     def handler(args: dict[str, Any]) -> dict[str, Any]:
+        root = workspace.require_confirmed()
         target = _resolve_safe_path(root, str(args.get("path", "")))
         if not target.exists():
             return {"ok": False, "error": "path does not exist", "path": str(target)}
@@ -218,11 +281,11 @@ def _read_file_tool(root: Path) -> ToolSpec:
 
     return ToolSpec(
         name="guga_read_file",
-        description="Read a UTF-8 text file under the Guga project root.",
+        description="Read a UTF-8 text file under the confirmed session workspace.",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative file path under the project root."},
+                "path": {"type": "string", "description": "Relative file path under the session workspace."},
                 "max_chars": {"type": "integer", "description": "Maximum characters to return."},
             },
             "required": ["path"],
@@ -232,10 +295,11 @@ def _read_file_tool(root: Path) -> ToolSpec:
     )
 
 
-def _write_file_tool(root: Path) -> ToolSpec:
+def _write_file_tool(workspace: WorkspaceContext) -> ToolSpec:
     def handler(args: dict[str, Any]) -> dict[str, Any]:
         if os.environ.get("Guga_ENABLE_WRITE_TOOL", "0").strip().lower() not in {"1", "true", "yes", "on"}:
             return {"ok": False, "error": "write tool disabled; set Guga_ENABLE_WRITE_TOOL=1 to enable"}
+        root = workspace.require_confirmed()
         target = _resolve_safe_path(root, str(args.get("path", "")))
         content = str(args.get("content", ""))
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -244,11 +308,11 @@ def _write_file_tool(root: Path) -> ToolSpec:
 
     return ToolSpec(
         name="guga_write_file",
-        description="Write a UTF-8 text file under the Guga project root. Disabled unless explicitly enabled.",
+        description="Write a UTF-8 text file under the confirmed session workspace. Disabled unless explicitly enabled.",
         parameters={
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative file path under the project root."},
+                "path": {"type": "string", "description": "Relative file path under the session workspace."},
                 "content": {"type": "string", "description": "File content to write."},
             },
             "required": ["path", "content"],
@@ -258,10 +322,11 @@ def _write_file_tool(root: Path) -> ToolSpec:
     )
 
 
-def _run_command_tool(root: Path) -> ToolSpec:
+def _run_command_tool(workspace: WorkspaceContext) -> ToolSpec:
     def handler(args: dict[str, Any]) -> dict[str, Any]:
         if os.environ.get("Guga_ENABLE_COMMAND_TOOL", "0").strip().lower() not in {"1", "true", "yes", "on"}:
             return {"ok": False, "error": "command tool disabled; set Guga_ENABLE_COMMAND_TOOL=1 to enable"}
+        root = workspace.require_confirmed()
         command = str(args.get("command", "")).strip()
         if not command:
             return {"ok": False, "error": "empty command"}
@@ -283,7 +348,7 @@ def _run_command_tool(root: Path) -> ToolSpec:
 
     return ToolSpec(
         name="guga_run_command",
-        description="Run a shell command in the Guga project root. Disabled unless explicitly enabled.",
+        description="Run a shell command in the confirmed session workspace. Disabled unless explicitly enabled.",
         parameters={
             "type": "object",
             "properties": {
