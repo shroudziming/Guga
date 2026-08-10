@@ -261,6 +261,28 @@ class AgentTaskGraphTest(unittest.TestCase):
         self.assertEqual("blocked", result["status"])
         self.assertEqual(["inspect"], self.calls)
 
+    def test_recovery_that_is_clearly_unmatched_enters_normal_retry(self) -> None:
+        adapter = FakeAdapter()
+        adapter.verifications = [
+            adapter.verification(matched=False),
+            adapter.verification(matched=True),
+        ]
+        execution_id = "task-1:r1:step-1:a1"
+        self.trace.append_once(
+            "task-1",
+            "tool_call_started",
+            {"execution_id": execution_id},
+            event_id=f"{execution_id}:started",
+        )
+        graph = self._graph(adapter)
+        graph.invoke(self._state(), self._config())
+
+        result = graph.invoke(Command(resume=True), self._config())
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(["inspect", "work"], self.calls)
+        self.assertEqual(2, result["attempt"])
+
 
 if __name__ == "__main__":
     unittest.main()
