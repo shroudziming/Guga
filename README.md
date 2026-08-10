@@ -87,13 +87,16 @@ PyTorch/CUDA 环境；仅使用在线 API 时不需要加载本地聊天模型�
 
 ## 模型配置
 
-CLI 会自动读取仓库根目录的 `.env`，已存在的系统环境变量优先。
+`guga_cli.ps1` 会读取两类互相隔离的配置：
+
+- 仓库根目录的 `.env` 被 Git 忽略，只保存 API 密钥、base URL 等私有连接信息；已存在的系统环境变量优先。
+- `config/guga_cli.env` 被 Git 跟踪，保存模型路线、模型名称、工具开关、调试和默认工作区等可共享设置。
+
+启动配置使用固定键白名单，不能覆盖 `.env` 中的 API 密钥。
 
 ### DeepSeek API
 
 ```env
-Guga_MODEL_PROVIDER=api
-Guga_MODEL_ID=deepseek-v4-pro
 Guga_API_BASE_URL=https://api.deepseek.com
 Guga_API_KEY=replace_with_your_key
 Guga_API_TIMEOUT=90
@@ -111,24 +114,23 @@ Guga_TOP_P=0.9
 Guga_MEMORY_MAX_NEW_TOKENS=2048
 Guga_MEMORY_USE_LLM_SUMMARY=1
 Guga_MAX_TOOL_ROUNDS=3
-Guga_DEBUG=1
 ```
 
 ### 本地模型
 
-```env
-Guga_MODEL_PROVIDER=local
-Guga_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
-Guga_CACHE_DIR=./models_cache
-```
+默认使用 API 路线。要使用 `config/guga_cli.env` 中配置的本地模型，只需把
+`Guga_CLI_MODEL_ROUTE=api` 改为 `Guga_CLI_MODEL_ROUTE=local`。本地模型名称和缓存目录也在
+该启动配置中维护。
 
 ## 运行
 
 文本 CLI：
 
 ```powershell
-python -B src\basic_cli_chat.py
+.\guga_cli.ps1
 ```
+
+启动器会解析当前 Windows 用户的真实桌面路径，并创建默认工作区 `Desktop\Guga`。
 
 交互命令：
 
@@ -172,17 +174,23 @@ python -B src\voice_cli_chat.py
 任务工具包括：
 
 - `guga_parse_time`
+- `guga_workspace`（`inspect`、`set`、`reset`）
 - `guga_list_dir`
 - `guga_read_file`
 - `guga_write_file`
 - `guga_run_command`
 
-写文件和命令执行工具默认关闭：
+写文件和命令执行工具在 `config/guga_cli.env` 中默认允许：
 
 ```env
 Guga_ENABLE_WRITE_TOOL=1
 Guga_ENABLE_COMMAND_TOOL=1
 ```
+
+允许开关不等于立即执行：任务仍需先展示计划并获得批准，随后调用
+`guga_workspace inspect` 确认当前工作区。`set` 可切换工作区，`reset` 可恢复默认目录；
+切换或重置后必须再次 `inspect`。这些变化只在当前 Guga 进程中有效，退出或重启后恢复
+默认的 `Desktop\Guga`，不会写入启动配置、checkpoint 或长期记忆。
 
 每个计划步骤最多进行三次真实工具执行。模型输出的 JSON/schema 修复最多尝试三次，
 但不计入步骤执行次数。
