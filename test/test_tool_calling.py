@@ -35,6 +35,18 @@ class ToolCallingTest(unittest.TestCase):
 
         self.assertEqual(registry.names(), {"guga_parse_time"})
 
+    def test_chat_session_defaults_to_conversation_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+            session = ChatSession(
+                model=object(),
+                system_prompt="base",
+                generation=GenerationConfig(),
+                memory_manager=memory_manager,
+            )
+
+        self.assertEqual({"guga_parse_time"}, session.tool_registry.names())
+
     def test_reply_executes_tool_and_continues_generation(self) -> None:
         class FakeToolModel:
             def __init__(self) -> None:
