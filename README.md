@@ -11,6 +11,7 @@ DeepSeek API 调用，包含流式对话、Tool Calling、分层记忆、BGE-M3 
 - **分层记忆**：原始对话会逐步整理为事件、摘要与用户画像，供之后的相关对话使用。
 - **自动整理**：默认每 10 个完整 turn，以及退出 session 时整理记忆。
 - **语义检索**：BGE-M3 + FAISS 从相关记忆中挑选当前需要的背景。
+- **审批式智能体任务**：使用 LangGraph 展示计划、等待批准、执行工具、验证并持久化恢复。
 - **可选评测**：提供隔离的 LongMemEval 评测入口。
 
 ## 记忆与人格
@@ -132,9 +133,14 @@ python -B src\basic_cli_chat.py
 交互命令：
 
 ```text
-/clear        清空当前 ChatSession 历史
-/rag_rebuild  从当前 agent 记忆和 documents 重建索引
-/exit         结束程序
+/task <任务>       创建任务并展示待批准计划
+/tasks             列出当前 persona 的未结束任务
+/resume <task_id>  选择重启后要恢复的任务
+/approve           批准当前版本计划并持续执行
+/reject            拒绝当前版本计划
+/clear             清空当前 ChatSession 历史
+/rag_rebuild       从当前 agent 记忆和 documents 重建索引
+/exit              结束程序
 ```
 
 可用 persona 位于 `config/personas/`，当前包含 `default`、`gentle` 和 `rational`。
@@ -159,12 +165,17 @@ python -B src\voice_cli_chat.py
 
 ## Tool Calling
 
-模型支持 OpenAI-compatible `tool_calls` 时，Guga 会在同一 turn 内执行工具并把结果
-返回模型。默认注册：
+文本 CLI 的普通聊天只注册时间解析工具 `guga_parse_time`。文件、写入和命令工具只允许
+通过 `/task` 启动的任务运行时执行。模型支持 OpenAI-compatible `tool_calls` 时，任务
+运行时使用原生工具调用；本地模型使用经过同样名称和参数校验的 JSON action 回退。
+
+任务工具包括：
 
 - `guga_parse_time`
 - `guga_list_dir`
 - `guga_read_file`
+- `guga_write_file`
+- `guga_run_command`
 
 写文件和命令执行工具默认关闭：
 
@@ -173,7 +184,57 @@ Guga_ENABLE_WRITE_TOOL=1
 Guga_ENABLE_COMMAND_TOOL=1
 ```
 
-工具调用最多执行 `Guga_MAX_TOOL_ROUNDS` 轮。
+每个计划步骤最多进行三次真实工具执行。模型输出的 JSON/schema 修复最多尝试三次，
+但不计入步骤执行次数。
+
+## LangGraph 任务运行时
+
+任务状态流为：
+
+```text
+planning → awaiting_approval → executing
+    ↑                              ├─ completed
+    └──── revised_plan ←───────────┤
+                                   ├─ failed
+                                   └─ blocked
+```
+
+- 未批准前不会执行工具；修订计划会再次等待 `/approve`。
+- 每个步骤包含目标、预期结果、验证方法和允许工具，计划外工具会要求修订计划。
+- 第三次执行仍与预期不符时进入 `failed`；连续三次无法生成有效内部协议时进入 `blocked`。
+- 任务开始时只冻结一次相关记忆、用户模型和文档上下文，执行期间不会因记忆变化漂移。
+- SQLite checkpoint 位于 `data/agent_runs/<agent_id>/checkpoints.sqlite3`。
+- 可读 trace 位于 `data/agent_runs/<agent_id>/<task_id>/trace.jsonl`，逻辑引用为
+  `agent-run://<agent_id>/<task_id>/trace.jsonl`。
+- 恢复时复用已有完成记录；只有开始记录时先执行状态检测，无法判断则进入 `blocked`
+  等待人工检查，不盲目重复原调用。
+- 长期记忆的 `task_outcomes.jsonl` 只保存清理后的终态摘要与 trace 引用，不混入原始
+  工具过程或用户语义事件。
+
+CLI 使用 LangGraph 的 `updates` 与 `custom` stream 显示步骤、工具名、尝试次数和验证
+结论，不显示原始 JSON、完整参数或完整工具输出。当前工具输出截断策略保持不变；完整
+artifact 归档不在本次实现范围内。
+
+### 智能体能力基准
+
+以下命令使用当前配置的 API 或本地模型运行六项隔离能力测试：
+
+```powershell
+python -B src\run_agent_task_benchmark.py --run-id agent_smoke_001
+```
+
+case 覆盖读取文件、发现未知文件、确定性 Python 命令、读取—执行—验证、预期命令失败
+恢复，以及写入后重新读取。成功与否由模型外部的确定性 verifier 判断。输出位于：
+
+```text
+data/benchmarks/agent_tasks/runs/<run_id>/
+├─ results.jsonl
+├─ metrics.json
+└─ cases/<case_id>/trace.jsonl
+```
+
+指标包括通过率、工具调用数、重试数、计划修订数、耗时和失败原因。基准会在运行期间
+临时开启写入与命令工具，并在结束后恢复原环境变量。
 
 ## 可选：LongMemEval 评测
 
@@ -226,9 +287,10 @@ python -B src\score_longmemeval_results.py `
 ```text
 config/personas/        persona、agent_id 和 reflection_context
 guga/chat/              ChatSession 与对话流程
+guga/agent/             LangGraph 计划、审批、执行、恢复和 trace
 guga/memory/            事件存储、两阶段整理、用户模型和恢复状态机
 guga/rag/               BGE-M3 embedder、chunking、FAISS store 和检索 pipeline
-guga/benchmark/         LongMemEval 数据加载、隔离 workspace 和运行编排
+guga/benchmark/         LongMemEval 与智能体能力基准
 guga/models/            本地模型与 OpenAI-compatible API 适配
 guga/voice/             GPT-SoVITS 客户端、句子缓冲和播放队列
 src/                    CLI 与 benchmark 入口
