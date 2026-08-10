@@ -18,6 +18,7 @@ from guga.tools import (
     default_tool_registry,
 )
 from guga.types import GenerationConfig
+from guga.workspace import WorkspaceContext
 
 
 class ToolCallingTest(unittest.TestCase):
@@ -28,7 +29,55 @@ class ToolCallingTest(unittest.TestCase):
             schemas = registry.openai_tools(names={"guga_read_file"})
 
         self.assertIn("guga_run_command", registry.names())
+        self.assertIn("guga_workspace", registry.names())
         self.assertEqual([item["function"]["name"] for item in schemas], ["guga_read_file"])
+
+    def test_operational_tools_follow_confirmed_session_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            default_root = root / "default"
+            other_root = root / "other"
+            default_root.mkdir()
+            other_root.mkdir()
+            (default_root / "note.txt").write_text("default", encoding="utf-8")
+            (other_root / "note.txt").write_text("other", encoding="utf-8")
+            workspace = WorkspaceContext(default_root)
+            registry = default_tool_registry(workspace=workspace)
+
+            denied = registry.execute(
+                ToolCall(id="read-before-inspect", name="guga_read_file", arguments={"path": "note.txt"})
+            )
+            inspected = registry.execute(
+                ToolCall(id="inspect-default", name="guga_workspace", arguments={"action": "inspect"})
+            )
+            first_read = registry.execute(
+                ToolCall(id="read-default", name="guga_read_file", arguments={"path": "note.txt"})
+            )
+            switched = registry.execute(
+                ToolCall(
+                    id="switch",
+                    name="guga_workspace",
+                    arguments={"action": "set", "path": str(other_root)},
+                )
+            )
+            denied_after_switch = registry.execute(
+                ToolCall(id="read-after-switch", name="guga_read_file", arguments={"path": "note.txt"})
+            )
+            registry.execute(
+                ToolCall(id="inspect-other", name="guga_workspace", arguments={"action": "inspect"})
+            )
+            second_read = registry.execute(
+                ToolCall(id="read-other", name="guga_read_file", arguments={"path": "note.txt"})
+            )
+
+        self.assertFalse(denied["ok"])
+        self.assertIn("inspect", denied["error"])
+        self.assertTrue(inspected["ok"])
+        self.assertEqual(first_read["content"], "default")
+        self.assertFalse(switched["confirmed"])
+        self.assertFalse(denied_after_switch["ok"])
+        self.assertIn("inspect", denied_after_switch["error"])
+        self.assertEqual(second_read["content"], "other")
 
     def test_conversation_registry_excludes_operational_tools(self) -> None:
         registry = conversation_tool_registry()
