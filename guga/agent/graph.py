@@ -226,6 +226,7 @@ def build_agent_task_graph(
         return {
             "current_action": action,
             "tool_result": result,
+            "recovery_required": False,
             "evidence": _append_evidence(state, recovery_id, result, recovery=True),
         }
 
