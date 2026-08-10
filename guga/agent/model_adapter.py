@@ -182,6 +182,11 @@ class AgentModelAdapter:
                 if not isinstance(call.arguments, dict):
                     last_error = "tool arguments must be an object"
                     continue
+                try:
+                    self.tools.validate_arguments(call.name, call.arguments)
+                except ValueError as exc:
+                    last_error = str(exc)
+                    continue
                 return {
                     "call_id": call.id,
                     "tool_name": call.name,
@@ -215,6 +220,7 @@ class AgentModelAdapter:
             arguments = payload.get("arguments")
             if not isinstance(arguments, dict):
                 raise AgentProtocolError("tool arguments must be an object")
+            self.tools.validate_arguments(tool_name, arguments)
             return {
                 "call_id": f"local_{uuid4().hex[:12]}",
                 "tool_name": tool_name,
