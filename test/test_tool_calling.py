@@ -7,11 +7,34 @@ from pathlib import Path
 
 from guga.chat.session import ChatSession
 from guga.memory.manager import MemoryManager
-from guga.tools import ToolCall, ToolModelResponse, ToolRegistry, ToolSpec, ToolStreamText, ToolStreamToolCalls
+from guga.tools import (
+    ToolCall,
+    ToolModelResponse,
+    ToolRegistry,
+    ToolSpec,
+    ToolStreamText,
+    ToolStreamToolCalls,
+    conversation_tool_registry,
+    default_tool_registry,
+)
 from guga.types import GenerationConfig
 
 
 class ToolCallingTest(unittest.TestCase):
+    def test_registry_filters_schemas_without_hiding_registered_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = default_tool_registry(Path(tmp))
+
+            schemas = registry.openai_tools(names={"guga_read_file"})
+
+        self.assertIn("guga_run_command", registry.names())
+        self.assertEqual([item["function"]["name"] for item in schemas], ["guga_read_file"])
+
+    def test_conversation_registry_excludes_operational_tools(self) -> None:
+        registry = conversation_tool_registry()
+
+        self.assertEqual(registry.names(), {"guga_parse_time"})
+
     def test_reply_executes_tool_and_continues_generation(self) -> None:
         class FakeToolModel:
             def __init__(self) -> None:
