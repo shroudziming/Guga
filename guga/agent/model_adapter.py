@@ -35,6 +35,9 @@ class AgentModelAdapter:
                     "格式为 {\"steps\":[{\"id\":...,\"description\":...,"
                     "\"expected_result\":...,\"verification_method\":...,"
                     "\"allowed_tools\":[...]}]}。每一步必须可执行、可验证。"
+                    "涉及目录、文件或命令操作时，必须先规划调用 guga_workspace 的 inspect；"
+                    "调用 guga_workspace 的 set 或 reset 后，必须再次规划 inspect，"
+                    "确认当前工作区后才能使用其他操作工具。"
                 ),
             },
             {
