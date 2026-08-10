@@ -22,6 +22,7 @@ from guga.utils.paths import personas_dir
 
 
 def main() -> None:
+    _load_env_file()
     args = _parse_args()
     model = create_chat_model(model_id=args.model_id, cache_dir=args.cache_dir)
     persona = PersonaManager(personas_dir()).load(args.persona)
@@ -56,6 +57,21 @@ def main() -> None:
         run_id=args.run_id,
     )
     print(f"benchmark results: {run_dir}")
+
+
+def _load_env_file() -> None:
+    env_path = PROJECT_ROOT / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def _parse_args() -> argparse.Namespace:
