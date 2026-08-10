@@ -75,6 +75,7 @@ class AgentTaskRunner:
             raise RuntimeError(
                 f"agent has an unfinished task: {pending[0]['task_id']}; resume or reject it first"
             )
+        self.tools.invalidate_workspace_confirmation()
         resolved_task_id = task_id or f"task_{uuid4().hex[:16]}"
         context = self.memory_manager.prepare_context(request, session_id)
         frozen_context = self.memory_manager.compose_system_prompt(
