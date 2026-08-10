@@ -8,3 +8,5 @@ tokenizers>=0.19.1
 sentence-transformers>=2.7.0
 faiss-cpu>=1.8.0
 numpy>=1.26.0
+langgraph>=1.1,<2.0
+langgraph-checkpoint-sqlite>=3.0,<4.0
