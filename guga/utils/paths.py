@@ -21,6 +21,10 @@ def debug_reports_dir(agent_id: str = "default") -> Path:
     return agent_memory_root(agent_id) / "debug_reports"
 
 
+def agent_runs_dir(agent_id: str = "default") -> Path:
+    return PROJECT_ROOT / "data" / "agent_runs" / agent_id
+
+
 def rag_data_dir() -> Path:
     return memory_data_dir() / "rag"
 
