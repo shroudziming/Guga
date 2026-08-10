@@ -21,6 +21,7 @@ from guga.persona import PersonaExpression, PersonaManager, PersonaOutputParser,
 from guga.tools import conversation_tool_registry, default_tool_registry
 from guga.utils.debug_reporter import FileDebugSink
 from guga.utils.paths import debug_reports_dir, personas_dir
+from guga.workspace import workspace_context_from_env
 
 
 def _load_env_file() -> None:
@@ -72,7 +73,8 @@ def main() -> None:
         agent_identity=agent_identity,
     )
     generation = default_generation_config()
-    task_tools = default_tool_registry(PROJECT_ROOT)
+    workspace = workspace_context_from_env(PROJECT_ROOT, os.environ)
+    task_tools = default_tool_registry(workspace=workspace)
     task_adapter = AgentModelAdapter(
         model,
         generation,
