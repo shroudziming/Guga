@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 from guga.chat.history import ChatHistory
 from guga.memory import MemoryManager
 from guga.memory.agent_identity import AgentIdentity
-from guga.tools import ToolRegistry, ToolStreamText, ToolStreamToolCalls, default_tool_registry, encode_tool_result
+from guga.tools import ToolRegistry, ToolStreamText, ToolStreamToolCalls, conversation_tool_registry, encode_tool_result
 from guga.types import GenerationConfig
 
 if TYPE_CHECKING:
@@ -73,7 +73,7 @@ class ChatSession:
             ),
         )
         self.session_id = session_id or self.memory_manager.session_store.create_session_id()
-        self.tool_registry = tool_registry or default_tool_registry()
+        self.tool_registry = tool_registry or conversation_tool_registry()
         self.max_tool_rounds = self._env_int("Guga_MAX_TOOL_ROUNDS", 3, minimum=0, maximum=8)
         self._debug("session_ready")
 
