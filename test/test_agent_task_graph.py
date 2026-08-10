@@ -11,6 +11,7 @@ from guga.agent.graph import build_agent_task_graph
 from guga.agent.model_adapter import AgentProtocolError
 from guga.agent.trace import ExecutionTraceStore
 from guga.tools import ToolRegistry, ToolSpec
+from guga.workspace import WorkspaceContext
 
 
 class FakeAdapter:
@@ -89,11 +90,13 @@ class AgentTaskGraphTest(unittest.TestCase):
         self.root = Path(self.temp_dir.name)
         self.trace = ExecutionTraceStore(self.root / "traces", "default")
         self.calls: list[str] = []
+        self.workspace = WorkspaceContext(self.root)
         self.tools = ToolRegistry(
             [
                 ToolSpec("work", "work", {"type": "object"}, self._handler("work")),
                 ToolSpec("inspect", "inspect", {"type": "object"}, self._handler("inspect")),
-            ]
+            ],
+            workspace=self.workspace,
         )
 
     def tearDown(self) -> None:
@@ -175,6 +178,7 @@ class AgentTaskGraphTest(unittest.TestCase):
             adapter.verification(matched=False, requires_replan=True),
             adapter.verification(matched=True),
         ]
+        self.workspace.inspect()
         graph = self._graph(adapter)
         graph.invoke(self._state(), self._config())
 
@@ -185,6 +189,7 @@ class AgentTaskGraphTest(unittest.TestCase):
         self.assertEqual(1, revised["approved_revision"])
         self.assertIn("__interrupt__", revised)
         self.assertEqual(["work"], self.calls)
+        self.assertFalse(self.workspace.confirmed)
 
         completed = graph.invoke(Command(resume=True), self._config())
         self.assertEqual("completed", completed["status"])
