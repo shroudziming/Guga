@@ -25,11 +25,13 @@ from guga.config import (
     DEFAULT_RAG_EMBEDDING_MODEL,
     DEFAULT_RAG_ENABLE_SEMANTIC,
 )
+from guga.agent.outcome import TaskOutcome
 from guga.memory.agent_identity import AgentIdentity, agent_memory_root
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
 from guga.memory.semantic_events import SemanticEventStore
+from guga.memory.task_outcomes import TaskOutcomeStore
 from guga.memory_source_validity import active_event_ids, uses_only_active_event_sources
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso, parse_datetime
@@ -176,6 +178,7 @@ class MemoryManager:
         self.consolidation_state_file = self.memory_root / "consolidation_state.json"
         self.event_summary_store = EventSummaryStore(self.memory_root / "event_summaries.jsonl")
         self.semantic_event_store = SemanticEventStore(self.semantic_event_file)
+        self.task_outcome_store = TaskOutcomeStore(self.memory_root / "task_outcomes.jsonl")
         self.user_model_store = GugaUserModelStore(self.memory_root / "guga_user_model.json")
         self.summarizer = MemoryBankSummarizer(model=model)
         self.consolidation_config = (consolidation_config or MemoryConsolidationConfig()).normalized()
@@ -387,7 +390,12 @@ class MemoryManager:
             query_reason=query_plan.reason,
         )
 
-    def compose_system_prompt(self, base_prompt: str, memory_context: MemoryContext) -> str:
+    def compose_system_prompt(
+        self,
+        base_prompt: str,
+        memory_context: MemoryContext,
+        task_mode: str = "Conversation",
+    ) -> str:
         """Build final system prompt by combining persona + retrieval results.
 
         Args:
@@ -397,7 +405,10 @@ class MemoryManager:
         Returns:
             A single system prompt string consumed by the chat model.
         """
-        sections = ["[Task Mode: Conversation]", "[Persona Skill]", base_prompt]
+        normalized_mode = str(task_mode).strip()
+        if not normalized_mode:
+            raise ValueError("task_mode is required")
+        sections = [f"[Task Mode: {normalized_mode}]", "[Persona Skill]", base_prompt]
         semantic_events = [hit for hit in memory_context.hits if hit.memory_type == "semantic_event"]
         derived_summaries = [hit for hit in memory_context.hits if hit.memory_type == "event_summary"]
         raw_evidence = [
@@ -539,6 +550,10 @@ class MemoryManager:
                 state["assistant_session_memory_id"] = turn_payload["id"]
         self._debug(session_id, f"ingest role=assistant message_id={message_id}")
         return message_id
+
+    def record_task_outcome(self, outcome: TaskOutcome) -> bool:
+        """Persist one terminal agent-task summary without changing user facts."""
+        return self.task_outcome_store.append(outcome)
 
     def finalize_turn(self, session_id: str) -> None:
         """Finalize one turn: optional archival writeback and index update.
