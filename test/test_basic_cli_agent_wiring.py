@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -29,6 +31,10 @@ class FakeRunner:
 class BasicCliAgentWiringTest(unittest.TestCase):
     def test_chat_and_task_tools_are_separated(self) -> None:
         captured = {}
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        workspace_root = Path(temp_dir.name) / "workspace"
+        workspace_root.mkdir()
 
         def make_session(**kwargs):
             captured["session"] = FakeSession(**kwargs)
@@ -48,7 +54,12 @@ class BasicCliAgentWiringTest(unittest.TestCase):
             patch.object(cli, "_load_env_file"),
             patch.dict(
                 cli.os.environ,
-                {"Guga_DEBUG": "0", "Guga_MODEL_ID": "fake-model"},
+                {
+                    "Guga_DEBUG": "0",
+                    "Guga_MODEL_ID": "fake-model",
+                    "Guga_CLI_DEFAULT_WORKSPACE_PATH": str(workspace_root),
+                    "Guga_CLI_ALLOW_CREATE_WORKSPACE": "1",
+                },
                 clear=False,
             ),
             patch.object(cli, "create_chat_model", return_value=object()),
@@ -64,8 +75,11 @@ class BasicCliAgentWiringTest(unittest.TestCase):
         chat_tools = captured["session"].kwargs["tool_registry"]
         task_tools = captured["runner"].args[1]
         self.assertEqual({"guga_parse_time"}, chat_tools.names())
+        self.assertIn("guga_workspace", task_tools.names())
         self.assertIn("guga_read_file", task_tools.names())
         self.assertIn("guga_run_command", task_tools.names())
+        self.assertEqual(workspace_root.resolve(), task_tools.workspace.current_root)
+        self.assertTrue(task_tools.workspace.allow_create)
         self.assertTrue(captured["runner"].closed)
 
 
