@@ -4,7 +4,7 @@
 
 为文本版 Guga 提供一个简单、可注释、可配置的 Windows 启动入口，并把文件和命令工具从固定项目根目录改为会话级工作区。
 
-用户通过仓库根目录的 `guga_cli.ps1` 启动 Guga。启动配置合并到仓库已有的 `.env`，不再新增第二个 CLI 配置文件。默认走 API 路线，默认工作区为当前 Windows 用户桌面下的 `Guga` 文件夹。Guga 可以在已批准的任务中通过工具检查、切换或重置工作区；切换只对当前 Python 进程有效，重启后恢复默认工作区。
+用户通过仓库根目录的 `guga_cli.ps1` 启动 Guga。可提交的启动设置保存在 `config/guga_cli.env`；API 密钥和 base URL 等敏感连接信息继续保存在未跟踪的 `.env`。默认走 API 路线，默认工作区为当前 Windows 用户桌面下的 `Guga` 文件夹。Guga 可以在已批准的任务中通过工具检查、切换或重置工作区；切换只对当前 Python 进程有效，重启后恢复默认工作区。
 
 ## 文件与职责
 
@@ -12,30 +12,32 @@
 
 根目录启动脚本负责：
 
-1. 读取仓库根目录 `.env` 中的模型路线、模型名称、API 密钥、工具开关和工作区设置；不打印密钥。
-2. 根据 `Guga_MODEL_PROVIDER` 选择 API 或本地模型；该值缺失时默认使用 `api`。
+1. 读取仓库根目录 `.env` 中的 API 密钥和 base URL 等敏感连接信息；不打印密钥。
+2. 读取 Git 跟踪的 `config/guga_cli.env`，应用模型路线、模型名称、工具开关和工作区设置。
+3. 根据 `Guga_CLI_MODEL_ROUTE` 选择 API 或本地模型，并设置现有的 `Guga_MODEL_PROVIDER`、`Guga_MODEL_ID` 和 `Guga_CACHE_DIR` 环境变量。
 4. 解析 Windows 真实桌面路径，创建默认的 `Desktop/Guga` 工作区。
 5. 启动 `src/basic_cli_chat.py`，并将默认工作区通过进程环境传入。
-6. 当配置缺失、路线非法、API 密钥缺失或目录创建失败时，在启动模型前给出明确错误并返回非零退出码。
+6. 当配置文件缺失、路线非法、API 密钥缺失或目录创建失败时，在启动模型前给出明确错误并返回非零退出码。
 
-脚本不保存会话中的工作区切换，也不修改 `.env`。
+脚本不保存会话中的工作区切换，也不修改 `.env` 或 `config/guga_cli.env`。
 
-### `.env`
+### `config/guga_cli.env`
 
-现有 `.env` 继续作为唯一启动配置，其中既包含 API 密钥等未跟踪的敏感值，也包含 CLI 设置。新增或整理配置时必须保留用户已有密钥，不在终端、Trace 或提交中输出密钥。每项配置必须带中文注释，尤其明确布尔开关中 `1 = 允许/启用`、`0 = 禁止/关闭`。
+该文件保存可提交、可共享的非敏感启动设置。每项配置必须带中文注释，尤其明确布尔开关中 `1 = 允许/启用`、`0 = 禁止/关闭`。
 
 ```env
 # 模型路线：api = 在线 API；local = 本地模型。
-# 未设置时 guga_cli.ps1 默认使用 api。
-Guga_MODEL_PROVIDER=api
+# 默认使用 API。
+Guga_CLI_MODEL_ROUTE=api
 
-# 当前路线使用的模型名称。
-# API 示例：deepseek-v4-pro
-# 本地示例：Qwen/Qwen2.5-VL-3B-Instruct
-Guga_MODEL_ID=deepseek-v4-pro
+# API 路线使用的模型名称。
+Guga_CLI_API_MODEL_ID=deepseek-v4-pro
 
-# 本地模型缓存目录。仅 local 路线使用；相对路径以仓库根目录为基准。
-Guga_CACHE_DIR=./models_cache
+# 本地路线使用的模型名称。
+Guga_CLI_LOCAL_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
+
+# 本地模型缓存目录。相对路径以仓库根目录为基准。
+Guga_CLI_LOCAL_CACHE_DIR=./models_cache
 
 # 默认工作区：desktop 表示 Windows 桌面下的 Guga 文件夹。
 Guga_CLI_DEFAULT_WORKSPACE=desktop
@@ -58,14 +60,22 @@ Guga_ENABLE_COMMAND_TOOL=1
 Guga_DEBUG=0
 ```
 
-切换本地模型时修改同一文件中的两项：
+切换本地模型只修改一项：
 
 ```env
-Guga_MODEL_PROVIDER=local
-Guga_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
+Guga_CLI_MODEL_ROUTE=local
 ```
 
-切回 API 时改回 `api` 与对应 API 模型名称。`.env` 继续被 Git 忽略，不得提交密钥、令牌或用户凭证。
+### `.env`
+
+该文件继续被 Git 忽略，只保存敏感或机器相关的 API 连接信息，例如：
+
+```env
+Guga_API_BASE_URL=https://api.example.com
+Guga_API_KEY=replace_with_private_key
+```
+
+`config/guga_cli.env` 不得包含密钥、令牌或用户凭证。脚本读取配置时只允许启动配置覆盖模型路线、模型名称、缓存目录和工具行为，不允许它覆盖 `.env` 中的 API 密钥。
 
 ## 会话级工作区模型
 
@@ -137,18 +147,20 @@ Guga_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
 
 ### API
 
-当 `Guga_MODEL_PROVIDER=api` 时：
+当 `Guga_CLI_MODEL_ROUTE=api` 时：
 
-- 使用 `.env` 中的 `Guga_MODEL_ID`；缺失时默认 `deepseek-v4-pro`。
+- 使用 `Guga_CLI_API_MODEL_ID` 设置 `Guga_MODEL_ID`。
+- 设置 `Guga_MODEL_PROVIDER=api`。
 - 要求 `.env` 已提供 `Guga_API_KEY` 或兼容的 `OPENAI_API_KEY`。
 - 使用现有原生 tool calling 路线。
 
 ### 本地模型
 
-当 `Guga_MODEL_PROVIDER=local` 时：
+当 `Guga_CLI_MODEL_ROUTE=local` 时：
 
-- 使用 `.env` 中的 `Guga_MODEL_ID`；缺失时默认 `Qwen/Qwen2.5-VL-3B-Instruct`。
-- 将相对 `Guga_CACHE_DIR` 解析为仓库根目录下的绝对路径。
+- 使用 `Guga_CLI_LOCAL_MODEL_ID` 设置 `Guga_MODEL_ID`。
+- 将相对 `Guga_CLI_LOCAL_CACHE_DIR` 解析为仓库根目录下的绝对路径并设置 `Guga_CACHE_DIR`。
+- 设置 `Guga_MODEL_PROVIDER=local`。
 - 使用现有结构化 JSON action 回退路线。
 
 路线值不是 `api` 或 `local` 时拒绝启动，不静默回退。
@@ -166,7 +178,7 @@ Guga_MODEL_ID=Qwen/Qwen2.5-VL-3B-Instruct
 
 自动测试使用临时目录替代真实桌面，不写用户文件：
 
-1. `.env` 配置默认路线为 API，且注释明确 `0/1` 含义。
+1. `config/guga_cli.env` 默认路线为 API，且注释明确 `0/1` 含义。
 2. 启动配置能正确选择 API 与本地模型变量。
 3. 默认工作区不存在时自动创建。
 4. 新会话从默认工作区开始。
