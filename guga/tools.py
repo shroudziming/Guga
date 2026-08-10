@@ -64,8 +64,14 @@ class ToolRegistry:
     def has_tools(self) -> bool:
         return bool(self._tools)
 
-    def openai_tools(self) -> list[dict[str, Any]]:
-        return [tool.to_openai_tool() for tool in self._tools.values()]
+    def names(self) -> set[str]:
+        return set(self._tools)
+
+    def openai_tools(self, names: set[str] | None = None) -> list[dict[str, Any]]:
+        selected = self._tools.values()
+        if names is not None:
+            selected = [tool for tool in selected if tool.name in names]
+        return [tool.to_openai_tool() for tool in selected]
 
     def execute(self, call: ToolCall) -> dict[str, Any]:
         tool = self._tools.get(call.name)
@@ -91,6 +97,10 @@ def default_tool_registry(project_root: Path | None = None) -> ToolRegistry:
     registry.add(_write_file_tool(root))
     registry.add(_run_command_tool(root))
     return registry
+
+
+def conversation_tool_registry() -> ToolRegistry:
+    return ToolRegistry([_time_parse_tool()])
 
 
 def _time_parse_tool() -> ToolSpec:
