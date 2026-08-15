@@ -10,6 +10,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from guga.chat import ChatSession
+from guga.cli_input import read_user_input
 from guga.config import DEFAULT_CACHE_DIR, DEFAULT_MODEL_ID, default_generation_config
 from guga.memory.agent_identity import identity_from_persona
 from guga.memory.manager import MemoryManager
@@ -75,7 +76,7 @@ def main() -> None:
     )
 
     while True:
-        user_text = input("你> ").strip()
+        user_text = read_user_input("你> ").strip()
         if not user_text:
             continue
 
