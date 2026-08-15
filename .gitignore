@@ -40,3 +40,6 @@ dist/
 
 CLAUDE.md
 .worktrees/
+
+# Local documentation
+/docs/
