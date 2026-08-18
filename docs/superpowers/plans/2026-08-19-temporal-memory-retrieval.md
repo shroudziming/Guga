@@ -15,7 +15,7 @@
 - Interpret every interval as left-closed and right-open: $[start\_at, end\_at)$.
 - Require timezone-aware ISO 8601 values and normalize them to `+08:00`.
 - Keep semantic retrieval and temporal retrieval independent; do not intersect their result sets.
-- Use `time_basis=semantic` by default; use `created_at` only for `time_basis=transaction`.
+- Match every normalized query against every supported temporal field, and preserve the matched field name and meaning on each result.
 - Search new canonical data only. Do not add compatibility inference for incomplete legacy temporal fields.
 - Include inactive semantic events in temporal matching and preserve lifecycle state in results.
 - Use BGE-M3 only to order records that already passed structural time filtering.
@@ -34,7 +34,7 @@
 **Interfaces:**
 - Consumes: `guga.memory.time_utils.parse_datetime`, `guga.memory.time_utils.format_beijing`, and an optional `guga.rag.embedder.BaseEmbedder`.
 - Produces: `TimeQuery`, `TemporalQueryValidationError`, `parse_time_queries(raw_queries)`, and `search_temporal_records(queries, records, semantic_query, embedder, top_k)`.
-- Canonical record input keys: `record_type`, `record_id`, `text`, `status`, `semantic_intervals`, `transaction_at`, `updated_at`, and `time_fields`.
+- Canonical record input keys: `record_type`, `record_id`, `text`, `status`, `time_values`, `updated_at`, and `time_fields`. Each `time_values` item contains `start_at`, optional `end_at`, `is_point`, `open_end`, `matched_time_field`, and `time_meaning`.
 - Search output: `{"queries": [{"query": <canonical query>, "matches": [<structured match>]}], "ranking_degraded": bool}`.
 
 - [ ] **Step 1: Write failing contract, boundary, lifecycle, and ranking tests**
@@ -71,7 +71,6 @@ class TemporalRetrievalTest(unittest.TestCase):
                     "end_at": "2026-08-21T00:00:00+08:00",
                     "relation": "overlap",
                     "granularity": "day",
-                    "time_basis": "semantic",
                 }]
             )
         self.assertEqual(caught.exception.code, "INVALID_TIMEZONE")
@@ -84,18 +83,20 @@ class TemporalRetrievalTest(unittest.TestCase):
             "end_at": "2026-08-21T00:00:00+08:00",
             "relation": "overlap",
             "granularity": "day",
-            "time_basis": "semantic",
         }])
         records = [{
             "record_type": "semantic_event",
             "record_id": "evt_boundary",
             "text": "第二天开始的安排",
             "status": "active",
-            "semantic_intervals": [{
+            "time_values": [{
                 "start_at": "2026-08-21T00:00:00+08:00",
                 "end_at": "2026-08-21T01:00:00+08:00",
+                "is_point": False,
+                "open_end": False,
+                "matched_time_field": "start_at/end_at",
+                "time_meaning": "事件实际发生区间",
             }],
-            "transaction_at": "",
             "updated_at": "2026-08-18T10:00:00+08:00",
             "time_fields": {},
         }]
@@ -109,7 +110,6 @@ class TemporalRetrievalTest(unittest.TestCase):
             "end_at": "2026-08-21T00:00:00+08:00",
             "relation": "overlap",
             "granularity": "day",
-            "time_basis": "semantic",
         }])
         records = [
             {
@@ -117,8 +117,7 @@ class TemporalRetrievalTest(unittest.TestCase):
                 "record_id": "evt_dinner",
                 "text": "晚上聚餐",
                 "status": "active",
-                "semantic_intervals": [{"start_at": "2026-08-20T18:00:00+08:00", "end_at": "2026-08-20T19:00:00+08:00"}],
-                "transaction_at": "",
+                "time_values": [{"start_at": "2026-08-20T18:00:00+08:00", "end_at": "2026-08-20T19:00:00+08:00", "is_point": False, "open_end": False, "matched_time_field": "start_at/end_at", "time_meaning": "事件实际发生区间"}],
                 "updated_at": "2026-08-18T09:00:00+08:00",
                 "time_fields": {},
             },
@@ -127,8 +126,7 @@ class TemporalRetrievalTest(unittest.TestCase):
                 "record_id": "evt_interview",
                 "text": "参加面试",
                 "status": "cancelled",
-                "semantic_intervals": [{"start_at": "2026-08-20T14:00:00+08:00", "end_at": "2026-08-20T15:00:00+08:00"}],
-                "transaction_at": "",
+                "time_values": [{"start_at": "2026-08-20T14:00:00+08:00", "end_at": "2026-08-20T15:00:00+08:00", "is_point": False, "open_end": False, "matched_time_field": "start_at/end_at", "time_meaning": "事件实际发生区间"}],
                 "updated_at": "2026-08-19T09:00:00+08:00",
                 "time_fields": {},
             },
@@ -139,37 +137,43 @@ class TemporalRetrievalTest(unittest.TestCase):
         self.assertEqual(matches[0]["status"], "cancelled")
         self.assertEqual(matches[0]["semantic_score"], 1.0)
 
-    def test_transaction_basis_matches_created_at_and_embedding_failure_degrades(self) -> None:
+    def test_created_at_candidate_is_annotated_and_embedding_failure_degrades(self) -> None:
         query = parse_time_queries([{
             "original_expression": "昨天聊的内容",
             "start_at": "2026-08-18T00:00:00+08:00",
             "end_at": "2026-08-19T00:00:00+08:00",
             "relation": "overlap",
             "granularity": "day",
-            "time_basis": "transaction",
         }])
         records = [{
             "record_type": "conversation_turn",
             "record_id": "turn_1",
             "text": "用户询问了面试",
             "status": "active",
-            "semantic_intervals": [],
-            "transaction_at": "2026-08-18T12:00:00+08:00",
+            "time_values": [{
+                "start_at": "2026-08-18T12:00:00+08:00",
+                "end_at": None,
+                "is_point": True,
+                "open_end": False,
+                "matched_time_field": "created_at",
+                "time_meaning": "这条消息是在该时间创建的，不代表消息内容中的事件发生于此时",
+            }],
             "updated_at": "2026-08-18T12:00:00+08:00",
             "time_fields": {"created_at": "2026-08-18T12:00:00+08:00"},
         }]
         result = search_temporal_records(query, records, "昨天聊了什么", BrokenEmbedder(), 5)
         self.assertEqual(result["queries"][0]["matches"][0]["record_id"], "turn_1")
+        self.assertEqual(result["queries"][0]["matches"][0]["matched_time_field"], "created_at")
         self.assertTrue(result["ranking_degraded"])
 
     def test_multiple_queries_group_before_and_after_results(self) -> None:
         queries = parse_time_queries([
-            {"original_expression": "8月20号之前", "start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00", "relation": "before", "granularity": "day", "time_basis": "semantic"},
-            {"original_expression": "8月20号之后", "start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00", "relation": "after", "granularity": "day", "time_basis": "semantic"},
+            {"original_expression": "8月20号之前", "start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00", "relation": "before", "granularity": "day"},
+            {"original_expression": "8月20号之后", "start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00", "relation": "after", "granularity": "day"},
         ])
         records = [
-            {"record_type": "semantic_event", "record_id": "evt_before", "text": "之前的事情", "status": "active", "semantic_intervals": [{"start_at": "2026-08-19T09:00:00+08:00", "end_at": "2026-08-19T10:00:00+08:00", "open_end": False}], "transaction_at": "", "updated_at": "2026-08-19T10:00:00+08:00", "time_fields": {}},
-            {"record_type": "semantic_event", "record_id": "evt_after", "text": "之后的事情", "status": "active", "semantic_intervals": [{"start_at": "2026-08-21T09:00:00+08:00", "end_at": "2026-08-21T10:00:00+08:00", "open_end": False}], "transaction_at": "", "updated_at": "2026-08-21T10:00:00+08:00", "time_fields": {}},
+            {"record_type": "semantic_event", "record_id": "evt_before", "text": "之前的事情", "status": "active", "time_values": [{"start_at": "2026-08-19T09:00:00+08:00", "end_at": "2026-08-19T10:00:00+08:00", "is_point": False, "open_end": False, "matched_time_field": "start_at/end_at", "time_meaning": "事件实际发生区间"}], "updated_at": "2026-08-19T10:00:00+08:00", "time_fields": {}},
+            {"record_type": "semantic_event", "record_id": "evt_after", "text": "之后的事情", "status": "active", "time_values": [{"start_at": "2026-08-21T09:00:00+08:00", "end_at": "2026-08-21T10:00:00+08:00", "is_point": False, "open_end": False, "matched_time_field": "start_at/end_at", "time_meaning": "事件实际发生区间"}], "updated_at": "2026-08-21T10:00:00+08:00", "time_fields": {}},
         ]
         result = search_temporal_records(queries, records, "事情", None, 5)
         self.assertEqual(len(result["queries"]), 2)
@@ -177,14 +181,13 @@ class TemporalRetrievalTest(unittest.TestCase):
         self.assertEqual(result["queries"][1]["matches"][0]["record_id"], "evt_after")
 
     def test_open_ended_archival_interval_overlaps_future_query(self) -> None:
-        query = parse_time_queries([{"original_expression": "8月20号", "start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00", "relation": "overlap", "granularity": "day", "time_basis": "semantic"}])
+        query = parse_time_queries([{"original_expression": "8月20号", "start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00", "relation": "overlap", "granularity": "day"}])
         records = [{
             "record_type": "archival_memory",
             "record_id": "mem_open",
             "text": "用户正在准备面试",
             "status": "active",
-            "semantic_intervals": [{"start_at": "2026-08-18T10:00:00+08:00", "end_at": None, "open_end": True}],
-            "transaction_at": "",
+            "time_values": [{"start_at": "2026-08-18T10:00:00+08:00", "end_at": None, "is_point": False, "open_end": True, "matched_time_field": "valid_at/invalid_at", "time_meaning": "事实成立的有效区间"}],
             "updated_at": "2026-08-18T10:00:00+08:00",
             "time_fields": {"valid_at": "2026-08-18T10:00:00+08:00", "invalid_at": ""},
         }]
@@ -219,7 +222,6 @@ from guga.rag.embedder import BaseEmbedder
 
 _RELATIONS = {"overlap", "before", "after"}
 _GRANULARITIES = {"minute", "hour", "day", "week", "month", "year", "range", "session"}
-_TIME_BASES = {"semantic", "transaction"}
 
 
 @dataclass(frozen=True)
@@ -229,7 +231,6 @@ class TimeQuery:
     end_at: datetime
     relation: str
     granularity: str
-    time_basis: str
 
     def as_dict(self) -> dict[str, str]:
         return {
@@ -238,7 +239,6 @@ class TimeQuery:
             "end_at": format_beijing(self.end_at),
             "relation": self.relation,
             "granularity": self.granularity,
-            "time_basis": self.time_basis,
         }
 
 
@@ -276,29 +276,27 @@ def parse_time_queries(raw_queries: object) -> list[TimeQuery]:
             raise TemporalQueryValidationError("INVALID_TIME_RANGE", "start_at must be earlier than end_at", index)
         relation = str(raw.get("relation", "overlap")).strip()
         granularity = str(raw.get("granularity", "range")).strip()
-        time_basis = str(raw.get("time_basis", "semantic")).strip()
         if relation not in _RELATIONS:
             raise TemporalQueryValidationError("INVALID_RELATION", f"unsupported relation: {relation}", index)
         if granularity not in _GRANULARITIES:
             raise TemporalQueryValidationError("INVALID_GRANULARITY", f"unsupported granularity: {granularity}", index)
-        if time_basis not in _TIME_BASES:
-            raise TemporalQueryValidationError("INVALID_TIME_BASIS", f"unsupported time_basis: {time_basis}", index)
-        parsed_queries.append(TimeQuery(str(raw.get("original_expression", "")).strip(), start, end, relation, granularity, time_basis))
+        parsed_queries.append(TimeQuery(str(raw.get("original_expression", "")).strip(), start, end, relation, granularity))
     return parsed_queries
 ```
 
 Complete the same file with these exact search rules:
 
-- `semantic` requires a valid timezone-aware start. Semantic events, event summaries, and conversation semantic intervals also require a valid end with `start < end`. Only `record_type=archival_memory` may use `{end_at: None, open_end: True}` for intentionally open-ended validity.
-- `transaction` uses only `transaction_at` as a point and checks `query.start_at <= point < query.end_at` for overlap.
-- `before` accepts a closed semantic interval only when `candidate_end <= query.start_at`; a transaction point must be `< query.start_at`.
-- `after` accepts a semantic interval only when `candidate_start >= query.end_at`; a transaction point must be `>= query.end_at`.
+- Iterate every record's `time_values`; do not choose a field category before matching.
+- Closed intervals require valid timezone-aware starts and ends with `start < end`. Only `record_type=archival_memory` may use `{end_at: None, open_end: True}` for intentionally open-ended validity.
+- Point values such as `created_at` use `query.start_at <= point < query.end_at` for overlap.
+- `before` accepts a closed interval only when `candidate_end <= query.start_at`; a point must be `< query.start_at`.
+- `after` accepts an interval only when `candidate_start >= query.end_at`; a point must be `>= query.end_at`.
 - An open-ended archival interval overlaps when `candidate_start < query.end_at`, never satisfies `before`, and satisfies `after` only when its start is at or after `query.end_at`.
-- Create at most one match per record per query.
+- Create one match for every matching time value. Do not deduplicate records that match multiple fields in this phase.
 - Encode `[semantic_query] + candidate_texts` once per query and compute normalized-vector dot products.
 - On any embedder exception, set `ranking_degraded=True`, leave `semantic_score=None`, and sort by `updated_at` descending followed by `record_id` ascending.
 - On successful embedding, sort by `semantic_score` descending, then `updated_at` descending, then `record_id` ascending.
-- Return only the first `top_k` matches for each query.
+- Merge all matches, apply one global semantic sort, and return only the first total `top_k` matches for each query. Do not reserve per-field quotas.
 
 Use this match shape:
 
@@ -309,6 +307,8 @@ match = {
     "text": str(record["text"]),
     "status": str(record.get("status", "active")),
     "time_fields": dict(record.get("time_fields", {})),
+    "matched_time_field": str(time_value["matched_time_field"]),
+    "time_meaning": str(time_value["time_meaning"]),
     "semantic_score": score,
 }
 ```
@@ -366,7 +366,6 @@ Add tests that seed all four layers without using legacy field inference:
                 "end_at": "2026-08-21T00:00:00+08:00",
                 "relation": "overlap",
                 "granularity": "day",
-                "time_basis": "semantic",
             }],
         )
         self.assertTrue(result["ok"])
@@ -385,7 +384,6 @@ Add tests that seed all four layers without using legacy field inference:
                 "end_at": "2026-08-20T00:00:00+08:00",
                 "relation": "overlap",
                 "granularity": "day",
-                "time_basis": "semantic",
             }],
         )
         self.assertFalse(result["ok"])
@@ -404,17 +402,16 @@ Add tests that seed all four layers without using legacy field inference:
                     "end_at": "2026-08-21T00:00:00+08:00",
                     "relation": "overlap",
                     "granularity": "day",
-                    "time_basis": "semantic",
                 }],
             )
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "TEMPORAL_STORE_READ_FAILED")
 ```
 
-Add this session-row test for both time bases:
+Add this session-row test for the unified time-query path:
 
 ```python
-    def test_search_time_context_uses_turn_semantic_time_or_message_transaction_time(self) -> None:
+    def test_search_time_context_searches_turn_semantic_time_and_message_created_at(self) -> None:
         session_dir = self.memory_root / "sessions"
         session_dir.mkdir(parents=True, exist_ok=True)
         row = {
@@ -432,7 +429,6 @@ Add this session-row test for both time bases:
                     "end_at": "2026-08-21T00:00:00+08:00",
                     "relation": "overlap",
                     "granularity": "day",
-                    "time_basis": "semantic",
                 }],
             }}},
         }
@@ -443,7 +439,7 @@ Add this session-row test for both time bases:
             reference_time="2026-08-19T10:00:00+08:00",
             time_queries=[{**row["metadata"]["turn"]["temporal_context"]["time_queries"][0]}],
         )
-        transaction = self.manager.search_time_context(
+        conversation_day = self.manager.search_time_context(
             session_id="sess_now",
             user_text="8月18号聊了什么",
             reference_time="2026-08-19T10:00:00+08:00",
@@ -453,11 +449,12 @@ Add this session-row test for both time bases:
                 "end_at": "2026-08-19T00:00:00+08:00",
                 "relation": "overlap",
                 "granularity": "day",
-                "time_basis": "transaction",
             }],
         )
         self.assertEqual(semantic["queries"][0]["matches"][0]["record_id"], "turn_msg_prior")
-        self.assertEqual(transaction["queries"][0]["matches"][0]["record_id"], "turn_msg_prior")
+        self.assertEqual(semantic["queries"][0]["matches"][0]["matched_time_field"], "temporal_context.time_queries")
+        self.assertEqual(conversation_day["queries"][0]["matches"][0]["record_id"], "turn_msg_prior")
+        self.assertEqual(conversation_day["queries"][0]["matches"][0]["matched_time_field"], "created_at")
 ```
 
 - [ ] **Step 2: Run the focused manager tests and verify the method is missing**
@@ -529,18 +526,18 @@ Implement this public method on `MemoryManager`:
 
 Implement `_load_temporal_records()` with these exact mappings:
 
-- `semantic_events.jsonl`: load all rows, require valid `start_at` and `end_at` with `start < end`, map `inactive_reason=cancelled` to output status `cancelled`, and retain other lifecycle reasons.
-- `archival_memory.jsonl`: require `valid_at`; map a non-empty `invalid_at` to a closed interval and an empty `invalid_at` to `{end_at: None, open_end: True}`. Map stored `type=episodic` to output `record_type=archival_memory`.
-- `event_summaries.jsonl`: require both `time_window_start` and `time_window_end` with `start < end`.
-- `sessions/*.jsonl`: inspect only user-message rows. Read semantic intervals exclusively from `metadata.turn.temporal_context.time_queries`; set `transaction_at` from the message's `created_at`.
-- Do not substitute `created_at`, `day`, `semantic_day`, `valid_at`, or parsed text when a semantic interval is missing.
+- `semantic_events.jsonl`: load all rows, require valid `start_at` and `end_at` with `start < end`, set `matched_time_field=start_at/end_at` and `time_meaning=事件实际发生区间`, map `inactive_reason=cancelled` to output status `cancelled`, and retain other lifecycle reasons.
+- `archival_memory.jsonl`: require `valid_at`; map a non-empty `invalid_at` to a closed interval and an empty `invalid_at` to `{end_at: None, open_end: True}`. Set `matched_time_field=valid_at/invalid_at` and `time_meaning=事实成立的有效区间`. Map stored `type=episodic` to output `record_type=archival_memory`.
+- `event_summaries.jsonl`: require both `time_window_start` and `time_window_end` with `start < end`; set `matched_time_field=time_window_start/time_window_end` and `time_meaning=事件总结覆盖的时间范围`.
+- `sessions/*.jsonl`: inspect only user-message rows. Add one interval value for every `metadata.turn.temporal_context.time_queries` item with `matched_time_field=temporal_context.time_queries`, and add the message `created_at` as an independent point with `matched_time_field=created_at`.
+- Do not substitute `day`, `semantic_day`, `valid_at`, or parsed text when a semantic interval is missing. `created_at` remains a separately labelled message-creation point and never masquerades as semantic event time.
 - Format semantic-event text from `description`, archival/event-summary text from `summary`, and conversation text from `content`.
 
 - [ ] **Step 4: Run manager and pure temporal tests**
 
 Run: `python -m unittest test.test_temporal_retrieval test.test_memory_manager -v`
 
-Expected: all tests PASS, including validation, lifecycle, session semantic time, and transaction-time retrieval.
+Expected: all tests PASS, including validation, lifecycle, session semantic time, `created_at` matching, field annotations, and global ranking.
 
 - [ ] **Step 5: Commit MemoryManager temporal loading**
 
@@ -588,7 +585,6 @@ Add a fake tool-capable model whose first response returns both a time call and 
                                     "end_at": "2026-08-21T00:00:00+08:00",
                                     "relation": "overlap",
                                     "granularity": "day",
-                                    "time_basis": "semantic",
                                 }]
                             }),
                             ToolCall(id="call_other", name="guga_test_tool", arguments={"query": "面试"}),
@@ -741,7 +737,6 @@ def memory_time_search_tool(handler: ToolHandler) -> ToolSpec:
         "end_at": {"type": "string", "description": "Timezone-aware ISO 8601 exclusive end."},
         "relation": {"type": "string", "enum": ["overlap", "before", "after"]},
         "granularity": {"type": "string", "enum": ["minute", "hour", "day", "week", "month", "year", "range", "session"]},
-        "time_basis": {"type": "string", "enum": ["semantic", "transaction"], "default": "semantic"},
     }
     return ToolSpec(
         name="memory_time_search",
@@ -755,7 +750,7 @@ def memory_time_search_tool(handler: ToolHandler) -> ToolSpec:
                     "items": {
                         "type": "object",
                         "properties": query_properties,
-                        "required": ["original_expression", "start_at", "end_at", "relation", "granularity", "time_basis"],
+                        "required": ["original_expression", "start_at", "end_at", "relation", "granularity"],
                         "additionalProperties": False,
                     },
                 }
@@ -851,7 +846,13 @@ timezone=Asia/Hong_Kong (+08:00)
 
 [Temporal Memory Tool]
 When the user states, changes, cancels, compares, or asks about time-bound information, resolve every relevant expression to an absolute timezone-aware left-closed/right-open interval and call memory_time_search.
-Use time_basis=semantic for event/fact time. Use time_basis=transaction only when the user explicitly asks when a conversation or message occurred.
+Use one normalized interval for all relevant time fields. Interpret the result labels as follows:
+- start_at/end_at: when an event occurs.
+- valid_at/invalid_at: when a fact is valid.
+- time_window_start/time_window_end: the period covered by an event summary.
+- temporal_context.time_queries: time mentioned or resolved in that conversation turn.
+- created_at: when the message was created, not when an event described by the message occurred.
+Use matched_time_field and time_meaning together with the user's question to decide which evidence is relevant.
 If a time reference cannot be resolved from the current time and conversation context, ask the user to clarify instead of inventing an interval.
 The time tool is one normal tool among all available tools. Continue the Agent Loop after any tool call, and finish only when no tool_calls remain.
 ```
@@ -923,7 +924,7 @@ Apply these exact structural changes in `guga/memory/manager.py`:
 - Reduce `_QueryPlan` to `route`, `reason`, and no temporal/day/session fields.
 - Remove `_date_context_by_session`.
 - Make `_build_query_plan` return `portrait` only for portrait queries and `hybrid` for every other query.
-- Stop loading raw session rows in `prepare_context`; transaction-time session retrieval now belongs to `memory_time_search`.
+- Stop loading raw session rows in `prepare_context`; time-matched session retrieval now belongs to `memory_time_search`, which searches both turn semantic time and labelled message `created_at`.
 - Remove `_records_for_query_plan`, `_record_matches_day`, `_extract_query_day_with_source`, `_mentions_recent_current`, `_mentions_last_session`, `_latest_non_current_session_id`, `_apply_time_score_adjustments`, `_apply_time_score_components`, `_record_day`, and `_dedupe_semantic_event_overlaps`.
 - Remove `time_hints` from `_merge_memory_hits` and its callers. Preserve semantic score, current-turn weakening, retention, layer quotas, and source validity unchanged.
 - Remove direct `extract_semantic_time`/`now_beijing` imports from `manager.py` when they become unused. Keep ingestion helpers in `time_utils.py` because consolidation migration is handled in the second implementation plan.
