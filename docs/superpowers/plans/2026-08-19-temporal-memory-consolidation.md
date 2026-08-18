@@ -69,7 +69,6 @@ Add this test around `_build_low_level_packet`:
                                 "end_at": "2026-08-21T00:00:00+08:00",
                                 "relation": "overlap",
                                 "granularity": "day",
-                                "time_basis": "semantic",
                             }],
                         },
                         "tool_interactions": [{
