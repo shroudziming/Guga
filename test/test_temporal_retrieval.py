@@ -184,6 +184,39 @@ class TemporalRetrievalTest(unittest.TestCase):
         self.assertEqual([item["record_id"] for item in result["queries"][0]["matches"]], ["newer", "older"])
         self.assertIsNone(result["queries"][0]["matches"][0]["semantic_score"])
 
+    def test_each_matching_time_value_competes_in_one_global_top_k(self) -> None:
+        query = parse_time_queries([{"original_expression": "8月20号", "start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00", "relation": "overlap", "granularity": "day"}])
+        records = [
+            {
+                "record_type": "conversation_turn",
+                "record_id": "turn_multi",
+                "text": "普通安排",
+                "status": "active",
+                "time_values": [
+                    {"start_at": "2026-08-20T09:00:00+08:00", "end_at": None, "is_point": True, "open_end": False, "matched_time_field": "created_at", "time_meaning": "消息创建时间"},
+                    {"start_at": "2026-08-20T10:00:00+08:00", "end_at": None, "is_point": True, "open_end": False, "matched_time_field": "updated_at", "time_meaning": "消息更新时间"},
+                ],
+                "updated_at": "2026-08-20T10:00:00+08:00",
+                "time_fields": {"created_at": "2026-08-20T09:00:00+08:00", "updated_at": "2026-08-20T10:00:00+08:00"},
+            },
+            {
+                "record_type": "semantic_event",
+                "record_id": "evt_interview",
+                "text": "参加面试",
+                "status": "active",
+                "time_values": [{"start_at": "2026-08-20T14:00:00+08:00", "end_at": "2026-08-20T15:00:00+08:00", "is_point": False, "open_end": False, "matched_time_field": "start_at/end_at", "time_meaning": "事件实际发生区间"}],
+                "updated_at": "2026-08-19T10:00:00+08:00",
+                "time_fields": {},
+            },
+        ]
+
+        result = search_temporal_records(query, records, "面试安排", KeywordEmbedder(), 3)
+
+        matches = result["queries"][0]["matches"]
+        self.assertEqual([item["record_id"] for item in matches], ["evt_interview", "turn_multi", "turn_multi"])
+        self.assertEqual([item["matched_time_field"] for item in matches[1:]], ["created_at", "updated_at"])
+        self.assertEqual([item["semantic_score"] for item in matches], [1.0, 0.0, 0.0])
+
 
 if __name__ == "__main__":
     unittest.main()
