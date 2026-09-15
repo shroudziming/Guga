@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
@@ -94,6 +95,26 @@ class SummaryModel:
         return "- 用户叫小明，在深圳工作。"
 
 
+class LayerRankingEmbedder:
+    def encode(self, texts: list[str]) -> list[list[float]]:
+        vectors = []
+        for text in texts:
+            if "查询" in text or "最相关" in text:
+                vectors.append([1.0, 0.0])
+            elif "次相关" in text:
+                vectors.append([0.8, 0.6])
+            elif "一般相关" in text:
+                vectors.append([0.6, 0.8])
+            else:
+                vectors.append([0.0, 1.0])
+        return vectors
+
+
+class RagWithEmbedder:
+    def __init__(self) -> None:
+        self.embedder = LayerRankingEmbedder()
+
+
 class MemoryManagerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -108,6 +129,317 @@ class MemoryManagerTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_search_time_context_reads_layers_and_preserves_event_lifecycle(self) -> None:
+        event = {
+            "id": "evt_interview",
+            "type": "semantic_event",
+            "description": "参加面试",
+            "start_at": "2026-08-20T14:00:00+08:00",
+            "end_at": "2026-08-20T15:00:00+08:00",
+            "status": "inactive",
+            "inactive_reason": "cancelled",
+            "updated_at": "2026-08-19T09:00:00+08:00",
+        }
+        self.manager.semantic_event_file.write_text(
+            json.dumps(event, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.manager.search_time_context(
+            session_id="sess_time",
+            user_text="8月20号有什么面试安排",
+            reference_time="2026-08-19T10:00:00+08:00",
+            time_queries=[{
+                "original_expression": "8月20号",
+                "start_at": "2026-08-20T00:00:00+08:00",
+                "end_at": "2026-08-21T00:00:00+08:00",
+                "relation": "overlap",
+                "granularity": "day",
+            }],
+        )
+
+        self.assertTrue(result["ok"])
+        match = result["queries"][0]["matches"][0]
+        self.assertEqual(match["record_id"], "evt_interview")
+        self.assertEqual(match["status"], "cancelled")
+
+    def test_search_time_context_returns_structured_validation_error(self) -> None:
+        result = self.manager.search_time_context(
+            session_id="sess_invalid",
+            user_text="查询安排",
+            reference_time="2026-08-19T10:00:00+08:00",
+            time_queries=[{
+                "original_expression": "错误区间",
+                "start_at": "2026-08-21T00:00:00+08:00",
+                "end_at": "2026-08-20T00:00:00+08:00",
+                "relation": "overlap",
+                "granularity": "day",
+            }],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "INVALID_TIME_RANGE")
+        self.assertEqual(result["error"]["query_index"], 0)
+
+    def test_search_time_context_reports_storage_failure_instead_of_empty_matches(self) -> None:
+        with patch.object(self.manager, "_load_temporal_records", side_effect=OSError("disk unavailable")):
+            result = self.manager.search_time_context(
+                session_id="sess_io",
+                user_text="8月20号有什么事情",
+                reference_time="2026-08-19T10:00:00+08:00",
+                time_queries=[{
+                    "original_expression": "8月20号",
+                    "start_at": "2026-08-20T00:00:00+08:00",
+                    "end_at": "2026-08-21T00:00:00+08:00",
+                    "relation": "overlap",
+                    "granularity": "day",
+                }],
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "TEMPORAL_STORE_READ_FAILED")
+
+    def test_search_time_context_searches_turn_semantic_time_and_message_created_at(self) -> None:
+        session_dir = self.memory_root / "sessions"
+        session_dir.mkdir(parents=True, exist_ok=True)
+        row = {
+            "id": "msg_prior",
+            "session_id": "sess_prior",
+            "role": "user",
+            "content": "我8月20号有个面试",
+            "created_at": "2026-08-18T10:00:00+08:00",
+            "metadata": {"turn": {"turn_id": "turn_msg_prior", "temporal_context": {
+                "source_message_id": "msg_prior",
+                "reference_time": "2026-08-18T10:00:00+08:00",
+                "time_queries": [{
+                    "original_expression": "8月20号",
+                    "start_at": "2026-08-20T00:00:00+08:00",
+                    "end_at": "2026-08-21T00:00:00+08:00",
+                    "relation": "overlap",
+                    "granularity": "day",
+                }],
+            }}},
+        }
+        (session_dir / "sess_prior.jsonl").write_text(
+            json.dumps(row, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        semantic = self.manager.search_time_context(
+            session_id="sess_now",
+            user_text="8月20号有什么",
+            reference_time="2026-08-19T10:00:00+08:00",
+            time_queries=[{**row["metadata"]["turn"]["temporal_context"]["time_queries"][0]}],
+        )
+        conversation_day = self.manager.search_time_context(
+            session_id="sess_now",
+            user_text="8月18号聊了什么",
+            reference_time="2026-08-19T10:00:00+08:00",
+            time_queries=[{
+                "original_expression": "8月18号聊的内容",
+                "start_at": "2026-08-18T00:00:00+08:00",
+                "end_at": "2026-08-19T00:00:00+08:00",
+                "relation": "overlap",
+                "granularity": "day",
+            }],
+        )
+
+        self.assertEqual(semantic["queries"][0]["matches"][0]["record_id"], "turn_msg_prior")
+        self.assertEqual(
+            semantic["queries"][0]["matches"][0]["matched_time_field"],
+            "temporal_context.time_queries",
+        )
+        self.assertEqual(conversation_day["queries"][0]["matches"][0]["record_id"], "turn_msg_prior")
+        self.assertEqual(conversation_day["queries"][0]["matches"][0]["matched_time_field"], "created_at")
+
+    def test_search_time_context_searches_created_at_without_semantic_time(self) -> None:
+        session_row = {
+            "id": "msg_created_only",
+            "session_id": "sess_prior",
+            "role": "user",
+            "content": "只记录了消息创建时间",
+            "created_at": "2026-08-18T10:00:00+08:00",
+        }
+        (self.memory_root / "sessions" / "sess_prior.jsonl").write_text(
+            json.dumps(session_row, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        result = self.manager.search_time_context(
+            session_id="sess_now",
+            user_text="8月18号聊了什么",
+            reference_time="2026-08-19T10:00:00+08:00",
+            time_queries=[{
+                "original_expression": "8月18号聊的内容",
+                "start_at": "2026-08-18T00:00:00+08:00",
+                "end_at": "2026-08-19T00:00:00+08:00",
+                "relation": "overlap",
+                "granularity": "day",
+            }],
+        )
+
+        match = result["queries"][0]["matches"][0]
+        self.assertEqual(match["record_id"], "turn_msg_created_only")
+        self.assertEqual(match["matched_time_field"], "created_at")
+
+    def test_search_time_context_loads_four_canonical_layers_and_applies_global_top_k(self) -> None:
+        events = [
+            {
+                "id": "evt_ranked",
+                "type": "semantic_event",
+                "description": "最相关面试",
+                "start_at": "2026-08-20T10:00:00+09:00",
+                "end_at": "2026-08-20T11:00:00+09:00",
+                "status": "active",
+                "updated_at": "2026-08-19T09:00:00+08:00",
+            },
+            {
+                "id": "evt_legacy_only",
+                "type": "semantic_event",
+                "description": "不能推断的旧格式",
+                "valid_at": "2026-08-20T09:00:00+08:00",
+                "day": "2026-08-20",
+                "semantic_day": "2026-08-20",
+                "status": "active",
+            },
+        ]
+        self.manager.semantic_event_file.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in events) + "\n",
+            encoding="utf-8",
+        )
+        archival_rows = [
+            {
+                "id": "mem_ranked",
+                "type": "episodic",
+                "summary": "次相关准备",
+                "valid_at": "2026-08-19T09:00:00+09:00",
+                "invalid_at": "2026-08-21T09:00:00+09:00",
+                "status": "active",
+                "updated_at": "2026-08-19T08:00:00+08:00",
+            },
+            {
+                "id": "mem_open",
+                "type": "episodic",
+                "summary": "无关的长期事实",
+                "valid_at": "2026-08-19T09:00:00+09:00",
+                "invalid_at": "",
+                "status": "active",
+                "updated_at": "2026-08-19T07:00:00+08:00",
+            },
+        ]
+        self.manager.archival_file.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in archival_rows) + "\n",
+            encoding="utf-8",
+        )
+        self.manager.event_summary_store.file_path.write_text(
+            json.dumps(
+                {
+                    "id": "summary_ranked",
+                    "type": "event_summary",
+                    "summary": "一般相关回顾",
+                    "time_window_start": "2026-08-20T09:00:00+09:00",
+                    "time_window_end": "2026-08-20T19:00:00+09:00",
+                    "status": "active",
+                    "updated_at": "2026-08-19T07:30:00+08:00",
+                },
+                ensure_ascii=False,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        session_row = {
+            "id": "msg_ranked",
+            "session_id": "sess_prior",
+            "role": "user",
+            "content": "较弱相关聊天",
+            "created_at": "2026-08-18T11:00:00+09:00",
+            "metadata": {"turn": {"turn_id": "turn_ranked", "temporal_context": {
+                "time_queries": [{
+                    "original_expression": "8月20号",
+                    "start_at": "2026-08-20T13:00:00+09:00",
+                    "end_at": "2026-08-20T14:00:00+09:00",
+                    "relation": "overlap",
+                    "granularity": "hour",
+                }],
+            }}},
+        }
+        (self.memory_root / "sessions" / "sess_prior.jsonl").write_text(
+            json.dumps(session_row, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+
+        records = self.manager._load_temporal_records()
+        by_id = {record["record_id"]: record for record in records}
+
+        self.assertNotIn("evt_legacy_only", by_id)
+        self.assertEqual(
+            {by_id[record_id]["record_type"] for record_id in ("evt_ranked", "mem_ranked", "summary_ranked", "turn_ranked")},
+            {"semantic_event", "archival_memory", "event_summary", "conversation_turn"},
+        )
+        self.assertEqual(by_id["evt_ranked"]["time_values"][0]["time_meaning"], "事件实际发生区间")
+        self.assertEqual(by_id["evt_ranked"]["time_fields"]["start_at"], "2026-08-20T10:00:00+09:00")
+        self.assertEqual(by_id["evt_ranked"]["time_values"][0]["start_at"], "2026-08-20T09:00:00+08:00")
+        self.assertEqual(by_id["mem_ranked"]["time_values"][0]["matched_time_field"], "valid_at/invalid_at")
+        self.assertEqual(by_id["mem_ranked"]["time_fields"]["valid_at"], "2026-08-19T09:00:00+09:00")
+        self.assertEqual(by_id["mem_ranked"]["time_fields"]["invalid_at"], "2026-08-21T09:00:00+09:00")
+        self.assertFalse(by_id["mem_ranked"]["time_values"][0]["open_end"])
+        self.assertTrue(by_id["mem_open"]["time_values"][0]["open_end"])
+        self.assertEqual(by_id["mem_open"]["time_fields"]["invalid_at"], "")
+        self.assertEqual(
+            by_id["summary_ranked"]["time_values"][0]["time_meaning"],
+            "事件总结覆盖的时间范围",
+        )
+        self.assertEqual(
+            by_id["summary_ranked"]["time_fields"]["time_window_start"],
+            "2026-08-20T09:00:00+09:00",
+        )
+        self.assertEqual(
+            [value["matched_time_field"] for value in by_id["turn_ranked"]["time_values"]],
+            ["temporal_context.time_queries", "created_at"],
+        )
+        self.assertEqual(
+            by_id["turn_ranked"]["time_fields"]["temporal_context.time_queries"],
+            session_row["metadata"]["turn"]["temporal_context"]["time_queries"],
+        )
+        self.assertEqual(by_id["turn_ranked"]["time_fields"]["created_at"], "2026-08-18T11:00:00+09:00")
+        self.assertEqual(by_id["turn_ranked"]["time_values"][1]["start_at"], "2026-08-18T10:00:00+08:00")
+
+        self.manager.rag_pipeline = RagWithEmbedder()
+        result = self.manager.search_time_context(
+            session_id="sess_now",
+            user_text="查询面试",
+            reference_time="2026-08-19T10:00:00+08:00",
+            time_queries=[{
+                "original_expression": "8月20号",
+                "start_at": "2026-08-20T00:00:00+08:00",
+                "end_at": "2026-08-21T00:00:00+08:00",
+                "relation": "overlap",
+                "granularity": "day",
+            }],
+        )
+
+        matches = result["queries"][0]["matches"]
+        self.assertEqual(len(matches), 2)
+        self.assertEqual([match["record_id"] for match in matches], ["evt_ranked", "mem_ranked"])
+
+    def test_search_time_context_reports_malformed_jsonl_as_storage_failure(self) -> None:
+        self.manager.semantic_event_file.write_text('{"id": "broken"\n', encoding="utf-8")
+
+        result = self.manager.search_time_context(
+            session_id="sess_malformed",
+            user_text="8月20号有什么事情",
+            reference_time="2026-08-19T10:00:00+08:00",
+            time_queries=[{
+                "original_expression": "8月20号",
+                "start_at": "2026-08-20T00:00:00+08:00",
+                "end_at": "2026-08-21T00:00:00+08:00",
+                "relation": "overlap",
+                "granularity": "day",
+            }],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"]["code"], "TEMPORAL_STORE_READ_FAILED")
 
     def test_incompatible_persisted_index_is_rebuilt(self) -> None:
         class StoreStub:

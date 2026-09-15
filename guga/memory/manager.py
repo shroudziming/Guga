@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from threading import RLock
 from time import perf_counter, sleep
+from typing import Any
 from uuid import uuid4
 
 from guga.config import (
@@ -32,6 +33,11 @@ from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_re
 from guga.memory.semantic_events import SemanticEventStore
 from guga.memory_source_validity import active_event_ids, uses_only_active_event_sources
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
+from guga.memory.temporal_retrieval import (
+    TemporalQueryValidationError,
+    parse_time_queries,
+    search_temporal_records,
+)
 from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso, parse_datetime
 from guga.memory.user_model import GugaUserModelStore
 from guga.rag.faiss_store import IncompatibleIndexError
@@ -197,6 +203,70 @@ class MemoryManager:
                 chunk_overlap=DEFAULT_RAG_CHUNK_OVERLAP,
                 debug_hook=self._debug_pipeline,
             )
+
+    def search_time_context(
+        self,
+        *,
+        session_id: str,
+        user_text: str,
+        reference_time: str,
+        time_queries: object,
+    ) -> dict[str, Any]:
+        started = perf_counter()
+        try:
+            queries = parse_time_queries(time_queries)
+        except TemporalQueryValidationError as exc:
+            error = exc.as_tool_error()
+            self._debug(
+                session_id,
+                f"time_search status=invalid error={json.dumps(error, ensure_ascii=False)}",
+            )
+            return {"ok": False, "type": "time_context", "error": error}
+        try:
+            records = self._load_temporal_records()
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            error = {
+                "code": "TEMPORAL_STORE_READ_FAILED",
+                "message": str(exc),
+                "query_index": -1,
+            }
+            self._debug(
+                session_id,
+                f"time_search status=storage_failed error={json.dumps(error, ensure_ascii=False)}",
+            )
+            return {"ok": False, "type": "time_context", "error": error}
+
+        embedder = self.rag_pipeline.embedder if self.rag_pipeline is not None else None
+        result = search_temporal_records(queries, records, user_text, embedder, self.top_k)
+        returned_ids = [
+            match["record_id"]
+            for group in result["queries"]
+            for match in group["matches"]
+        ]
+        elapsed_ms = int((perf_counter() - started) * 1000)
+        self._debug(
+            session_id,
+            "time_search " + json.dumps(
+                {
+                    "status": "success",
+                    "reference_time": reference_time,
+                    "time_queries": [query.as_dict() for query in queries],
+                    "candidate_count": len(records),
+                    "returned_memory_ids": returned_ids,
+                    "ranking_model": DEFAULT_RAG_EMBEDDING_MODEL,
+                    "ranking_degraded": result["ranking_degraded"],
+                    "duration_ms": elapsed_ms,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        return {
+            "ok": True,
+            "type": "time_context",
+            "reference_time": reference_time,
+            **result,
+        }
 
     def _default_agent_identity(self) -> AgentIdentity:
         return AgentIdentity(
@@ -1227,21 +1297,234 @@ class MemoryManager:
         session_state["completed_turns"] = int(session_state.get("completed_turns", 0) or 0)
         return session_state
 
-    def _read_jsonl_records(self, path: Path) -> list[dict]:
+    def _read_jsonl_records(self, path: Path, *, strict: bool = False) -> list[dict]:
         if not path.exists():
             return []
         rows: list[dict] = []
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
             line = line.strip()
             if not line:
                 continue
             try:
                 payload = json.loads(line)
             except json.JSONDecodeError:
+                if strict:
+                    raise
                 continue
             if isinstance(payload, dict):
                 rows.append(payload)
+            elif strict:
+                raise ValueError(f"JSONL row must be an object: {path}:{line_number}")
         return rows
+
+    def _load_temporal_records(self) -> list[dict]:
+        records: list[dict] = []
+
+        for payload in self._read_jsonl_records(self.semantic_event_file, strict=True):
+            interval = self._canonical_temporal_interval(
+                payload.get("start_at"),
+                payload.get("end_at"),
+            )
+            record_id = str(payload.get("id", "")).strip()
+            text = str(payload.get("description", "")).strip()
+            if interval is None or not record_id or not text:
+                continue
+            start_at, end_at = interval
+            stored_status = str(payload.get("status", "active")).strip() or "active"
+            inactive_reason = str(payload.get("inactive_reason") or "").strip()
+            status = inactive_reason if stored_status == "inactive" and inactive_reason else stored_status
+            records.append(
+                {
+                    "record_type": "semantic_event",
+                    "record_id": record_id,
+                    "text": text,
+                    "status": status,
+                    "time_values": [{
+                        "start_at": start_at,
+                        "end_at": end_at,
+                        "is_point": False,
+                        "open_end": False,
+                        "matched_time_field": "start_at/end_at",
+                        "time_meaning": "事件实际发生区间",
+                    }],
+                    "updated_at": str(payload.get("updated_at", "")),
+                    "time_fields": {
+                        "start_at": payload.get("start_at"),
+                        "end_at": payload.get("end_at"),
+                    },
+                }
+            )
+
+        for payload in self._read_jsonl_records(self.archival_file, strict=True):
+            record_id = str(payload.get("id", "")).strip()
+            text = str(payload.get("summary", "")).strip()
+            valid_at = self._canonical_temporal_point(payload.get("valid_at"))
+            if valid_at is None or not record_id or not text:
+                continue
+            invalid_raw = str(payload.get("invalid_at") or "").strip()
+            if invalid_raw:
+                interval = self._canonical_temporal_interval(valid_at, invalid_raw)
+                if interval is None:
+                    continue
+                valid_at, invalid_at = interval
+                open_end = False
+            else:
+                invalid_at = None
+                open_end = True
+            records.append(
+                {
+                    "record_type": "archival_memory",
+                    "record_id": record_id,
+                    "text": text,
+                    "status": str(payload.get("status", "active")).strip() or "active",
+                    "time_values": [{
+                        "start_at": valid_at,
+                        "end_at": invalid_at,
+                        "is_point": False,
+                        "open_end": open_end,
+                        "matched_time_field": "valid_at/invalid_at",
+                        "time_meaning": "事实成立的有效区间",
+                    }],
+                    "updated_at": str(payload.get("updated_at", "")),
+                    "time_fields": {
+                        "valid_at": payload.get("valid_at"),
+                        "invalid_at": payload.get("invalid_at") or "",
+                    },
+                }
+            )
+
+        for payload in self._read_jsonl_records(self.event_summary_store.file_path, strict=True):
+            interval = self._canonical_temporal_interval(
+                payload.get("time_window_start"),
+                payload.get("time_window_end"),
+            )
+            record_id = str(payload.get("id", "")).strip()
+            text = str(payload.get("summary", "")).strip()
+            if interval is None or not record_id or not text:
+                continue
+            start_at, end_at = interval
+            records.append(
+                {
+                    "record_type": "event_summary",
+                    "record_id": record_id,
+                    "text": text,
+                    "status": str(payload.get("status", "active")).strip() or "active",
+                    "time_values": [{
+                        "start_at": start_at,
+                        "end_at": end_at,
+                        "is_point": False,
+                        "open_end": False,
+                        "matched_time_field": "time_window_start/time_window_end",
+                        "time_meaning": "事件总结覆盖的时间范围",
+                    }],
+                    "updated_at": str(payload.get("updated_at", "")),
+                    "time_fields": {
+                        "time_window_start": payload.get("time_window_start"),
+                        "time_window_end": payload.get("time_window_end"),
+                    },
+                }
+            )
+
+        session_dir = self.memory_root / "sessions"
+        if session_dir.exists():
+            for path in sorted(session_dir.glob("*.jsonl")):
+                for payload in self._read_jsonl_records(path, strict=True):
+                    if str(payload.get("role", "")).strip() != "user":
+                        continue
+                    content = str(payload.get("content", "")).strip()
+                    message_id = str(payload.get("id", "")).strip()
+                    if not content or not message_id:
+                        continue
+                    metadata = payload.get("metadata")
+                    turn = metadata.get("turn") if isinstance(metadata, dict) else None
+                    if not isinstance(turn, dict):
+                        turn = {}
+                    turn_id = str(turn.get("turn_id") or f"turn_{message_id}").strip()
+                    temporal_context = turn.get("temporal_context")
+                    if not isinstance(temporal_context, dict):
+                        temporal_context = {}
+
+                    time_values: list[dict[str, Any]] = []
+                    canonical_queries: list[dict[str, str]] = []
+                    stored_queries = temporal_context.get("time_queries")
+                    if isinstance(stored_queries, list):
+                        for stored_query in stored_queries:
+                            try:
+                                query = parse_time_queries([stored_query])[0]
+                            except TemporalQueryValidationError:
+                                continue
+                            canonical_query = query.as_dict()
+                            canonical_queries.append(canonical_query)
+                            time_values.append(
+                                {
+                                    "start_at": canonical_query["start_at"],
+                                    "end_at": canonical_query["end_at"],
+                                    "is_point": False,
+                                    "open_end": False,
+                                    "matched_time_field": "temporal_context.time_queries",
+                                    "time_meaning": "消息内容中提及的时间区间",
+                                }
+                            )
+
+                    time_fields: dict[str, Any] = {}
+                    if canonical_queries:
+                        time_fields["temporal_context.time_queries"] = stored_queries
+                    created_at = self._canonical_temporal_point(payload.get("created_at"))
+                    if created_at is not None:
+                        time_fields["created_at"] = payload.get("created_at")
+                        time_values.append(
+                            {
+                                "start_at": created_at,
+                                "end_at": None,
+                                "is_point": True,
+                                "open_end": False,
+                                "matched_time_field": "created_at",
+                                "time_meaning": "这条消息是在该时间创建的，不代表消息内容中的事件发生于此时",
+                            }
+                        )
+                    if not time_values:
+                        continue
+                    records.append(
+                        {
+                            "record_type": "conversation_turn",
+                            "record_id": turn_id,
+                            "text": content,
+                            "status": "active",
+                            "time_values": time_values,
+                            "updated_at": created_at or "",
+                            "time_fields": time_fields,
+                        }
+                    )
+
+        return records
+
+    def _canonical_temporal_interval(
+        self,
+        start_at: object,
+        end_at: object,
+    ) -> tuple[str, str] | None:
+        try:
+            interval = parse_time_queries([{
+                "original_expression": "",
+                "start_at": start_at,
+                "end_at": end_at,
+                "relation": "overlap",
+                "granularity": "range",
+            }])[0].as_dict()
+        except TemporalQueryValidationError:
+            return None
+        return interval["start_at"], interval["end_at"]
+
+    def _canonical_temporal_point(self, value: object) -> str | None:
+        raw = str(value or "").strip()
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        canonical = parse_datetime(raw)
+        return canonical.isoformat() if canonical is not None else None
 
     def _clamp_float(self, value: object, fallback: float) -> float:
         try:
