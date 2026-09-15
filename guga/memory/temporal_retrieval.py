@@ -5,7 +5,7 @@ from datetime import datetime
 from math import isfinite, sqrt
 from typing import Any
 
-from guga.memory.time_utils import format_beijing, parse_datetime
+from guga.memory.time_utils import BEIJING_TZ, parse_datetime
 from guga.rag.embedder import BaseEmbedder
 
 
@@ -24,8 +24,8 @@ class TimeQuery:
     def as_dict(self) -> dict[str, str]:
         return {
             "original_expression": self.original_expression,
-            "start_at": _format_query_time(self.start_at),
-            "end_at": _format_query_time(self.end_at),
+            "start_at": self.start_at.astimezone(BEIJING_TZ).isoformat(),
+            "end_at": self.end_at.astimezone(BEIJING_TZ).isoformat(),
             "relation": self.relation,
             "granularity": self.granularity,
         }
@@ -146,13 +146,6 @@ def search_temporal_records(
         )
 
     return {"queries": query_results, "ranking_degraded": ranking_degraded}
-
-
-def _format_query_time(value: datetime) -> str:
-    normalized = parse_datetime(value)
-    if normalized is not None and normalized.microsecond:
-        return normalized.isoformat(timespec="microseconds")
-    return format_beijing(value)
 
 
 def _matching_candidates(
