@@ -96,6 +96,27 @@ class _SessionStore:
             handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return message_id
 
+    def merge_message_metadata(self, session_id: str, message_id: str, metadata: dict) -> None:
+        target = self.session_dir / f"{session_id}.jsonl"
+        rows = []
+        found = False
+        for line in target.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if str(row.get("id", "")) == message_id:
+                row["metadata"] = {**dict(row.get("metadata", {}) or {}), **metadata}
+                found = True
+            rows.append(row)
+        if not found:
+            raise ValueError(f"session message not found: {message_id}")
+        temporary = target.with_suffix(".jsonl.tmp")
+        temporary.write_text(
+            "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+
 
 class MemoryManager:
     """Manage memory retrieval/writeback around the chat turn lifecycle.
@@ -186,7 +207,7 @@ class MemoryManager:
         self.summarizer = MemoryBankSummarizer(model=model)
         self.consolidation_config = (consolidation_config or MemoryConsolidationConfig()).normalized()
         self.session_store = _SessionStore(self.memory_root / "sessions")
-        self._turn_state: dict[str, dict[str, str]] = {}
+        self._turn_state: dict[str, dict[str, Any]] = {}
         self._date_context_by_session: dict[str, str] = {}
         self._turn_state_lock = RLock()
         self._finalize_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guga-memory")
@@ -610,6 +631,15 @@ class MemoryManager:
         self._debug(session_id, f"ingest role=assistant message_id={message_id}")
         return message_id
 
+    def attach_turn_metadata(self, *, session_id: str, user_message_id: str, metadata: dict) -> None:
+        self.session_store.merge_message_metadata(session_id, user_message_id, metadata)
+        turn = dict(metadata.get("turn", {}) or {})
+        with self._turn_state_lock:
+            state = self._turn_state.setdefault(session_id, {})
+            state["turn_id"] = str(turn.get("turn_id", f"turn_{user_message_id}"))
+            state["temporal_context"] = dict(turn.get("temporal_context", {}) or {})
+            state["tool_interactions"] = list(turn.get("tool_interactions", []) or [])
+
     def finalize_turn(self, session_id: str) -> None:
         """Finalize one turn: optional archival writeback and index update.
 
@@ -685,11 +715,11 @@ class MemoryManager:
                 progress({"phase": "stage_retry_succeeded", "stage": stage, "cycle": cycle + 1})
         return result
 
-    def _pop_turn_state(self, session_id: str) -> dict[str, str]:
+    def _pop_turn_state(self, session_id: str) -> dict[str, Any]:
         with self._turn_state_lock:
             return dict(self._turn_state.pop(session_id, {}))
 
-    def _finalize_turn_state(self, session_id: str, state: dict[str, str]) -> None:
+    def _finalize_turn_state(self, session_id: str, state: dict[str, Any]) -> None:
         started = perf_counter()
         session_memory_payload = self._load_memory_by_id(self.session_memory_file, state.get("session_memory_id", ""))
         if session_memory_payload and self.rag_pipeline is not None:
@@ -708,7 +738,7 @@ class MemoryManager:
         if pending_count >= self.consolidation_config.batch_turns:
             self._consolidate_pending_turns(session_id=session_id, force=False)
 
-    def _append_pending_turn(self, *, session_id: str, state: dict[str, str]) -> int:
+    def _append_pending_turn(self, *, session_id: str, state: dict[str, Any]) -> int:
         if not state.get("user_message_id"):
             return 0
         with self._turn_state_lock:

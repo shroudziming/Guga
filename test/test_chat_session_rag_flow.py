@@ -12,6 +12,7 @@ from guga.chat.session import ChatSession
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
 from guga.rag.embedder import HashingEmbedder
+from guga.tools import ToolCall, ToolModelResponse, ToolRegistry, ToolSpec
 from guga.types import GenerationConfig
 
 
@@ -101,6 +102,71 @@ class FakeChatModel:
 
 
 class ChatSessionRagFlowTest(unittest.TestCase):
+    def test_stream_persists_trace_with_one_reference_timestamp_and_two_rows(self) -> None:
+        class StreamToolModel:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.system_prompts: list[str] = []
+
+            def generate_reply_with_tools(self, messages, gen, tools):
+                _ = gen, tools
+                self.system_prompts.append(messages[0]["content"])
+                self.calls += 1
+                if self.calls == 1:
+                    return ToolModelResponse(
+                        content="",
+                        tool_calls=[ToolCall(id="call_other", name="guga_test_tool", arguments={"query": "项目"})],
+                    )
+                return ToolModelResponse(content="工具处理完成。", tool_calls=[])
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_root = Path(tmp_dir)
+            manager = MemoryManager(memory_root=memory_root, enable_semantic=False)
+            model = StreamToolModel()
+            registry = ToolRegistry(
+                [
+                    ToolSpec(
+                        name="guga_test_tool",
+                        description="test",
+                        parameters={
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                        handler=lambda args: {"result": args["query"]},
+                    )
+                ]
+            )
+            session = ChatSession(
+                model=model,
+                system_prompt="test",
+                generation=GenerationConfig(),
+                memory_manager=manager,
+                session_id="sess_stream_trace",
+                tool_registry=registry,
+            )
+
+            chunks = list(
+                session.reply_stream(
+                    "读取项目",
+                    created_at="2026-08-19T10:00:00+08:00",
+                )
+            )
+            manager.wait_for_background_tasks(timeout=3)
+
+            self.assertEqual(chunks, ["工具处理完成。"])
+            rows = [
+                json.loads(line)
+                for line in (memory_root / "sessions" / "sess_stream_trace.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual([row["created_at"] for row in rows], ["2026-08-19T10:00:00+08:00"] * 2)
+            self.assertIn("reference_time=2026-08-19T10:00:00+08:00", model.system_prompts[0])
+            turn = rows[0]["metadata"]["turn"]
+            self.assertEqual(turn["assistant_message_id"], rows[1]["id"])
+            self.assertEqual([item["tool"] for item in turn["tool_interactions"]], ["guga_test_tool"])
+            self.assertNotIn("temporal_context", turn)
+
     def test_reply_injects_memory_and_emits_debug_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             memory_root = Path(tmp_dir)

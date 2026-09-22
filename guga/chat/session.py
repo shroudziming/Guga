@@ -9,9 +9,19 @@ from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 from guga.chat.history import ChatHistory
+from guga.chat.turn_trace import TurnTrace
 from guga.memory import MemoryManager
 from guga.memory.agent_identity import AgentIdentity
-from guga.tools import ToolRegistry, ToolStreamText, ToolStreamToolCalls, default_tool_registry, encode_tool_result
+from guga.memory.time_utils import now_beijing_iso
+from guga.tools import (
+    ToolCall,
+    ToolRegistry,
+    ToolStreamText,
+    ToolStreamToolCalls,
+    default_tool_registry,
+    encode_tool_result,
+    memory_time_search_tool,
+)
 from guga.types import GenerationConfig
 
 if TYPE_CHECKING:
@@ -73,7 +83,10 @@ class ChatSession:
             ),
         )
         self.session_id = session_id or self.memory_manager.session_store.create_session_id()
-        self.tool_registry = tool_registry or default_tool_registry()
+        self.tool_registry = tool_registry.copy() if tool_registry is not None else default_tool_registry()
+        self._active_turn_user_text = ""
+        self._active_turn_reference_time = ""
+        self.tool_registry.add(memory_time_search_tool(self._execute_memory_time_search))
         self.max_tool_rounds = self._env_int("Guga_MAX_TOOL_ROUNDS", 3, minimum=0, maximum=8)
         self._debug("session_ready")
 
@@ -92,8 +105,18 @@ class ChatSession:
             - Queue memory writeback in MemoryManager.finalize_turn_async.
         """
         self._debug("reply_start")
+        reference_time = created_at or now_beijing_iso()
         self.history.add_user(user_input)
-        self.memory_manager.record_user_message(session_id=self.session_id, text=user_input, created_at=created_at)
+        user_message_id = self.memory_manager.record_user_message(
+            session_id=self.session_id,
+            text=user_input,
+            created_at=reference_time,
+        )
+        trace = TurnTrace(
+            turn_id=f"turn_{user_message_id}",
+            user_message_id=user_message_id,
+            reference_time=reference_time,
+        )
 
         context_started = perf_counter()
         memory_context = self.memory_manager.prepare_context(user_text=user_input, session_id=self.session_id)
@@ -104,22 +127,41 @@ class ChatSession:
         self._debug("prompt_assemble_done")
         self._debug(f"system_prompt={json.dumps(system_prompt, ensure_ascii=False)}")
 
-        messages = [{"role": "system", "content": self._tool_system_prompt(system_prompt)}]
+        messages = [{"role": "system", "content": self._tool_system_prompt(system_prompt, reference_time)}]
         messages.extend(self.history.as_messages())
 
         generate_started = perf_counter()
         self._debug("model_generate_start")
-        answer = self._generate_reply_with_optional_tools(messages)
-        if not str(answer).strip():
-            self._debug("model_generate_empty_retry")
-            answer = self._generate_reply_with_optional_tools(messages, generation=self._retry_generation_config())
-        if not str(answer).strip():
-            answer = "刚才没有生成出有效回复，可以再说一遍吗？"
+        self._active_turn_user_text = user_input
+        self._active_turn_reference_time = reference_time
+        try:
+            answer = self._generate_reply_with_optional_tools(messages, trace=trace)
+            if not str(answer).strip():
+                self._debug("model_generate_empty_retry")
+                answer = self._generate_reply_with_optional_tools(
+                    messages,
+                    generation=self._retry_generation_config(),
+                    trace=trace,
+                )
+            if not str(answer).strip():
+                answer = "刚才没有生成出有效回复，可以再说一遍吗？"
+        finally:
+            self._active_turn_user_text = ""
+            self._active_turn_reference_time = ""
         generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
         self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
 
         self.history.add_assistant(answer)
-        self.memory_manager.record_assistant_message(session_id=self.session_id, text=answer, created_at=created_at)
+        assistant_message_id = self.memory_manager.record_assistant_message(
+            session_id=self.session_id,
+            text=answer,
+            created_at=reference_time,
+        )
+        self.memory_manager.attach_turn_metadata(
+            session_id=self.session_id,
+            user_message_id=user_message_id,
+            metadata=trace.as_metadata(assistant_message_id),
+        )
         if finalize_memory:
             self.memory_manager.finalize_turn_async(self.session_id)
             self._debug("finalize_queued")
@@ -127,7 +169,12 @@ class ChatSession:
             self._debug("finalize_skipped")
         return answer
 
-    def reply_stream(self, user_input: str, cancel_event: Event | None = None) -> Iterator[str]:
+    def reply_stream(
+        self,
+        user_input: str,
+        cancel_event: Event | None = None,
+        created_at: str | None = None,
+    ) -> Iterator[str]:
         """Run one streaming dialogue turn and yield output chunks.
 
         Args:
@@ -142,8 +189,18 @@ class ChatSession:
             output mode differs (streamed chunks vs single final string).
         """
         self._debug("reply_start")
+        reference_time = created_at or now_beijing_iso()
         self.history.add_user(user_input)
-        self.memory_manager.record_user_message(session_id=self.session_id, text=user_input)
+        user_message_id = self.memory_manager.record_user_message(
+            session_id=self.session_id,
+            text=user_input,
+            created_at=reference_time,
+        )
+        trace = TurnTrace(
+            turn_id=f"turn_{user_message_id}",
+            user_message_id=user_message_id,
+            reference_time=reference_time,
+        )
 
         context_started = perf_counter()
         memory_context = self.memory_manager.prepare_context(user_text=user_input, session_id=self.session_id)
@@ -154,60 +211,79 @@ class ChatSession:
         self._debug("prompt_assemble_done")
         self._debug(f"system_prompt={json.dumps(system_prompt, ensure_ascii=False)}")
 
-        messages = [{"role": "system", "content": self._tool_system_prompt(system_prompt)}]
+        messages = [{"role": "system", "content": self._tool_system_prompt(system_prompt, reference_time)}]
         messages.extend(self.history.as_messages())
 
         chunks: list[str] = []
 
         stream_fn = getattr(self.model, "generate_reply_stream", None)
-        if self._can_use_tools():
-            generate_started = perf_counter()
-            self._debug("model_generate_start")
-            stream_tools_fn = getattr(self.model, "generate_reply_with_tools_stream", None)
-            if callable(stream_tools_fn):
-                for chunk in self._generate_reply_with_optional_tools_stream(messages, cancel_event=cancel_event):
+        self._active_turn_user_text = user_input
+        self._active_turn_reference_time = reference_time
+        try:
+            if self._can_use_tools():
+                generate_started = perf_counter()
+                self._debug("model_generate_start")
+                stream_tools_fn = getattr(self.model, "generate_reply_with_tools_stream", None)
+                if callable(stream_tools_fn):
+                    for chunk in self._generate_reply_with_optional_tools_stream(
+                        messages,
+                        trace=trace,
+                        cancel_event=cancel_event,
+                    ):
+                        chunks.append(chunk)
+                        yield chunk
+                else:
+                    answer = self._generate_reply_with_optional_tools(messages, trace=trace)
+                    chunks.append(answer)
+                    if answer:
+                        yield answer
+                generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
+                self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
+            elif callable(stream_fn):
+                generate_started = perf_counter()
+                self._debug("model_generate_start")
+                for chunk in stream_fn(messages, self.generation, cancel_event=cancel_event):
                     chunks.append(chunk)
                     yield chunk
+                generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
+                self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
             else:
-                answer = self._generate_reply_with_optional_tools(messages)
+                generate_started = perf_counter()
+                self._debug("model_generate_start")
+                answer = self.model.generate_reply(messages, self.generation)
                 chunks.append(answer)
+                yield answer
+                generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
+                self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
+
+            answer = "".join(chunks).strip()
+            if not answer:
+                self._debug("model_generate_empty_retry")
+                try:
+                    answer = self.model.generate_reply(messages, self._retry_generation_config()).strip()
+                except Exception as exc:
+                    self._debug(f"model_generate_empty_retry_failed reason={exc}")
+                    answer = ""
                 if answer:
                     yield answer
-            generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
-            self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
-        elif callable(stream_fn):
-            generate_started = perf_counter()
-            self._debug("model_generate_start")
-            for chunk in stream_fn(messages, self.generation, cancel_event=cancel_event):
-                chunks.append(chunk)
-                yield chunk
-            generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
-            self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
-        else:
-            generate_started = perf_counter()
-            self._debug("model_generate_start")
-            answer = self.model.generate_reply(messages, self.generation)
-            chunks.append(answer)
-            yield answer
-            generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
-            self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
-
-        answer = "".join(chunks).strip()
-        if not answer:
-            self._debug("model_generate_empty_retry")
-            try:
-                answer = self.model.generate_reply(messages, self._retry_generation_config()).strip()
-            except Exception as exc:
-                self._debug(f"model_generate_empty_retry_failed reason={exc}")
-                answer = ""
-            if answer:
-                yield answer
-            else:
-                answer = "刚才没有生成出有效回复，可以再说一遍吗？"
-                yield answer
+                else:
+                    answer = "刚才没有生成出有效回复，可以再说一遍吗？"
+                    yield answer
+        finally:
+            self._active_turn_user_text = ""
+            self._active_turn_reference_time = ""
 
         self.history.add_assistant(answer)
-        self.memory_manager.record_assistant_message(session_id=self.session_id, text=answer)
+        assistant_message_id = self.memory_manager.record_assistant_message(
+            session_id=self.session_id,
+            text=answer,
+            created_at=reference_time,
+        )
+        self.memory_manager.attach_turn_metadata(
+            session_id=self.session_id,
+            user_message_id=user_message_id,
+            metadata=trace.as_metadata(assistant_message_id),
+        )
         self.memory_manager.finalize_turn_async(self.session_id)
         self._debug("finalize_queued")
 
@@ -243,6 +319,7 @@ class ChatSession:
     def _generate_reply_with_optional_tools(
         self,
         messages: list[dict],
+        trace: TurnTrace,
         generation: GenerationConfig | None = None,
     ) -> str:
         gen = generation or self.generation
@@ -274,12 +351,7 @@ class ChatSession:
             }
             tool_messages.append(assistant_message)
             for call in response.tool_calls:
-                result = self.tool_registry.execute(call)
-                self._debug(
-                    "tool_call "
-                    f"round={round_index + 1} name={call.name} ok={bool(result.get('ok'))} "
-                    f"args={json.dumps(call.arguments, ensure_ascii=False)}"
-                )
+                result = self._execute_tool_call(call, trace, round_index)
                 tool_messages.append(
                     {
                         "role": "tool",
@@ -295,6 +367,7 @@ class ChatSession:
     def _generate_reply_with_optional_tools_stream(
         self,
         messages: list[dict],
+        trace: TurnTrace,
         cancel_event: Event | None = None,
     ) -> Iterator[str]:
         tool_messages = [dict(message) for message in messages]
@@ -334,12 +407,7 @@ class ChatSession:
             }
             tool_messages.append(assistant_message)
             for call in tool_calls:
-                result = self.tool_registry.execute(call)
-                self._debug(
-                    "tool_call "
-                    f"round={round_index + 1} name={call.name} ok={bool(result.get('ok'))} "
-                    f"args={json.dumps(call.arguments, ensure_ascii=False)}"
-                )
+                result = self._execute_tool_call(call, trace, round_index)
                 tool_messages.append(
                     {
                         "role": "tool",
@@ -361,7 +429,35 @@ class ChatSession:
             and callable(getattr(self.model, "generate_reply_with_tools", None))
         )
 
-    def _tool_system_prompt(self, base_prompt: str) -> str:
+    def _execute_tool_call(self, call: ToolCall, trace: TurnTrace, round_index: int) -> dict[str, Any]:
+        result = self.tool_registry.execute(call)
+        trace.record_tool(call, result)
+        self._debug(
+            "tool_call "
+            f"round={round_index + 1} name={call.name} ok={bool(result.get('ok'))} "
+            f"args={json.dumps(call.arguments, ensure_ascii=False)}"
+        )
+        return result
+
+    def _execute_memory_time_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not self._active_turn_user_text or not self._active_turn_reference_time:
+            return {
+                "ok": False,
+                "type": "time_context",
+                "error": {
+                    "code": "NO_ACTIVE_TURN",
+                    "message": "time search requires an active turn",
+                    "query_index": -1,
+                },
+            }
+        return self.memory_manager.search_time_context(
+            session_id=self.session_id,
+            user_text=self._active_turn_user_text,
+            reference_time=self._active_turn_reference_time,
+            time_queries=args.get("time_queries"),
+        )
+
+    def _tool_system_prompt(self, base_prompt: str, reference_time: str) -> str:
         if not self._can_use_tools():
             return base_prompt
         return (
@@ -369,6 +465,24 @@ class ChatSession:
             + "\n\n[Tool Use]\n"
             + "你可以在需要精确时间解析、读取项目文件、列目录或执行已启用工具时调用工具。"
             + "工具结果是内部证据，收到结果后继续用自然语言回答用户。"
+            + "\n\n[Current Time]\n"
+            + f"reference_time={reference_time}\n"
+            + "timezone=Asia/Hong_Kong (+08:00)\n\n"
+            + "[Temporal Memory Tool]\n"
+            + "When the user states, changes, cancels, compares, or asks about time-bound information, "
+            + "resolve every relevant expression to an absolute timezone-aware left-closed/right-open interval "
+            + "and call memory_time_search.\n"
+            + "Use one normalized interval for all relevant time fields. Interpret the result labels as follows:\n"
+            + "- start_at/end_at: when an event occurs.\n"
+            + "- valid_at/invalid_at: when a fact is valid.\n"
+            + "- time_window_start/time_window_end: the period covered by an event summary.\n"
+            + "- temporal_context.time_queries: time mentioned or resolved in that conversation turn.\n"
+            + "- created_at: when the message was created, not when an event described by the message occurred.\n"
+            + "Use matched_time_field and time_meaning together with the user's question to decide which evidence is relevant.\n"
+            + "If a time reference cannot be resolved from the current time and conversation context, ask the user "
+            + "to clarify instead of inventing an interval.\n"
+            + "The time tool is one normal tool among all available tools. Continue the Agent Loop after any tool call, "
+            + "and finish only when no tool_calls remain."
         )
 
     def _env_int(self, name: str, default: int, minimum: int, maximum: int) -> int:

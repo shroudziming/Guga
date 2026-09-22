@@ -7,9 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from guga.memory.time_utils import extract_semantic_time, now_beijing, parse_datetime
-
-
 ToolHandler = Callable[[dict[str, Any]], dict[str, Any]]
 
 
@@ -61,6 +58,9 @@ class ToolRegistry:
     def add(self, tool: ToolSpec) -> None:
         self._tools[tool.name] = tool
 
+    def copy(self) -> ToolRegistry:
+        return ToolRegistry(list(self._tools.values()))
+
     def has_tools(self) -> bool:
         return bool(self._tools)
 
@@ -85,7 +85,6 @@ class ToolRegistry:
 def default_tool_registry(project_root: Path | None = None) -> ToolRegistry:
     root = (project_root or Path(__file__).resolve().parents[1]).resolve()
     registry = ToolRegistry()
-    registry.add(_time_parse_tool())
     registry.add(_list_dir_tool(root))
     registry.add(_read_file_tool(root))
     registry.add(_write_file_tool(root))
@@ -93,42 +92,37 @@ def default_tool_registry(project_root: Path | None = None) -> ToolRegistry:
     return registry
 
 
-def _time_parse_tool() -> ToolSpec:
-    def handler(args: dict[str, Any]) -> dict[str, Any]:
-        text = str(args.get("text", ""))
-        reference_time = str(args.get("reference_time", "") or "")
-        reference = parse_datetime(reference_time) if reference_time else now_beijing()
-        extracted = extract_semantic_time(text, reference_time=reference)
-        if extracted is None:
-            return {
-                "text": text,
-                "reference_time": reference.isoformat(timespec="seconds"),
-                "matched": False,
-            }
-        valid_at, source, granularity = extracted
-        return {
-            "text": text,
-            "reference_time": reference.isoformat(timespec="seconds"),
-            "matched": True,
-            "valid_at": valid_at.isoformat(timespec="seconds"),
-            "semantic_day": valid_at.date().isoformat(),
-            "time_source": source,
-            "time_granularity": granularity,
-        }
-
+def memory_time_search_tool(handler: ToolHandler) -> ToolSpec:
+    query_properties = {
+        "original_expression": {"type": "string"},
+        "start_at": {"type": "string", "description": "Timezone-aware ISO 8601 inclusive start."},
+        "end_at": {"type": "string", "description": "Timezone-aware ISO 8601 exclusive end."},
+        "relation": {"type": "string", "enum": ["overlap", "before", "after"]},
+        "granularity": {
+            "type": "string",
+            "enum": ["minute", "hour", "day", "week", "month", "year", "range", "session"],
+        },
+    }
     return ToolSpec(
-        name="guga_parse_time",
-        description="Parse explicit or relative time expressions in user text using Beijing time.",
+        name="memory_time_search",
+        description=(
+            "Search memory by one or more absolute time intervals resolved from the user's expression and current context."
+        ),
         parameters={
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "Text containing a time expression."},
-                "reference_time": {
-                    "type": "string",
-                    "description": "Optional ISO datetime used as the reference time.",
+                "time_queries": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": query_properties,
+                        "required": ["original_expression", "start_at", "end_at", "relation", "granularity"],
+                        "additionalProperties": False,
+                    },
                 },
             },
-            "required": ["text"],
+            "required": ["time_queries"],
             "additionalProperties": False,
         },
         handler=handler,
