@@ -162,7 +162,7 @@ python -B src\voice_cli_chat.py
 模型支持 OpenAI-compatible `tool_calls` 时，Guga 会在同一 turn 内执行工具并把结果
 返回模型。默认注册：
 
-- `guga_parse_time`
+- `memory_time_search`
 - `guga_list_dir`
 - `guga_read_file`
 
