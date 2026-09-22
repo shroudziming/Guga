@@ -38,7 +38,7 @@ from guga.memory.temporal_retrieval import (
     parse_time_queries,
     search_temporal_records,
 )
-from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, extract_semantic_time, now_beijing, now_beijing_iso, parse_datetime
+from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, now_beijing_iso, parse_datetime
 from guga.memory.user_model import GugaUserModelStore
 from guga.rag.faiss_store import IncompatibleIndexError
 from guga.rag.pipeline import RagPipeline
@@ -50,18 +50,10 @@ from guga.utils.paths import memory_data_dir, rag_documents_dir
 @dataclass(frozen=True)
 class _QueryPlan:
     route: str
-    time_hints: dict[str, str | bool]
     reason: str = ""
-    day: str = ""
-    preferred_session_id: str = ""
 
-    def as_debug_payload(self) -> dict[str, str | bool]:
-        payload: dict[str, str | bool] = {"route": self.route, "reason": self.reason}
-        if self.day:
-            payload["day"] = self.day
-        if self.preferred_session_id:
-            payload["preferred_session_id"] = self.preferred_session_id
-        return payload
+    def as_debug_payload(self) -> dict[str, str]:
+        return {"route": self.route, "reason": self.reason}
 
 
 class _SessionStore:
@@ -208,7 +200,6 @@ class MemoryManager:
         self.consolidation_config = (consolidation_config or MemoryConsolidationConfig()).normalized()
         self.session_store = _SessionStore(self.memory_root / "sessions")
         self._turn_state: dict[str, dict[str, Any]] = {}
-        self._date_context_by_session: dict[str, str] = {}
         self._turn_state_lock = RLock()
         self._finalize_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="guga-memory")
         self._finalize_futures: list[Future] = []
@@ -393,7 +384,7 @@ class MemoryManager:
         Retrieval steps:
             1) Load active records used to resolve semantic hit metadata.
             2) Retrieve BGE-M3 chunk hits from RagPipeline (memory + documents).
-            3) Apply deterministic lifecycle, time, and prompt-noise filters.
+            3) Apply deterministic lifecycle and prompt-noise filters.
 
         Args:
             user_text: Current user query text.
@@ -410,13 +401,11 @@ class MemoryManager:
         current_turn_ids = self._current_turn_ids(session_id)
         records = self._load_archival_records()
         query_plan = self._build_query_plan(user_text, session_id, records)
-        if query_plan.route == "recent_turn":
-            records.extend(self._load_session_message_records(session_id))
-        records = self._records_for_query_plan(records, query_plan, session_id)
-        time_hints = query_plan.time_hints
+        if query_plan.route == "portrait":
+            records = []
         self._debug(
             session_id,
-            f"retrieve_start query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} candidates={len(records)} min_score={self.memory_min_score:.2f} current_turn_factor={self.current_turn_score_factor:.2f} query_plan={json.dumps(query_plan.as_debug_payload(), ensure_ascii=False)} time_hints={json.dumps(time_hints, ensure_ascii=False)}",
+            f"retrieve_start query={json.dumps(user_text, ensure_ascii=False)} top_k={self.top_k} doc_top_k={self.document_top_k} candidates={len(records)} min_score={self.memory_min_score:.2f} current_turn_factor={self.current_turn_score_factor:.2f} query_plan={json.dumps(query_plan.as_debug_payload(), ensure_ascii=False)}",
         )
 
         semantic_memory_hits, semantic_document_hits = self._retrieve_semantic(user_text=user_text, session_id=session_id)
@@ -425,10 +414,7 @@ class MemoryManager:
             semantic_memory_hits,
             records,
             current_turn_ids=current_turn_ids,
-            time_hints=time_hints,
-            session_id=session_id,
         )
-        merged_memory_hits = self._dedupe_semantic_event_overlaps(merged_memory_hits, query_plan)
         self._reinforce_recalled_memories(merged_memory_hits, session_id=session_id, query=user_text, current_turn_ids=current_turn_ids)
         document_hits = self._to_document_hits(semantic_document_hits)
         current_event_ids = active_event_ids(self.semantic_event_store.load_all())
@@ -589,9 +575,6 @@ class MemoryManager:
             state["user_text"] = text
             state["user_message_id"] = message_id
             state["session_memory_id"] = turn_payload["id"]
-            parsed_created_at = parse_datetime(created_at)
-            if parsed_created_at is not None:
-                self._date_context_by_session[session_id] = parsed_created_at.date().isoformat()
         self._debug(session_id, f"ingest role=user message_id={message_id}")
         return message_id
 
@@ -1633,8 +1616,6 @@ class MemoryManager:
         semantic_hits: list[RetrievalHit],
         records: list[dict],
         current_turn_ids: set[str],
-        time_hints: dict[str, str | bool],
-        session_id: str,
     ) -> list[MemoryHit]:
         """Map BGE-M3 chunk hits to memory records, then filter prompt noise."""
         candidates: dict[str, MemoryHit] = {}
@@ -1657,13 +1638,6 @@ class MemoryManager:
                 "retention": round(retention, 4),
                 "semantic_retained_score": round(score, 4),
             }
-            score, temporal_components = self._apply_time_score_components(
-                score,
-                record or self._record_from_semantic_hit(key, hit),
-                time_hints,
-                session_id,
-            )
-            components.update(temporal_components)
             self._store_memory_candidate(
                 candidates,
                 MemoryHit(
@@ -1712,39 +1686,6 @@ class MemoryManager:
 
         merged.sort(key=lambda item: item.score, reverse=True)
         return self._filter_memory_hits(merged)
-
-    def _dedupe_semantic_event_overlaps(self, hits: list[MemoryHit], query_plan: _QueryPlan) -> list[MemoryHit]:
-        if query_plan.route != "date_window":
-            return hits
-
-        fact_message_ids: set[str] = set()
-        for hit in hits:
-            if hit.memory_type == "semantic_event":
-                fact_message_ids.update(hit.source_message_ids)
-        if not fact_message_ids:
-            return hits
-
-        deduped: list[MemoryHit] = []
-        for hit in hits:
-            if hit.memory_type in {"event_summary", "conversation_turn"} and fact_message_ids.intersection(hit.source_message_ids):
-                continue
-            deduped.append(hit)
-        return deduped
-
-    def _record_from_semantic_hit(self, key: str, hit: RetrievalHit) -> dict:
-        return {
-            "id": key,
-            "type": hit.source_type or "episodic",
-            "summary": hit.text,
-            "raw_excerpt": hit.text,
-            "source_session_id": hit.source_session_id,
-            "source_message_ids": [hit.source_message_id] if hit.source_message_id else [],
-            "created_at": hit.created_at,
-            "day": self._day_bucket(hit.created_at) if hit.created_at else "",
-            "valid_at": hit.created_at,
-            "invalid_at": "",
-            "time_source": "semantic_hit_created_at",
-        }
 
     def _store_memory_candidate(self, candidates: dict[str, MemoryHit], hit: MemoryHit) -> None:
         existing = candidates.get(hit.id)
@@ -1869,107 +1810,10 @@ class MemoryManager:
                     records.append(normalized)
         return records
 
-    def _load_session_message_records(self, session_id: str, limit: int = 8) -> list[dict]:
-        """Expose recent raw session messages only for explicit recent-turn queries."""
-        session_file = self.memory_root / "sessions" / f"{session_id}.jsonl"
-        rows = self._read_session_rows(session_file)[-limit:]
-        records: list[dict] = []
-        for row in rows:
-            message_id = str(row.get("id", ""))
-            content = str(row.get("content", "")).strip()
-            if not message_id or not content:
-                continue
-            role = str(row.get("role", "")).strip() or "message"
-            created_at = str(row.get("created_at", ""))
-            records.append(
-                apply_temporal_fields(
-                    {
-                        "id": f"chat_{message_id}",
-                        "type": "conversation_turn",
-                        "summary": f"{role}: {content}",
-                        "raw_excerpt": content,
-                        "source_session_id": session_id,
-                        "source_message_ids": [message_id],
-                        "created_at": created_at,
-                        "day": self._day_bucket(created_at) if created_at else "",
-                        "last_recalled_at": created_at,
-                        "memory_strength": 1,
-                        "retention": 1.0,
-                        "importance": 0.4,
-                        "confidence": 1.0,
-                        "status": "active",
-                    },
-                    text=content,
-                    reference_time=created_at,
-                )
-            )
-        return records
-
     def _build_query_plan(self, query: str, session_id: str, records: list[dict]) -> _QueryPlan:
-        normalized = query.strip()
-        day, source = self._extract_query_day_with_source(normalized, session_id)
-        if day:
-            return _QueryPlan(
-                route="date_window",
-                time_hints={"day": day},
-                reason=source,
-                day=day,
-            )
-
-        if self._mentions_recent_current(normalized):
-            return _QueryPlan(
-                route="recent_turn",
-                time_hints={"recent_current_session": True},
-                reason="recent_current_session_reference",
-            )
-
-        if self._mentions_last_session(normalized):
-            preferred_session_id = self._latest_non_current_session_id(records, session_id)
-            hints: dict[str, str | bool] = {}
-            if preferred_session_id:
-                hints["preferred_session_id"] = preferred_session_id
-            return _QueryPlan(
-                route="last_session",
-                time_hints=hints,
-                reason="last_session_reference",
-                preferred_session_id=preferred_session_id,
-            )
-
-        if self._mentions_user_portrait(normalized):
-            return _QueryPlan(route="portrait", time_hints={}, reason="long_term_user_profile")
-
-        return _QueryPlan(route="hybrid", time_hints={}, reason="default_hybrid")
-
-    def _records_for_query_plan(self, records: list[dict], query_plan: _QueryPlan, session_id: str) -> list[dict]:
-        if query_plan.route == "date_window":
-            candidates = [record for record in records if self._record_matches_day(record, query_plan.day)]
-            if query_plan.reason in {"semantic_explicit_date", "contextual_date"}:
-                return candidates
-            if any(str(record.get("source_session_id", "")) != session_id for record in candidates):
-                return candidates
-            return records
-
-        if query_plan.route == "recent_turn":
-            return [record for record in records if str(record.get("source_session_id", "")) == session_id]
-
-        if query_plan.route == "last_session":
-            if not query_plan.preferred_session_id:
-                return []
-            return [record for record in records if str(record.get("source_session_id", "")) == query_plan.preferred_session_id]
-
-        if query_plan.route == "portrait":
-            return []
-
-        return records
-
-    def _record_matches_day(self, item: dict, day: str) -> bool:
-        if not day:
-            return False
-        record_day = self._record_day(item)
-        if record_day:
-            return record_day == day
-        created_at = str(item.get("created_at", "") or "")
-        return bool(created_at and self._day_bucket(created_at) == day)
+        if self._mentions_user_portrait(query.strip()):
+            return _QueryPlan(route="portrait", reason="long_term_user_profile")
+        return _QueryPlan(route="hybrid", reason="default_hybrid")
 
     def _mentions_user_portrait(self, query: str) -> bool:
         lower = query.lower()
@@ -1988,137 +1832,6 @@ class MemoryManager:
                 "what do you know about me",
             )
         )
-
-    def _extract_query_day_with_source(self, query: str, session_id: str) -> tuple[str, str]:
-        normalized = query.strip()
-        reference_time = self._date_context_by_session.get(session_id) or now_beijing()
-        extracted = extract_semantic_time(normalized, reference_time=reference_time)
-        if extracted is not None:
-            day = extracted[0].date().isoformat()
-            source = extracted[1]
-        elif "那天" in normalized:
-            day = self._date_context_by_session.get(session_id, "")
-            source = "contextual_date" if day else ""
-        else:
-            day = ""
-            source = ""
-        if day:
-            self._date_context_by_session[session_id] = day
-        return day, source
-
-    def _mentions_recent_current(self, query: str) -> bool:
-        lower = query.lower()
-        return any(token in lower for token in ("刚才", "上一轮", "前一轮", "刚刚", "just now", "previous turn"))
-
-    def _mentions_last_session(self, query: str) -> bool:
-        lower = query.lower()
-        return any(token in lower for token in ("上次", "上一次", "上回", "last time", "previous chat", "last chat"))
-
-    def _latest_non_current_session_id(self, records: list[dict], session_id: str) -> str:
-        latest_session_id = ""
-        latest_created_at = ""
-        for record in records:
-            candidate_session_id = str(record.get("source_session_id", ""))
-            if not candidate_session_id or candidate_session_id == session_id:
-                continue
-            created_at = str(record.get("created_at", ""))
-            if created_at >= latest_created_at:
-                latest_created_at = created_at
-                latest_session_id = candidate_session_id
-        return latest_session_id
-
-    def _apply_time_score_adjustments(
-        self,
-        score: float,
-        item: dict,
-        time_hints: dict[str, str | bool],
-        session_id: str,
-    ) -> float:
-        adjusted, _ = self._apply_time_score_components(score, item, time_hints, session_id)
-        return adjusted
-
-    def _apply_time_score_components(
-        self,
-        score: float,
-        item: dict,
-        time_hints: dict[str, str | bool],
-        session_id: str,
-    ) -> tuple[float, dict[str, float | str | bool]]:
-        adjusted = max(0.0, score)
-        before = adjusted
-        rule = "none"
-        day = str(time_hints.get("day", "") or "")
-        if day:
-            record_day = self._record_day(item)
-            if record_day == day:
-                adjusted = max(adjusted, 0.45)
-                rule = "date_match"
-                if item.get("type") == "semantic_event":
-                    adjusted += 0.25
-                    rule = "date_match_semantic_event"
-                if item.get("type") == "event_summary":
-                    adjusted += 0.2
-                    rule = "date_match_event_summary"
-                if str(item.get("id", "")).startswith(f"evt_daily_{day.replace('-', '')}"):
-                    adjusted += 0.15
-                    rule = "date_match_daily_summary"
-            elif record_day:
-                adjusted *= 0.35
-                rule = "date_mismatch_downweight"
-
-        if bool(time_hints.get("recent_current_session")):
-            if str(item.get("source_session_id", "")) == session_id:
-                adjusted = max(adjusted, 0.35 + (0.25 * self._recency_score(str(item.get("created_at", "")))))
-                rule = "recent_current_session"
-            elif item.get("source_session_id"):
-                adjusted *= 0.6
-                rule = "recent_other_session_downweight"
-
-        preferred_session_id = str(time_hints.get("preferred_session_id", "") or "")
-        if preferred_session_id:
-            if str(item.get("source_session_id", "")) == preferred_session_id:
-                adjusted = max(adjusted, 0.55)
-                rule = "last_session_match"
-                if item.get("type") == "event_summary":
-                    adjusted += 0.15
-                    rule = "last_session_event_summary"
-            elif item.get("source_session_id"):
-                adjusted *= 0.5
-                rule = "last_session_mismatch_downweight"
-
-        components: dict[str, float | str | bool] = {
-            "score_before_temporal": round(before, 4),
-            "temporal_adjustment": round(adjusted - before, 4),
-            "score_after_temporal": round(adjusted, 4),
-            "temporal_rule": rule,
-        }
-        if day:
-            components["query_day"] = day
-            components["record_day"] = self._record_day(item)
-        if preferred_session_id:
-            components["preferred_session_id"] = preferred_session_id
-        if bool(time_hints.get("recent_current_session")):
-            components["recent_current_session"] = True
-        return adjusted, components
-
-    def _record_day(self, item: dict) -> str:
-        if item.get("type") == "semantic_event":
-            start_at = str(item.get("start_at", "") or "").strip()
-            if start_at:
-                return self._day_bucket(start_at)
-        time_source = str(item.get("time_source", "") or "")
-        if time_source.startswith("semantic_"):
-            semantic_day = str(item.get("semantic_day", "") or "").strip()
-            if semantic_day:
-                return semantic_day
-            valid_at = str(item.get("valid_at", "") or "").strip()
-            if valid_at:
-                return self._day_bucket(valid_at)
-        day = str(item.get("day", "") or "").strip()
-        if item.get("type") == "event_summary" and day:
-            return day
-        created_at = str(item.get("created_at", "") or "")
-        return self._day_bucket(created_at) if item.get("type") == "event_summary" and created_at else ""
 
     def _apply_decay_policy(self, session_id: str) -> None:
         if not self.decay_enabled:
@@ -2282,25 +1995,6 @@ class MemoryManager:
         if not raw:
             return default
         return raw in {"1", "true", "yes", "on", "y"}
-
-    def _recency_score(self, created_at: str) -> float:
-        """Map timestamp recency to [0, 1] with linear decay over 30 days."""
-        if not created_at:
-            return 0.0
-        try:
-            ts = datetime.fromisoformat(created_at)
-        except ValueError:
-            return 0.0
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-
-        now = datetime.now(timezone.utc)
-        age_days = (now - ts.astimezone(timezone.utc)).total_seconds() / 86400
-        if age_days <= 0:
-            return 1.0
-        if age_days >= 30:
-            return 0.0
-        return 1.0 - (age_days / 30)
 
     def _debug_pipeline(self, message: str) -> None:
         if not self.debug:

@@ -283,6 +283,61 @@ class MemoryManagerTest(unittest.TestCase):
         self.assertEqual(match["record_id"], "turn_msg_created_only")
         self.assertEqual(match["matched_time_field"], "created_at")
 
+    def test_explicit_date_keeps_ordinary_retrieval_in_hybrid_route(self) -> None:
+        records = [
+            {
+                "id": "evt_20",
+                "type": "semantic_event",
+                "summary": "8月20日面试",
+                "created_at": "2026-08-19T09:00:00+08:00",
+                "valid_at": "2026-08-20T14:00:00+08:00",
+                "semantic_day": "2026-08-20",
+                "time_source": "semantic_explicit_date",
+                "source_session_id": "sess_20",
+                "source_message_ids": ["msg_20"],
+                "status": "active",
+            },
+            {
+                "id": "evt_21",
+                "type": "semantic_event",
+                "summary": "8月21日聚餐",
+                "created_at": "2026-08-19T10:00:00+08:00",
+                "valid_at": "2026-08-21T18:00:00+08:00",
+                "semantic_day": "2026-08-21",
+                "time_source": "semantic_explicit_date",
+                "source_session_id": "sess_21",
+                "source_message_ids": ["msg_21"],
+                "status": "active",
+            },
+        ]
+        self.manager.semantic_event_file.write_text(
+            "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+            encoding="utf-8",
+        )
+        self.manager._retrieve_semantic = lambda **_: (
+            [
+                RetrievalHit(
+                    chunk_id=f"chunk_{record['id']}",
+                    text=record["summary"],
+                    score=score,
+                    source_type="memory",
+                    source_id=record["id"],
+                    source_session_id=record["source_session_id"],
+                    source_message_id=record["source_message_ids"][0],
+                    created_at=record["created_at"],
+                )
+                for record, score in zip(records, (0.8, 0.7))
+            ],
+            [],
+        )
+
+        plan = self.manager._build_query_plan("8月20号有什么事情", "sess_plain", [])
+        context = self.manager.prepare_context("8月20号有什么事情", "sess_plain")
+
+        self.assertEqual(plan.route, "hybrid")
+        self.assertEqual(plan.reason, "default_hybrid")
+        self.assertEqual([hit.id for hit in context.hits], ["evt_20", "evt_21"])
+
     def test_search_time_context_loads_four_canonical_layers_and_applies_global_top_k(self) -> None:
         events = [
             {
@@ -856,8 +911,6 @@ class MemoryManagerTest(unittest.TestCase):
             [semantic_hit],
             [record],
             current_turn_ids=set(),
-            time_hints={},
-            session_id="sess_now",
         )
 
         self.assertEqual(hits[0].summary, semantic_hit.text)

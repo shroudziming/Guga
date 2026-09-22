@@ -6,11 +6,10 @@ import unittest
 from pathlib import Path
 
 from guga.memory.consolidation import MemoryConsolidationConfig
-from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.manager import MemoryManager
 from guga.memory.summarizer import MemoryBankSummarizer
 from guga.memory.time_utils import extract_semantic_time
-from guga.rag.schemas import RetrievalHit
+from guga.tools import default_tool_registry
 
 
 class SummaryModel:
@@ -98,51 +97,19 @@ class MemoryTimeUtilsTest(unittest.TestCase):
         self.assertEqual(source, "semantic_relative_weekday")
         self.assertEqual(granularity, "date")
 
-    def test_date_query_uses_semantic_day_for_retrieval_boost(self) -> None:
+    def test_ordinary_query_plan_does_not_route_explicit_date_to_date_window(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            memory_root = Path(tmp)
-            archival = memory_root / "archival_memory.jsonl"
-            archival.write_text(
-                json.dumps(
-                    {
-                        "id": "mem_meeting",
-                        "type": "episodic",
-                        "summary": "用户计划在2026年6月20日与导师见面",
-                        "raw_excerpt": "真实测试：我在2026年6月20日要和导师见面，请你记住。",
-                        "created_at": "2026-06-12T17:09:37+08:00",
-                        "last_recalled_at": "2099-01-01T00:00:00+08:00",
-                        "valid_at": "2026-06-20T00:00:00+08:00",
-                        "semantic_day": "2026-06-20",
-                        "time_source": "semantic_explicit_date",
-                        "memory_strength": 1,
-                        "source_session_id": "sess_time",
-                        "source_message_ids": ["msg_time"],
-                        "importance": 0.7,
-                        "confidence": 1.0,
-                        "status": "active",
-                    },
-                    ensure_ascii=False,
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
-            semantic_hit = RetrievalHit(
-                chunk_id="chunk_mem_meeting",
-                text="用户将在2026年6月20日与导师见面。",
-                score=0.8,
-                source_type="memory",
-                source_id="mem_meeting",
-                source_session_id="sess_time",
-                source_message_id="msg_time",
-                created_at="2026-06-12T17:09:37+08:00",
-            )
-            manager._retrieve_semantic = lambda **_: ([semantic_hit], [])
+            manager = MemoryManager(memory_root=Path(tmp), model=None, enable_semantic=False)
 
-            context = manager.prepare_context("你记得我2026年6月20日要做什么吗？", session_id="sess_probe")
+            plan = manager._build_query_plan("8月20号有什么事情", "sess_plain", [])
 
-            self.assertEqual(context.hits[0].id, "mem_meeting")
-            self.assertEqual(context.hits[0].valid_at, "2026-06-20T00:00:00+08:00")
+            self.assertEqual(plan.route, "hybrid")
+            self.assertEqual(plan.reason, "default_hybrid")
+
+    def test_default_tool_registry_no_longer_exposes_regex_time_parser(self) -> None:
+        names = [item["function"]["name"] for item in default_tool_registry().openai_tools()]
+
+        self.assertNotIn("guga_parse_time", names)
 
 
 if __name__ == "__main__":

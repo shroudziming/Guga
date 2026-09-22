@@ -147,8 +147,6 @@ class MemoryMigrationTest(unittest.TestCase):
                 [stale_hit],
                 manager._load_archival_records(),
                 current_turn_ids=set(),
-                time_hints={},
-                session_id="sess_probe",
             )
 
             self.assertEqual(hits, [])

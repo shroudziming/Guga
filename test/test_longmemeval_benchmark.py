@@ -152,14 +152,6 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
             self.assertEqual(question_row["created_at"], "2026/01/02 (Fri) 09:30")
             self.assertEqual(result["question_date"], "2026/01/02 (Fri) 09:30")
             self.assertEqual(result["answer_session_ids"], ["history_session"])
-            manager = MemoryManager(memory_root=workspace.case_memory_root(case.case_id), enable_semantic=False)
-            manager.record_user_message(
-                "q_question_time_relative",
-                "今天",
-                created_at="2026/01/02 (Fri) 09:30",
-            )
-            self.assertEqual(manager._extract_query_day_with_source("今天", "q_question_time_relative"), ("2026-01-02", "semantic_relative_date"))
-
     def test_ingest_case_writes_only_to_benchmark_memory_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

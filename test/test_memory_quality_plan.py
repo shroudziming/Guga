@@ -143,7 +143,7 @@ class MemoryQualityPlanTest(unittest.TestCase):
 
             self.assertEqual(context.hits, [])
 
-    def test_debug_report_includes_score_components(self) -> None:
+    def test_debug_report_keeps_semantic_and_retention_score_components(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             logs: list[str] = []
             memory_root = Path(tmp)
@@ -181,8 +181,10 @@ class MemoryQualityPlanTest(unittest.TestCase):
             components = payload[0]["score_components"]
             self.assertEqual(components["route"], "semantic")
             self.assertEqual(components["semantic_raw_score"], 0.6)
+            self.assertEqual(components["retention"], 1.0)
+            self.assertEqual(components["semantic_retained_score"], 0.6)
             self.assertNotIn("lexical_score", payload[0])
-            self.assertIn("temporal_adjustment", components)
+            self.assertNotIn("temporal_adjustment", components)
 
     def test_best_bge_chunk_score_is_used_for_duplicate_memory_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,8 +213,6 @@ class MemoryQualityPlanTest(unittest.TestCase):
                 [semantic_hit, stronger_chunk],
                 [record],
                 current_turn_ids=set(),
-                time_hints={},
-                session_id="sess_probe",
             )
 
             self.assertEqual(hits[0].id, "mem_mix")
@@ -220,72 +220,52 @@ class MemoryQualityPlanTest(unittest.TestCase):
             self.assertEqual(hits[0].semantic_score, 0.8)
             self.assertEqual(hits[0].score_source, "semantic")
 
-    def test_explicit_date_query_prioritizes_daily_event_summary(self) -> None:
+    def test_explicit_date_query_keeps_cross_date_semantic_ranking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
             manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
-            _append_jsonl(
-                memory_root / "event_summaries.jsonl",
+            records = [
                 {
-                    "id": "evt_daily_20260509",
-                    "type": "event_summary",
-                    "scope": "daily",
-                    "day": "2026-05-09",
-                    "summary": "当天讨论了导师安排。",
-                    "raw_excerpt": "导师安排",
+                    "id": "mem_may9",
+                    "type": "episodic",
+                    "summary": "5月9日讨论了导师安排。",
                     "created_at": "2026-05-09T12:00:00+08:00",
+                    "valid_at": "2026-05-09T12:00:00+08:00",
+                    "semantic_day": "2026-05-09",
+                    "time_source": "semantic_explicit_date",
                     "last_recalled_at": "2099-01-01T00:00:00+00:00",
-                    "memory_strength": 1,
                     "source_session_id": "sess_may9",
                     "source_message_ids": ["msg_may9"],
-                    "importance": 0.75,
-                    "confidence": 0.8,
                     "status": "active",
                 },
-            )
-            _append_jsonl(
-                memory_root / "archival_memory.jsonl",
                 {
-                    "id": "mem_other_day",
+                    "id": "mem_may10",
                     "type": "episodic",
-                    "summary": "那天的对话比较长。",
-                    "raw_excerpt": "那天的对话",
+                    "summary": "5月10日也讨论了导师安排。",
                     "created_at": "2026-05-10T12:00:00+08:00",
+                    "valid_at": "2026-05-10T12:00:00+08:00",
+                    "semantic_day": "2026-05-10",
+                    "time_source": "semantic_explicit_date",
                     "last_recalled_at": "2099-01-01T00:00:00+00:00",
-                    "memory_strength": 1,
                     "source_session_id": "sess_may10",
                     "source_message_ids": ["msg_may10"],
                     "status": "active",
                 },
-            )
-            _append_jsonl(
-                memory_root / "archival_memory.jsonl",
-                {
-                    "id": "mem_wrong_day_strong",
-                    "type": "episodic",
-                    "summary": "2026-05-09那天的对话 那天的对话 那天的对话",
-                    "raw_excerpt": "2026-05-09那天的对话",
-                    "created_at": "2026-05-10T12:00:00+08:00",
-                    "last_recalled_at": "2099-01-01T00:00:00+00:00",
-                    "memory_strength": 1,
-                    "source_session_id": "sess_wrong",
-                    "source_message_ids": ["msg_wrong"],
-                    "importance": 1.0,
-                    "confidence": 1.0,
-                    "status": "active",
-                },
-            )
+            ]
+            for record in records:
+                _append_jsonl(memory_root / "archival_memory.jsonl", record)
 
-            records = manager._load_archival_records()
-            manager._retrieve_semantic = lambda **_: ([_semantic_hit(record, 0.6) for record in records], [])
+            manager._retrieve_semantic = lambda **_: (
+                [_semantic_hit(records[0], 0.6), _semantic_hit(records[1], 0.9)],
+                [],
+            )
 
             context = manager.prepare_context("2026-05-09那天的对话", session_id="sess_probe")
-            hit_ids = [hit.id for hit in context.hits]
 
-            self.assertEqual(context.hits[0].id, "evt_daily_20260509")
-            self.assertNotIn("mem_wrong_day_strong", hit_ids)
+            self.assertEqual([hit.id for hit in context.hits], ["mem_may10", "mem_may9"])
+            self.assertEqual([hit.score for hit in context.hits], [0.9, 0.6])
 
-    def test_recent_and_last_session_time_references_are_prioritized(self) -> None:
+    def test_last_session_reference_keeps_semantic_ranking_across_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             memory_root = Path(tmp)
             manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
@@ -320,25 +300,44 @@ class MemoryQualityPlanTest(unittest.TestCase):
                 },
             )
             historical = manager._load_archival_records()
-            manager._retrieve_semantic = lambda **_: ([_semantic_hit(record, 0.6) for record in historical], [])
-            last_context = manager.prepare_context("上次我们聊了什么", session_id="sess_now")
-            self.assertEqual(last_context.hits[0].id, "evt_daily_20260510")
-            self.assertEqual([hit.id for hit in last_context.hits], ["evt_daily_20260510"])
-
-            manager.record_user_message("sess_now", "我们先聊蝴蝶刀")
-            manager.record_assistant_message("sess_now", "刚才你说什么：蝴蝶刀练习安排")
-            manager.record_user_message("sess_now", "刚才你说什么")
-            session_records = manager._load_session_message_records("sess_now")
             manager._retrieve_semantic = lambda **_: (
                 [
-                    _semantic_hit(record, 0.9 if str(record.get("summary", "")).startswith("assistant:") else 0.4)
-                    for record in session_records
+                    _semantic_hit(historical[0], 0.9),
+                    _semantic_hit(historical[1], 0.6),
                 ],
                 [],
             )
-            recent_context = manager.prepare_context("刚才你说什么", session_id="sess_now")
 
-            self.assertTrue(recent_context.hits[0].summary.startswith("assistant:"))
+            last_context = manager.prepare_context("上次我们聊了什么", session_id="sess_now")
+
+            self.assertEqual([hit.id for hit in last_context.hits], ["evt_daily_20260508", "evt_daily_20260510"])
+            self.assertEqual([hit.score for hit in last_context.hits], [0.9, 0.6])
+
+    def test_recent_reference_does_not_load_raw_session_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            memory_root = Path(tmp)
+            manager = MemoryManager(memory_root=memory_root, top_k=4, enable_semantic=False)
+            message_id = manager.session_store.append_message(
+                session_id="sess_now",
+                role="assistant",
+                content="蝴蝶刀练习安排",
+                created_at="2026-05-10T12:00:00+08:00",
+            )
+            raw_hit = RetrievalHit(
+                chunk_id=f"chunk_chat_{message_id}",
+                text="assistant: 蝴蝶刀练习安排",
+                score=0.9,
+                source_type="memory",
+                source_id=f"chat_{message_id}",
+                source_session_id="sess_now",
+                source_message_id=message_id,
+                created_at="2026-05-10T12:00:00+08:00",
+            )
+            manager._retrieve_semantic = lambda **_: ([raw_hit], [])
+
+            context = manager.prepare_context("刚才你说什么", session_id="sess_now")
+
+            self.assertEqual(context.hits, [])
 
     def test_portrait_query_uses_profile_without_episodic_noise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
