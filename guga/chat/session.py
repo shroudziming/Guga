@@ -256,14 +256,22 @@ class ChatSession:
                 generate_elapsed_ms = int((perf_counter() - generate_started) * 1000)
                 self._debug(f"model_generate_done latency_ms={generate_elapsed_ms}")
 
+            if cancel_event is not None and cancel_event.is_set():
+                return
             answer = "".join(chunks).strip()
             if not answer:
                 self._debug("model_generate_empty_retry")
                 try:
-                    answer = self.model.generate_reply(messages, self._retry_generation_config()).strip()
+                    answer = self._generate_reply_with_optional_tools(
+                        messages,
+                        generation=self._retry_generation_config(),
+                        trace=trace,
+                    ).strip()
                 except Exception as exc:
                     self._debug(f"model_generate_empty_retry_failed reason={exc}")
                     answer = ""
+                if cancel_event is not None and cancel_event.is_set():
+                    return
                 if answer:
                     yield answer
                 else:
@@ -273,6 +281,8 @@ class ChatSession:
             self._active_turn_user_text = ""
             self._active_turn_reference_time = ""
 
+        if cancel_event is not None and cancel_event.is_set():
+            return
         self.history.add_assistant(answer)
         assistant_message_id = self.memory_manager.record_assistant_message(
             session_id=self.session_id,

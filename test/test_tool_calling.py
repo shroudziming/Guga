@@ -12,6 +12,118 @@ from guga.types import GenerationConfig
 
 
 class ToolCallingTest(unittest.TestCase):
+    def test_empty_tool_stream_retry_uses_agent_loop_and_records_trace(self) -> None:
+        class EmptyThenToolModel:
+            def __init__(self) -> None:
+                self.tool_calls = 0
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                raise AssertionError("raw retry bypassed the tool agent loop")
+
+            def generate_reply_with_tools(self, messages, gen, tools):
+                _ = messages, gen, tools
+                self.tool_calls += 1
+                if self.tool_calls == 1:
+                    return ToolModelResponse(
+                        content="",
+                        tool_calls=[ToolCall(id="call_retry", name="guga_test_tool", arguments={"query": "重试"})],
+                    )
+                return ToolModelResponse(content="重试工具完成。", tool_calls=[])
+
+            def generate_reply_with_tools_stream(self, messages, gen, tools, cancel_event=None):
+                _ = messages, gen, tools, cancel_event
+                if False:
+                    yield ToolStreamText("")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+            registry = ToolRegistry(
+                [
+                    ToolSpec(
+                        name="guga_test_tool",
+                        description="test",
+                        parameters={
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                        handler=lambda args: {"result": args["query"]},
+                    )
+                ]
+            )
+            session = ChatSession(
+                model=EmptyThenToolModel(),
+                system_prompt="test",
+                generation=GenerationConfig(),
+                memory_manager=manager,
+                session_id="sess_tool_retry",
+                tool_registry=registry,
+            )
+
+            chunks = list(session.reply_stream("用工具重试"))
+
+            self.assertEqual(chunks, ["重试工具完成。"])
+            rows = [
+                json.loads(line)
+                for line in (Path(tmp) / "sessions" / "sess_tool_retry.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                [item["tool"] for item in rows[0]["metadata"]["turn"]["tool_interactions"]],
+                ["guga_test_tool"],
+            )
+
+    def test_non_time_tool_result_with_scalar_queries_records_empty_memory_ids(self) -> None:
+        class ScalarQueriesModel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate_reply_with_tools(self, messages, gen, tools):
+                _ = messages, gen, tools
+                self.calls += 1
+                if self.calls == 1:
+                    return ToolModelResponse(
+                        content="",
+                        tool_calls=[ToolCall(id="call_scalar", name="guga_test_tool", arguments={"query": "项目"})],
+                    )
+                return ToolModelResponse(content="标量结果已处理。", tool_calls=[])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+            registry = ToolRegistry(
+                [
+                    ToolSpec(
+                        name="guga_test_tool",
+                        description="test",
+                        parameters={
+                            "type": "object",
+                            "properties": {"query": {"type": "string"}},
+                            "required": ["query"],
+                        },
+                        handler=lambda args: {"queries": 42, "result": args["query"]},
+                    )
+                ]
+            )
+            session = ChatSession(
+                model=ScalarQueriesModel(),
+                system_prompt="test",
+                generation=GenerationConfig(),
+                memory_manager=manager,
+                session_id="sess_scalar_queries",
+                tool_registry=registry,
+            )
+
+            self.assertEqual(session.reply("读取项目", finalize_memory=False), "标量结果已处理。")
+
+            user = json.loads(
+                (Path(tmp) / "sessions" / "sess_scalar_queries.jsonl").read_text(encoding="utf-8").splitlines()[0]
+            )
+            self.assertEqual(
+                user["metadata"]["turn"]["tool_interactions"][0]["returned_memory_ids"],
+                [],
+            )
+
     def test_time_tool_and_other_tool_share_agent_loop_and_persist_turn_trace(self) -> None:
         class MixedToolModel:
             def __init__(self) -> None:

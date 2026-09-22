@@ -15,11 +15,13 @@ class TurnTrace:
     tool_interactions: list[dict[str, Any]] = field(default_factory=list)
 
     def record_tool(self, call: ToolCall, result: dict[str, Any]) -> None:
+        raw_queries = result.get("queries")
+        query_groups = raw_queries if call.name == "memory_time_search" and isinstance(raw_queries, list) else []
         returned_ids = [
             str(match.get("record_id", ""))
-            for group in (result.get("queries", []) or [])
+            for group in query_groups
             if isinstance(group, dict)
-            for match in (group.get("matches", []) or [])
+            for match in (group.get("matches") if isinstance(group.get("matches"), list) else [])
             if isinstance(match, dict) and str(match.get("record_id", ""))
         ]
         self.tool_interactions.append(
@@ -39,7 +41,7 @@ class TurnTrace:
         if call.name == "memory_time_search" and result.get("ok") is True:
             self.time_queries.extend(
                 dict(group["query"])
-                for group in (result.get("queries", []) or [])
+                for group in query_groups
                 if isinstance(group, dict) and isinstance(group.get("query"), dict)
             )
 

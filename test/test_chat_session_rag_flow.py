@@ -7,6 +7,7 @@ from time import perf_counter, sleep
 import unittest
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event
 
 from guga.chat.session import ChatSession
 from guga.memory.consolidation import MemoryConsolidationConfig
@@ -102,6 +103,87 @@ class FakeChatModel:
 
 
 class ChatSessionRagFlowTest(unittest.TestCase):
+    def test_stream_cancellation_after_partial_chunk_leaves_turn_incomplete(self) -> None:
+        class CancelAfterPartialModel:
+            def generate_reply_stream(self, messages, gen, cancel_event=None):
+                _ = messages, gen
+                yield "部分回复"
+                cancel_event.set()
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return "不应重试"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_root = Path(tmp_dir)
+            manager = MemoryManager(memory_root=memory_root, enable_semantic=False)
+            cancel_event = Event()
+            session = ChatSession(
+                model=CancelAfterPartialModel(),
+                system_prompt="test",
+                generation=GenerationConfig(),
+                memory_manager=manager,
+                session_id="sess_cancel_partial",
+            )
+
+            chunks = list(session.reply_stream("取消部分回复", cancel_event=cancel_event))
+            manager.wait_for_background_tasks(timeout=3)
+
+            self.assertEqual(chunks, ["部分回复"])
+            rows = [
+                json.loads(line)
+                for line in (memory_root / "sessions" / "sess_cancel_partial.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["role"], "user")
+            self.assertEqual(rows[0]["metadata"], {})
+            self.assertEqual(session._active_turn_user_text, "")
+            self.assertEqual(session._active_turn_reference_time, "")
+
+    def test_stream_cancellation_before_empty_retry_leaves_turn_incomplete(self) -> None:
+        class CancelEmptyModel:
+            def __init__(self) -> None:
+                self.retry_calls = 0
+
+            def generate_reply_stream(self, messages, gen, cancel_event=None):
+                _ = messages, gen
+                cancel_event.set()
+                if False:
+                    yield ""
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                self.retry_calls += 1
+                return "不应重试"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            memory_root = Path(tmp_dir)
+            manager = MemoryManager(memory_root=memory_root, enable_semantic=False)
+            model = CancelEmptyModel()
+            cancel_event = Event()
+            session = ChatSession(
+                model=model,
+                system_prompt="test",
+                generation=GenerationConfig(),
+                memory_manager=manager,
+                session_id="sess_cancel_empty",
+            )
+
+            chunks = list(session.reply_stream("取消空回复", cancel_event=cancel_event))
+            manager.wait_for_background_tasks(timeout=3)
+
+            self.assertEqual(chunks, [])
+            self.assertEqual(model.retry_calls, 0)
+            rows = [
+                json.loads(line)
+                for line in (memory_root / "sessions" / "sess_cancel_empty.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["role"], "user")
+            self.assertEqual(rows[0]["metadata"], {})
+            self.assertEqual(session._active_turn_user_text, "")
+            self.assertEqual(session._active_turn_reference_time, "")
+
     def test_stream_persists_trace_with_one_reference_timestamp_and_two_rows(self) -> None:
         class StreamToolModel:
             def __init__(self) -> None:
