@@ -223,6 +223,7 @@ class TemporalRetrievalTest(unittest.TestCase):
         result = search_temporal_records(query, records, "面试安排", KeywordEmbedder(), 3)
 
         matches = result["queries"][0]["matches"]
+        self.assertEqual(result["candidate_count"], 3)
         self.assertEqual([item["record_id"] for item in matches], ["evt_interview", "turn_multi", "turn_multi"])
         self.assertEqual([item["matched_time_field"] for item in matches[1:]], ["created_at", "updated_at"])
         self.assertEqual([item["semantic_score"] for item in matches], [1.0, 0.0, 0.0])
