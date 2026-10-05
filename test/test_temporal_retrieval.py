@@ -25,6 +25,16 @@ class MalformedEmbedder:
 
 
 class TemporalRetrievalTest(unittest.TestCase):
+    def test_timezone_overflow_returns_indexed_query_validation_error(self) -> None:
+        valid = {"start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00"}
+        for field, extreme in (("start_at", "0001-01-01T00:00:00+14:00"),
+                               ("end_at", "9999-12-31T23:59:59-12:00")):
+            with self.subTest(field=field):
+                with self.assertRaises(TemporalQueryValidationError) as caught:
+                    parse_time_queries([valid, {**valid, field: extreme}])
+                self.assertEqual(caught.exception.code, "INVALID_ISO_TIME")
+                self.assertEqual(caught.exception.query_index, 1)
+
     def test_normalizes_query_timezone_without_losing_subsecond_interval(self) -> None:
         queries = parse_time_queries([{
             "original_expression": "瞬间",
