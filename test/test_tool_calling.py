@@ -46,9 +46,11 @@ class ToolCallingTest(unittest.TestCase):
 
                 manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
                 model = ToolThenEmptyModel()
+                logs = []
                 session = ChatSession(
                     model=model, system_prompt="test", generation=GenerationConfig(),
                     memory_manager=manager, session_id="sess_retry_context",
+                    debug=True, debug_sink=logs.append,
                     tool_registry=ToolRegistry([ToolSpec(
                         name="write_note", description="test",
                         parameters={"type": "object", "properties": {}}, handler=write_note,
@@ -75,6 +77,9 @@ class ToolCallingTest(unittest.TestCase):
                 self.assertEqual(turn["turn_id"], f"turn_{rows[0]['id']}")
                 self.assertEqual(turn["assistant_message_id"], rows[1]["id"])
                 self.assertEqual([item["tool_call_id"] for item in turn["tool_interactions"]], ["call_write"])
+                tool_log = next(line for line in logs if "tool_call " in line)
+                self.assertIn(f"turn_id={turn['turn_id']}", tool_log)
+                self.assertIn("tool_call_id=call_write", tool_log)
 
     def test_empty_tool_stream_retry_uses_agent_loop_and_records_trace(self) -> None:
         class EmptyThenToolModel:
