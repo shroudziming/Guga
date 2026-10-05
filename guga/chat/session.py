@@ -447,6 +447,7 @@ class ChatSession:
         self._debug(
             "tool_call "
             f"round={round_index + 1} name={call.name} ok={bool(result.get('ok'))} "
+            f"turn_id={trace.turn_id} tool_call_id={call.id} "
             f"args={json.dumps(call.arguments, ensure_ascii=False)}"
         )
         return result
