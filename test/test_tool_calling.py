@@ -12,6 +12,70 @@ from guga.types import GenerationConfig
 
 
 class ToolCallingTest(unittest.TestCase):
+    def test_empty_answer_retry_preserves_tool_results_without_repeating_side_effects(self) -> None:
+        class ToolThenEmptyModel:
+            def __init__(self) -> None:
+                self.responses = 0
+                self.requests = []
+
+            def generate_reply_with_tools(self, messages, gen, tools):
+                self.requests.append([dict(message) for message in messages])
+                self.responses += 1
+                if not any(message["role"] == "tool" for message in messages):
+                    return ToolModelResponse(content="", tool_calls=[
+                        ToolCall(id="call_write", name="write_note", arguments={}),
+                    ])
+                return ToolModelResponse(
+                    content="" if self.responses == 2 else "写入完成。", tool_calls=[],
+                )
+
+            def generate_reply_with_tools_stream(self, messages, gen, tools, cancel_event=None):
+                response = self.generate_reply_with_tools(messages, gen, tools)
+                if response.content:
+                    yield ToolStreamText(response.content)
+                if response.tool_calls:
+                    yield ToolStreamToolCalls(response.tool_calls)
+
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming), tempfile.TemporaryDirectory() as tmp:
+                writes = []
+
+                def write_note(args):
+                    writes.append("note")
+                    return {"result": "note saved"}
+
+                manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+                model = ToolThenEmptyModel()
+                session = ChatSession(
+                    model=model, system_prompt="test", generation=GenerationConfig(),
+                    memory_manager=manager, session_id="sess_retry_context",
+                    tool_registry=ToolRegistry([ToolSpec(
+                        name="write_note", description="test",
+                        parameters={"type": "object", "properties": {}}, handler=write_note,
+                    )]),
+                )
+                reference = "2026-08-19T10:00:00+08:00"
+                answer = (
+                    "".join(session.reply_stream("保存笔记", created_at=reference)) if streaming
+                    else session.reply("保存笔记", finalize_memory=False, created_at=reference)
+                )
+                manager.wait_for_background_tasks(timeout=3)
+                self.assertEqual(answer, "写入完成。")
+                self.assertEqual(writes, ["note"])
+                self.assertEqual([message["role"] for message in model.requests[2]],
+                                 ["system", "user", "assistant", "tool"])
+                self.assertIn("note saved", model.requests[2][-1]["content"])
+                self.assertEqual(model.requests[2][-1]["tool_call_id"], "call_write")
+                self.assertTrue(all(f"reference_time={reference}" in request[0]["content"]
+                                    for request in model.requests))
+                rows = [json.loads(line) for line in
+                        (Path(tmp) / "sessions" / "sess_retry_context.jsonl").read_text(encoding="utf-8").splitlines()]
+                self.assertEqual([row["created_at"] for row in rows], [reference, reference])
+                turn = rows[0]["metadata"]["turn"]
+                self.assertEqual(turn["turn_id"], f"turn_{rows[0]['id']}")
+                self.assertEqual(turn["assistant_message_id"], rows[1]["id"])
+                self.assertEqual([item["tool_call_id"] for item in turn["tool_interactions"]], ["call_write"])
+
     def test_empty_tool_stream_retry_uses_agent_loop_and_records_trace(self) -> None:
         class EmptyThenToolModel:
             def __init__(self) -> None:
