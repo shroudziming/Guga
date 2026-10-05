@@ -121,10 +121,12 @@ def search_temporal_records(
     top_k: int,
 ) -> dict[str, Any]:
     ranking_degraded = False
+    candidate_count = 0
     query_results: list[dict[str, Any]] = []
 
     for query in queries:
         candidates = _matching_candidates(query, records)
+        candidate_count += len(candidates)
         if embedder is not None and candidates:
             try:
                 vectors = embedder.encode([semantic_query] + [item["text"] for item in candidates])
@@ -145,7 +147,7 @@ def search_temporal_records(
             }
         )
 
-    return {"queries": query_results, "ranking_degraded": ranking_degraded}
+    return {"queries": query_results, "ranking_degraded": ranking_degraded, "candidate_count": candidate_count}
 
 
 def _matching_candidates(
