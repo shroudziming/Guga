@@ -336,7 +336,8 @@ class ChatSession:
         if not self._can_use_tools():
             return self.model.generate_reply(messages, gen)
 
-        tool_messages = [dict(message) for message in messages]
+        # Keep tool results in the turn-owned list so an empty-answer retry resumes it.
+        tool_messages = messages
         tools = self.tool_registry.openai_tools()
         generate_with_tools = getattr(self.model, "generate_reply_with_tools")
         for round_index in range(self.max_tool_rounds):
@@ -380,7 +381,8 @@ class ChatSession:
         trace: TurnTrace,
         cancel_event: Event | None = None,
     ) -> Iterator[str]:
-        tool_messages = [dict(message) for message in messages]
+        # Share the same accumulated context with the synchronous retry path.
+        tool_messages = messages
         tools = self.tool_registry.openai_tools()
         generate_stream_with_tools = getattr(self.model, "generate_reply_with_tools_stream")
 
