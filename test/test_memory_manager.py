@@ -130,6 +130,34 @@ class MemoryManagerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_time_search_skips_overflowing_stored_times_and_falls_back_for_recency(self) -> None:
+        query = {"start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00"}
+        valid_event = {
+            "id": "evt_valid", "description": "有效安排", **query,
+            "updated_at": "2026-08-19T10:00:00+08:00",
+        }
+        for extreme in ("0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-12:00"):
+            for field in ("start_at", "end_at", "created_at", "updated_at"):
+                with self.subTest(extreme=extreme, field=field):
+                    events = [valid_event]
+                    if field != "created_at":
+                        events.append({**valid_event, "id": "evt_bad", field: extreme})
+                    self.manager.semantic_event_file.write_text(
+                        "\n".join(json.dumps(row) for row in events) + "\n", encoding="utf-8",
+                    )
+                    (self.memory_root / "sessions" / "extreme.jsonl").write_text(
+                        json.dumps({"id": "msg_bad", "role": "user", "content": "无效创建时间",
+                                    "created_at": extreme}) + "\n" if field == "created_at" else "",
+                        encoding="utf-8",
+                    )
+                    result = self.manager.search_time_context(
+                        session_id="sess_now", user_text="安排", reference_time="2026-08-19T10:00:00+08:00",
+                        time_queries=[query],
+                    )
+                    self.assertTrue(result["ok"])
+                    expected_ids = ["evt_valid", "evt_bad"] if field == "updated_at" else ["evt_valid"]
+                    self.assertEqual([match["record_id"] for match in result["queries"][0]["matches"]], expected_ids)
+
     def test_search_time_context_reads_layers_and_preserves_event_lifecycle(self) -> None:
         event = {
             "id": "evt_interview",
