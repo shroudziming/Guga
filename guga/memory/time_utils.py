@@ -42,12 +42,10 @@ def format_beijing(value: datetime) -> str:
 
 
 def parse_datetime(value: str | datetime | None) -> datetime | None:
-    if isinstance(value, datetime):
-        return value.astimezone(BEIJING_TZ) if value.tzinfo else value.replace(tzinfo=BEIJING_TZ)
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(str(value))
+        parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
     except ValueError:
         match = re.fullmatch(
             r"\s*(\d{4})/(\d{1,2})/(\d{1,2})\s+\([^)]*\)\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*",
@@ -67,7 +65,10 @@ def parse_datetime(value: str | datetime | None) -> datetime | None:
             )
         except ValueError:
             return None
-    return parsed.astimezone(BEIJING_TZ) if parsed.tzinfo else parsed.replace(tzinfo=BEIJING_TZ)
+    try:
+        return parsed.astimezone(BEIJING_TZ) if parsed.tzinfo else parsed.replace(tzinfo=BEIJING_TZ)
+    except OverflowError:
+        return None
 
 
 def day_bucket(value: str | datetime | None) -> str:
