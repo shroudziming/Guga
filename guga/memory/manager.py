@@ -263,9 +263,13 @@ class MemoryManager:
                     "status": "success",
                     "reference_time": reference_time,
                     "time_queries": [query.as_dict() for query in queries],
-                    "candidate_count": len(records),
+                    "candidate_count": result["candidate_count"],
                     "returned_memory_ids": returned_ids,
-                    "ranking_model": DEFAULT_RAG_EMBEDDING_MODEL,
+                    "ranking_model": (
+                        getattr(embedder, "model_name", type(embedder).__name__)
+                        if embedder is not None and result["candidate_count"]
+                        else "deterministic_fallback"
+                    ),
                     "ranking_degraded": result["ranking_degraded"],
                     "duration_ms": elapsed_ms,
                 },
