@@ -130,6 +130,41 @@ class MemoryManagerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
+    def test_time_search_logs_matched_field_count_and_actual_ranking_backend(self) -> None:
+        query = {"start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00"}
+        row = {
+            "id": "msg_match", "role": "user", "content": "最相关安排",
+            "created_at": "2026-08-20T10:00:00+08:00",
+            "metadata": {"turn": {"temporal_context": {"time_queries": [query]}}},
+        }
+        (self.memory_root / "sessions" / "match.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+        self.manager.semantic_event_file.write_text(json.dumps({
+            "id": "evt_outside", "description": "不在范围内",
+            "start_at": "2026-08-22T00:00:00+08:00", "end_at": "2026-08-23T00:00:00+08:00",
+        }) + "\n", encoding="utf-8")
+        logs = []
+        self.manager.debug = True
+        self.manager.debug_sink = logs.append
+        self.manager.top_k = 1
+        for semantic, empty in ((False, False), (True, False), (True, True)):
+            with self.subTest(semantic=semantic, empty=empty):
+                logs.clear()
+                self.manager.rag_pipeline = RagWithEmbedder() if semantic else None
+                result = self.manager.search_time_context(
+                    session_id="sess_log", user_text="查询安排", reference_time="2026-08-19T10:00:00+08:00",
+                    time_queries=[query if not empty else {
+                        "start_at": "2026-08-24T00:00:00+08:00", "end_at": "2026-08-25T00:00:00+08:00",
+                    }] * 2,
+                )
+                event = json.loads(next(line.split("time_search ", 1)[1] for line in logs if "time_search " in line))
+                self.assertEqual(event["candidate_count"], 0 if empty else 4)
+                self.assertEqual(event["ranking_model"], "LayerRankingEmbedder" if semantic and not empty else "deterministic_fallback")
+                self.assertFalse(event["ranking_degraded"])
+                self.assertFalse(result["ranking_degraded"])
+                self.assertEqual([len(group["matches"]) for group in result["queries"]], [0, 0] if empty else [1, 1])
+                if not empty:
+                    self.assertEqual(result["queries"][0]["matches"][0]["semantic_score"], 1.0 if semantic else None)
+
     def test_time_search_skips_overflowing_stored_times_and_falls_back_for_recency(self) -> None:
         query = {"start_at": "2026-08-20T00:00:00+08:00", "end_at": "2026-08-21T00:00:00+08:00"}
         valid_event = {
