@@ -205,9 +205,10 @@ class TemporalRetrievalTest(unittest.TestCase):
                 "time_values": [
                     {"start_at": "2026-08-20T09:00:00+08:00", "end_at": None, "is_point": True, "open_end": False, "matched_time_field": "created_at", "time_meaning": "消息创建时间"},
                     {"start_at": "2026-08-20T10:00:00+08:00", "end_at": None, "is_point": True, "open_end": False, "matched_time_field": "updated_at", "time_meaning": "消息更新时间"},
+                    {"start_at": "2026-08-20T11:00:00+08:00", "end_at": None, "is_point": True, "open_end": False, "matched_time_field": "valid_at", "time_meaning": "事实生效时间"},
                 ],
                 "updated_at": "2026-08-20T10:00:00+08:00",
-                "time_fields": {"created_at": "2026-08-20T09:00:00+08:00", "updated_at": "2026-08-20T10:00:00+08:00"},
+                "time_fields": {"created_at": "2026-08-20T09:00:00+08:00", "updated_at": "2026-08-20T10:00:00+08:00", "valid_at": "2026-08-20T11:00:00+08:00"},
             },
             {
                 "record_type": "semantic_event",
@@ -223,7 +224,7 @@ class TemporalRetrievalTest(unittest.TestCase):
         result = search_temporal_records(query, records, "面试安排", KeywordEmbedder(), 3)
 
         matches = result["queries"][0]["matches"]
-        self.assertEqual(result["candidate_count"], 3)
+        self.assertEqual(result["candidate_count"], 4)
         self.assertEqual([item["record_id"] for item in matches], ["evt_interview", "turn_multi", "turn_multi"])
         self.assertEqual([item["matched_time_field"] for item in matches[1:]], ["created_at", "updated_at"])
         self.assertEqual([item["semantic_score"] for item in matches], [1.0, 0.0, 0.0])
