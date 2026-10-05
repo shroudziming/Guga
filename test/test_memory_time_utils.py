@@ -4,11 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime
 
 from guga.memory.consolidation import MemoryConsolidationConfig
 from guga.memory.manager import MemoryManager
 from guga.memory.summarizer import MemoryBankSummarizer
-from guga.memory.time_utils import extract_semantic_time
+from guga.memory.time_utils import extract_semantic_time, parse_datetime
 from guga.tools import default_tool_registry
 
 
@@ -88,6 +89,12 @@ class SummaryModel:
 
 
 class MemoryTimeUtilsTest(unittest.TestCase):
+    def test_parse_datetime_returns_none_when_timezone_normalization_overflows(self) -> None:
+        for raw in ("0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-12:00"):
+            for value in (raw, datetime.fromisoformat(raw)):
+                with self.subTest(value=value):
+                    self.assertIsNone(parse_datetime(value))
+
     def test_extract_semantic_time_uses_reference_time_for_relative_weekday(self) -> None:
         result = extract_semantic_time("我下周三要和导师见面", reference_time="2026-06-12T17:09:37+08:00")
 
