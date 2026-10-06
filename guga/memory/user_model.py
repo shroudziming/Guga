@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
-from guga.memory_sources import normalize_memory_sources, normalize_payload_sources
+from guga.memory_sources import normalize_memory_sources
 from guga.memory.time_utils import now_beijing_iso
 
 
@@ -23,11 +23,16 @@ class GugaUserModelStore:
         payload.setdefault("schema_version", 1)
         payload.setdefault("updated_at", "")
         payload.setdefault("insights", [])
-        payload["insights"] = [
-            normalize_payload_sources(item)
-            for item in payload["insights"]
-            if isinstance(item, dict)
-        ]
+        insights: list[dict] = []
+        for item in payload["insights"]:
+            if not isinstance(item, dict):
+                continue
+            if "source_event_ids" in item:
+                raise ValueError("source_event_ids is no longer supported")
+            normalized = dict(item)
+            normalized["sources"] = normalize_memory_sources(item.get("sources"))
+            insights.append(normalized)
+        payload["insights"] = insights
         return payload
 
     def apply_operations(self, operations: list[dict]) -> list[dict]:
@@ -41,6 +46,8 @@ class GugaUserModelStore:
             action = str(operation.get("operation", "upsert")).strip()
             if action not in {"upsert", "deactivate"}:
                 raise ValueError(f"unsupported user model operation: {action}")
+            if "source_event_ids" in operation:
+                raise ValueError("source_event_ids is no longer supported")
             if action == "deactivate":
                 target_id = str(operation.get("id", "")).strip()
                 for insight in insights:
@@ -55,10 +62,7 @@ class GugaUserModelStore:
             stability = str(operation.get("stability", "")).strip()
             if not statement or not kind or not stability:
                 raise ValueError("user model upsert requires statement, kind, and stability")
-            sources = normalize_memory_sources(
-                operation.get("sources"),
-                legacy_event_ids=operation.get("source_event_ids"),
-            )
+            sources = normalize_memory_sources(operation.get("sources"))
             insight_id = str(operation.get("id", "")).strip() or f"gum_{uuid4().hex}"
             insight = {
                 "id": insight_id,

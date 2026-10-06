@@ -115,8 +115,8 @@ class RagPipelineTest(unittest.TestCase):
             (memory_root / "archival_memory.jsonl").write_text(
                 "\n".join(
                     [
-                        json.dumps({"id": "mem_current", "summary": "当前额度", "source_event_ids": ["evt_active"], "status": "active"}),
-                        json.dumps({"id": "mem_old", "summary": "旧额度", "source_event_ids": ["evt_old"], "status": "active"}),
+                        json.dumps({"id": "mem_current", "summary": "当前额度", "sources": [{"type": "semantic_event", "id": "evt_active"}], "status": "active"}),
+                        json.dumps({"id": "mem_old", "summary": "旧额度", "sources": [{"type": "semantic_event", "id": "evt_old"}], "status": "active"}),
                     ]
                 )
                 + "\n",
@@ -172,7 +172,7 @@ class RagPipelineTest(unittest.TestCase):
                 encoding="utf-8",
             )
             (memory_root / "archival_memory.jsonl").write_text(
-                json.dumps({"id": "mem_old", "summary": "旧安排", "source_event_ids": ["evt_old"], "status": "active"}) + "\n",
+                json.dumps({"id": "mem_old", "summary": "旧安排", "sources": [{"type": "semantic_event", "id": "evt_old"}], "status": "active"}) + "\n",
                 encoding="utf-8",
             )
             pipeline = RagPipeline(

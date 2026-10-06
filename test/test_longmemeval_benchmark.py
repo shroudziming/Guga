@@ -271,7 +271,7 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                                     "summary": "User likes blue notebooks.",
                                     "importance": 0.8,
                                     "confidence": 0.9,
-                                    "source_event_ids": [event_match.group(1)] if event_match else [],
+                                    "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                                 }
                             ],
                             "user_model_operations": [],

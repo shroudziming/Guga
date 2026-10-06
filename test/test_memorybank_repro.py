@@ -45,7 +45,7 @@ class SummaryModel:
                     {
                         "decision": "update_high_level_memory",
                         "archival_operations": [
-                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9, "source_event_ids": event_ids}
+                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9, "sources": [{"type": "semantic_event", "id": event_id} for event_id in event_ids]}
                         ],
                         "user_model_operations": [],
                         "reason": "identity",
@@ -61,7 +61,7 @@ class SummaryModel:
                             "summary": "用户提到深圳工作和不喜欢说教式安慰",
                             "importance": 0.8,
                             "confidence": 0.9,
-                            "source_event_ids": event_ids,
+                            "sources": [{"type": "semantic_event", "id": event_id} for event_id in event_ids],
                         }
                     ],
                     "user_model_operations": [],
@@ -148,7 +148,7 @@ class MemoryBankReproTest(unittest.TestCase):
                                     "summary": "The user works as a backend engineer in Hangzhou.",
                                     "importance": 0.9,
                                     "confidence": 0.8,
-                                    "source_event_ids": [event_match.group(1)] if event_match else [],
+                                    "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                                 }
                             ],
                             "user_model_operations": [],

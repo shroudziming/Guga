@@ -18,10 +18,7 @@ def uses_only_active_event_sources(payload: dict, active_ids: set[str]) -> bool:
     if payload.get("type") == "semantic_event":
         return str(payload.get("id", "")) in active_ids
 
-    sources = normalize_memory_sources(
-        payload.get("sources"),
-        legacy_event_ids=payload.get("source_event_ids"),
-    )
+    sources = normalize_memory_sources(payload.get("sources"))
     source_ids = [item["id"] for item in sources if item["type"] == "semantic_event"]
     if source_ids and not set(source_ids).issubset(active_ids):
         return False

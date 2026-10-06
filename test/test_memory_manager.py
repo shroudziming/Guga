@@ -58,7 +58,7 @@ class SummaryModel:
                             "summary": "用户叫小明，在深圳工作",
                             "importance": 0.8,
                             "confidence": 0.9,
-                            "source_event_ids": [event_match.group(1)] if event_match else [],
+                            "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                         }
                     ],
                     "user_model_operations": [
@@ -68,7 +68,7 @@ class SummaryModel:
                             "kind": "work_context",
                             "confidence": 0.9,
                             "stability": "explicit",
-                            "source_event_ids": [event_match.group(1)] if event_match else [],
+                            "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                         }
                     ],
                     "reason": "stable profile",
@@ -711,7 +711,7 @@ class MemoryManagerTest(unittest.TestCase):
                         {
                             "id": "gum_cancelled",
                             "statement": "用户正在安排看牙。",
-                            "source_event_ids": ["evt_cancelled"],
+                            "sources": [{"type": "semantic_event", "id": "evt_cancelled"}],
                             "status": "active",
                         }
                     ],
@@ -843,7 +843,7 @@ class MemoryManagerTest(unittest.TestCase):
                             "kind": "identity",
                             "confidence": 0.9,
                             "stability": "explicit",
-                            "source_event_ids": ["evt_identity"],
+                            "sources": [{"type": "semantic_event", "id": "evt_identity"}],
                             "status": "active",
                             "updated_at": "2026-06-28T01:35:00+08:00",
                         }

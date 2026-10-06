@@ -358,8 +358,8 @@ class MemoryQualityPlanTest(unittest.TestCase):
                         "schema_version": 1,
                         "updated_at": "2026-06-12T00:00:00+08:00",
                         "insights": [
-                            {"id": "gum_identity", "statement": "用户自称叔本明。", "kind": "identity", "confidence": 0.9, "stability": "explicit", "source_event_ids": ["evt_identity"], "status": "active", "updated_at": "2026-06-12T00:00:00+08:00"},
-                            {"id": "gum_interest", "statement": "用户想练蝴蝶刀。", "kind": "interest", "confidence": 0.8, "stability": "recurring", "source_event_ids": ["evt_interest"], "status": "active", "updated_at": "2026-06-12T00:00:00+08:00"},
+                            {"id": "gum_identity", "statement": "用户自称叔本明。", "kind": "identity", "confidence": 0.9, "stability": "explicit", "sources": [{"type": "semantic_event", "id": "evt_identity"}], "status": "active", "updated_at": "2026-06-12T00:00:00+08:00"},
+                            {"id": "gum_interest", "statement": "用户想练蝴蝶刀。", "kind": "interest", "confidence": 0.8, "stability": "recurring", "sources": [{"type": "semantic_event", "id": "evt_interest"}], "status": "active", "updated_at": "2026-06-12T00:00:00+08:00"},
                         ],
                     },
                     ensure_ascii=False,

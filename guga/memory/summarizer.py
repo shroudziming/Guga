@@ -526,12 +526,9 @@ class MemoryBankSummarizer:
             for index, operation in enumerate(parsed[key]):
                 if not isinstance(operation, dict):
                     raise SummaryGenerationError(f"{key}[{index}] must be an object")
+                if "source_event_ids" in operation:
+                    raise SummaryGenerationError(f"{key}[{index}].source_event_ids is no longer supported")
                 raw_sources = operation.get("sources")
-                if raw_sources is None and "source_event_ids" in operation:
-                    raw_sources = [
-                        {"type": "semantic_event", "id": source_id}
-                        for source_id in (operation.get("source_event_ids") or [])
-                    ]
                 if raw_sources is None:
                     raw_sources = []
                 if not isinstance(raw_sources, list):
@@ -546,7 +543,6 @@ class MemoryBankSummarizer:
                     if source_id not in valid_ids[source_type]:
                         raise SummaryGenerationError(f"{key}[{index}].sources[{source_index}] contains unknown source")
                 operation["sources"] = normalize_memory_sources(raw_sources)
-                operation.pop("source_event_ids", None)
         parsed["reason"] = str(parsed.get("reason", "")).strip()
         return parsed
 

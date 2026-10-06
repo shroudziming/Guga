@@ -62,7 +62,11 @@ class ConsolidationModel:
             packet_text = prompt.split("Input packet:\n", 1)[1]
             packet, _ = json.JSONDecoder().raw_decode(packet_text)
             self.high_packets.append(packet)
-            source_event_ids = [str(packet["semantic_events"][-1]["id"])] if packet.get("semantic_events") else []
+            sources = (
+                [{"type": "semantic_event", "id": str(packet["semantic_events"][-1]["id"])}]
+                if packet.get("semantic_events")
+                else []
+            )
             if self.high_decision == "no_high_level_update":
                 return json.dumps(
                     {
@@ -81,7 +85,7 @@ class ConsolidationModel:
                             "summary": "The user has a project report deadline.",
                             "importance": 0.8,
                             "confidence": 0.88,
-                            "source_event_ids": source_event_ids,
+                            "sources": sources,
                         }
                     ],
                     "user_model_operations": [
@@ -91,7 +95,7 @@ class ConsolidationModel:
                             "kind": "reminder_pattern",
                             "confidence": 0.8,
                             "stability": "recurring",
-                            "source_event_ids": source_event_ids,
+                            "sources": sources,
                         }
                     ],
                     "reason": "The low-level memories contain a stable reminder preference.",
@@ -345,8 +349,8 @@ class MemoryConsolidationTest(unittest.TestCase):
             (root / "archival_memory.jsonl").write_text(
                 "\n".join(
                     [
-                        json.dumps({"id": "mem_current", "summary": "当前额度", "source_event_ids": [active_id], "status": "active"}),
-                        json.dumps({"id": "mem_cancelled", "summary": "周日看牙", "source_event_ids": [cancelled_id], "status": "active"}),
+                        json.dumps({"id": "mem_current", "summary": "当前额度", "sources": [{"type": "semantic_event", "id": active_id}], "status": "active"}),
+                        json.dumps({"id": "mem_cancelled", "summary": "周日看牙", "sources": [{"type": "semantic_event", "id": cancelled_id}], "status": "active"}),
                     ]
                 )
                 + "\n",
@@ -779,6 +783,39 @@ class MemoryConsolidationTest(unittest.TestCase):
             ],
         )
         self.assertEqual(result["user_model_operations"][0]["sources"], [])
+
+    def test_high_level_rejects_legacy_source_event_ids(self) -> None:
+        class LegacySourceModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return json.dumps(
+                    {
+                        "decision": "update_high_level_memory",
+                        "archival_operations": [
+                            {
+                                "topic": "legacy",
+                                "summary": "旧来源格式。",
+                                "importance": 0.5,
+                                "confidence": 0.5,
+                                "source_event_ids": ["evt_1"],
+                            }
+                        ],
+                        "user_model_operations": [],
+                        "reason": "旧格式",
+                    }
+                )
+
+        summarizer = MemoryBankSummarizer(model=LegacySourceModel(), use_llm=True, retry_delays=())
+
+        with self.assertRaisesRegex(SummaryGenerationError, "source_event_ids is no longer supported"):
+            summarizer.consolidate_high_level_memory(
+                {
+                    "semantic_events": [{"id": "evt_1", "source_message_ids": []}],
+                    "event_summaries": [],
+                    "archival_memory": [],
+                    "guga_user_model": {"insights": []},
+                }
+            )
 
     def test_create_discards_model_supplied_target_event_id(self) -> None:
         class CreateModel:
