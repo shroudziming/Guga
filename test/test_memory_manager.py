@@ -1038,7 +1038,9 @@ class MemoryManagerTest(unittest.TestCase):
         payload = json.loads(archival_file.read_text(encoding="utf-8").splitlines()[-1])
         self.assertEqual(payload["type"], "episodic")
         self.assertEqual(payload["status"], "active")
-        self.assertTrue(payload["source_event_ids"])
+        self.assertTrue(payload["sources"])
+        self.assertEqual(payload["sources"][0]["type"], "semantic_event")
+        self.assertNotIn("source_event_ids", payload)
 
 
 if __name__ == "__main__":

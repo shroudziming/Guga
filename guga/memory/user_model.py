@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from guga.memory_sources import normalize_memory_sources, normalize_payload_sources
 from guga.memory.time_utils import now_beijing_iso
 
 
@@ -22,6 +23,11 @@ class GugaUserModelStore:
         payload.setdefault("schema_version", 1)
         payload.setdefault("updated_at", "")
         payload.setdefault("insights", [])
+        payload["insights"] = [
+            normalize_payload_sources(item)
+            for item in payload["insights"]
+            if isinstance(item, dict)
+        ]
         return payload
 
     def apply_operations(self, operations: list[dict]) -> list[dict]:
@@ -35,7 +41,6 @@ class GugaUserModelStore:
             action = str(operation.get("operation", "upsert")).strip()
             if action not in {"upsert", "deactivate"}:
                 raise ValueError(f"unsupported user model operation: {action}")
-            source_event_ids = _event_ids(operation.get("source_event_ids"))
             if action == "deactivate":
                 target_id = str(operation.get("id", "")).strip()
                 for insight in insights:
@@ -48,8 +53,12 @@ class GugaUserModelStore:
             statement = str(operation.get("statement", "")).strip()
             kind = str(operation.get("kind", "")).strip()
             stability = str(operation.get("stability", "")).strip()
-            if not statement or not kind or not stability or not source_event_ids:
-                raise ValueError("user model upsert requires statement, kind, stability, and source_event_ids")
+            if not statement or not kind or not stability:
+                raise ValueError("user model upsert requires statement, kind, and stability")
+            sources = normalize_memory_sources(
+                operation.get("sources"),
+                legacy_event_ids=operation.get("source_event_ids"),
+            )
             insight_id = str(operation.get("id", "")).strip() or f"gum_{uuid4().hex}"
             insight = {
                 "id": insight_id,
@@ -57,7 +66,7 @@ class GugaUserModelStore:
                 "kind": kind,
                 "confidence": _clamp(operation.get("confidence"), 0.7),
                 "stability": stability,
-                "source_event_ids": source_event_ids,
+                "sources": sources,
                 "status": "active",
                 "updated_at": now,
             }
@@ -68,25 +77,12 @@ class GugaUserModelStore:
             else:
                 insights.append(insight)
             written.append(insight)
+        model["schema_version"] = 2
         model["insights"] = insights
         model["updated_at"] = now
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         self.file_path.write_text(json.dumps(model, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return written
-
-
-def _event_ids(value: object) -> list[str]:
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, list):
-        return []
-    result: list[str] = []
-    for item in value:
-        event_id = str(item).strip()
-        if event_id and event_id not in result:
-            result.append(event_id)
-    return result
-
 
 def _clamp(value: object, fallback: float) -> float:
     try:

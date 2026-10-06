@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from guga.memory_sources import normalize_memory_sources
+
 
 def active_event_ids(events: list[dict]) -> set[str]:
     return {
@@ -16,9 +18,13 @@ def uses_only_active_event_sources(payload: dict, active_ids: set[str]) -> bool:
     if payload.get("type") == "semantic_event":
         return str(payload.get("id", "")) in active_ids
 
-    if "source_event_ids" in payload:
-        source_ids = _ids(payload.get("source_event_ids"))
-        return bool(source_ids) and set(source_ids).issubset(active_ids)
+    sources = normalize_memory_sources(
+        payload.get("sources"),
+        legacy_event_ids=payload.get("source_event_ids"),
+    )
+    source_ids = [item["id"] for item in sources if item["type"] == "semantic_event"]
+    if source_ids and not set(source_ids).issubset(active_ids):
+        return False
 
     if payload.get("type") == "event_summary":
         if _ids(payload.get("deactivated_event_ids")):

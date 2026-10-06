@@ -9,6 +9,7 @@ from time import perf_counter
 from collections.abc import Sequence
 from typing import Any
 
+from guga.memory_sources import ALLOWED_MEMORY_SOURCE_TYPES, normalize_memory_sources
 from guga.types import GenerationConfig
 
 
@@ -261,14 +262,15 @@ class MemoryBankSummarizer:
             "{"
             "\"decision\": \"update_high_level_memory|no_high_level_update\", "
             "\"archival_operations\": [{\"topic\": string, \"summary\": string, \"importance\": number, "
-            "\"confidence\": number, \"source_event_ids\": [string]}], "
+            "\"confidence\": number, \"sources\": [{\"type\": \"semantic_event|event_summary|message\", \"id\": string}]}], "
             "\"user_model_operations\": [{\"operation\": \"upsert|deactivate\", \"statement\": string, "
-            "\"kind\": string, \"confidence\": number, \"stability\": string, \"source_event_ids\": [string]}], "
+            "\"kind\": string, \"confidence\": number, \"stability\": string, \"sources\": [{\"type\": \"semantic_event|event_summary|message\", \"id\": string}]}], "
             "\"reason\": string"
             "}\n"
             "Rules:\n"
             "- Use only semantic_events and derived event_summaries in the packet.\n"
             "- Never infer directly from raw sessions or transcript text.\n"
+            "- sources is optional. Use an empty array when reliable provenance is unavailable; never invent or force an unrelated id.\n"
             "- Return no_high_level_update when there is no stable long-term value.\n\n"
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
@@ -500,15 +502,51 @@ class MemoryBankSummarizer:
             for event in (packet.get("semantic_events", []) or [])
             if isinstance(event, dict) and str(event.get("id", ""))
         }
+        valid_summary_ids = {
+            str(summary.get("id", ""))
+            for summary in (packet.get("event_summaries", []) or [])
+            if isinstance(summary, dict) and str(summary.get("id", ""))
+        }
+        valid_message_ids = {
+            str(message_id)
+            for item in [
+                *(packet.get("semantic_events", []) or []),
+                *(packet.get("event_summaries", []) or []),
+            ]
+            if isinstance(item, dict)
+            for message_id in (item.get("source_message_ids", []) or [])
+            if str(message_id)
+        }
+        valid_ids = {
+            "semantic_event": valid_event_ids,
+            "event_summary": valid_summary_ids,
+            "message": valid_message_ids,
+        }
         for key in ("archival_operations", "user_model_operations"):
             for index, operation in enumerate(parsed[key]):
                 if not isinstance(operation, dict):
                     raise SummaryGenerationError(f"{key}[{index}] must be an object")
-                ids = operation.get("source_event_ids", []) or []
-                if not isinstance(ids, list) or not ids:
-                    raise SummaryGenerationError(f"{key}[{index}].source_event_ids is required")
-                if any(str(value) not in valid_event_ids for value in ids):
-                    raise SummaryGenerationError(f"{key}[{index}].source_event_ids contains unknown event")
+                raw_sources = operation.get("sources")
+                if raw_sources is None and "source_event_ids" in operation:
+                    raw_sources = [
+                        {"type": "semantic_event", "id": source_id}
+                        for source_id in (operation.get("source_event_ids") or [])
+                    ]
+                if raw_sources is None:
+                    raw_sources = []
+                if not isinstance(raw_sources, list):
+                    raise SummaryGenerationError(f"{key}[{index}].sources must be an array")
+                for source_index, source in enumerate(raw_sources):
+                    if not isinstance(source, dict):
+                        raise SummaryGenerationError(f"{key}[{index}].sources[{source_index}] must be an object")
+                    source_type = str(source.get("type", "")).strip()
+                    source_id = str(source.get("id", "")).strip()
+                    if source_type not in ALLOWED_MEMORY_SOURCE_TYPES or not source_id:
+                        raise SummaryGenerationError(f"{key}[{index}].sources[{source_index}] is invalid")
+                    if source_id not in valid_ids[source_type]:
+                        raise SummaryGenerationError(f"{key}[{index}].sources[{source_index}] contains unknown source")
+                operation["sources"] = normalize_memory_sources(raw_sources)
+                operation.pop("source_event_ids", None)
         parsed["reason"] = str(parsed.get("reason", "")).strip()
         return parsed
 

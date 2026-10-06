@@ -32,6 +32,7 @@ from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.forgetting import normalize_memorybank_fields, refresh_jsonl_retention, reinforce_jsonl_records, retention_score
 from guga.memory.semantic_events import SemanticEventStore
 from guga.memory_source_validity import active_event_ids, uses_only_active_event_sources
+from guga.memory_sources import normalize_memory_sources, normalize_payload_sources
 from guga.memory.summarizer import MemoryBankSummarizer, SummaryGenerationError
 from guga.memory.temporal_retrieval import (
     TemporalQueryValidationError,
@@ -1011,7 +1012,7 @@ class MemoryManager:
                 if uses_only_active_event_sources(item, current_event_ids)
             ][-50:],
             "archival_memory": [
-                item
+                normalize_payload_sources(item)
                 for item in self._read_jsonl_records(self.archival_file)
                 if uses_only_active_event_sources(item, current_event_ids)
             ][-50:],
@@ -1161,9 +1162,10 @@ class MemoryManager:
         if not summary:
             return {}
         now = now_beijing_iso()
-        source_event_ids = [str(value) for value in (item.get("source_event_ids") or []) if str(value)]
-        if not source_event_ids:
-            return {}
+        sources = normalize_memory_sources(
+            item.get("sources"),
+            legacy_event_ids=item.get("source_event_ids"),
+        )
         return normalize_memorybank_fields(
             apply_temporal_fields(
                 {
@@ -1179,7 +1181,7 @@ class MemoryManager:
                     "memory_strength": 1,
                     "retention": 1.0,
                     "source_session_id": session_id,
-                    "source_event_ids": source_event_ids,
+                    "sources": sources,
                     "status": "active",
                 },
                 text=summary,

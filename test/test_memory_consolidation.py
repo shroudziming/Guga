@@ -721,6 +721,65 @@ class MemoryConsolidationTest(unittest.TestCase):
         self.assertEqual(model.calls, 2)
         self.assertEqual(summarizer.last_structured_attempts[0]["error_type"], "schema")
 
+    def test_high_level_sources_can_reference_summaries_and_messages_or_be_empty(self) -> None:
+        class UnifiedSourceModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return json.dumps(
+                    {
+                        "decision": "update_high_level_memory",
+                        "archival_operations": [
+                            {
+                                "topic": "memory_design",
+                                "summary": "用户希望记忆保留被修正的余地。",
+                                "importance": 0.8,
+                                "confidence": 0.9,
+                                "sources": [
+                                    {"type": "event_summary", "id": "summary_1"},
+                                    {"type": "message", "id": "msg_1"},
+                                ],
+                            }
+                        ],
+                        "user_model_operations": [
+                            {
+                                "operation": "upsert",
+                                "statement": "用户希望记忆保留被修正的余地。",
+                                "kind": "preference",
+                                "confidence": 0.9,
+                                "stability": "moderate",
+                                "sources": [],
+                            }
+                        ],
+                        "reason": "保留有价值的记忆设计偏好。",
+                    }
+                )
+
+        summarizer = MemoryBankSummarizer(model=UnifiedSourceModel(), use_llm=True, retry_delays=())
+
+        result = summarizer.consolidate_high_level_memory(
+            {
+                "semantic_events": [],
+                "event_summaries": [
+                    {
+                        "id": "summary_1",
+                        "summary": "用户希望记忆保留被修正的余地。",
+                        "source_message_ids": ["msg_1"],
+                    }
+                ],
+                "archival_memory": [],
+                "guga_user_model": {"insights": []},
+            }
+        )
+
+        self.assertEqual(
+            result["archival_operations"][0]["sources"],
+            [
+                {"type": "event_summary", "id": "summary_1"},
+                {"type": "message", "id": "msg_1"},
+            ],
+        )
+        self.assertEqual(result["user_model_operations"][0]["sources"], [])
+
     def test_create_discards_model_supplied_target_event_id(self) -> None:
         class CreateModel:
             def generate_reply(self, messages, gen):
