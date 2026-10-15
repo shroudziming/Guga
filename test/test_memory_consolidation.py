@@ -160,9 +160,11 @@ def _reflection_packet() -> dict:
 class FixedLowLevelModel:
     def __init__(self, reflection: dict | None) -> None:
         self.reflection = reflection
+        self.prompts: list[str] = []
 
     def generate_reply(self, messages, gen):
-        _ = messages, gen
+        _ = gen
+        self.prompts.append(messages[-1]["content"])
         operation = {
                         "operation": "create",
                         "event_kind": "task",
@@ -222,6 +224,85 @@ class MemoryConsolidationTest(unittest.TestCase):
         )
 
         self.assertNotIn("UNIQUE_SKILL_MARKER", model.prompts[0])
+
+    def test_low_level_prompt_declares_temporal_evidence_priority(self) -> None:
+        model = FixedLowLevelModel(None)
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
+
+        summarizer.consolidate_low_level_memory(
+            _reflection_packet(),
+            include_guga_reflection=False,
+        )
+
+        self.assertIn(
+            "later explicit user correction > explicit absolute user time > temporal_context > existing memory time > model inference",
+            model.prompts[0],
+        )
+
+    def test_low_level_packet_includes_persisted_turn_temporal_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+            user_id = manager.record_user_message(
+                "sess_temporal",
+                "我计划明天交报告。",
+                created_at="2026-07-15T12:00:00+08:00",
+            )
+            assistant_id = manager.record_assistant_message(
+                "sess_temporal",
+                "记住了。",
+                created_at="2026-07-15T12:00:01+08:00",
+            )
+            manager.attach_turn_metadata(
+                session_id="sess_temporal",
+                user_message_id=user_id,
+                metadata={
+                    "turn": {
+                        "turn_id": "turn_temporal",
+                        "assistant_message_id": assistant_id,
+                        "temporal_context": {
+                            "source_message_id": user_id,
+                            "reference_time": "2026-07-15T12:00:00+08:00",
+                            "time_queries": [
+                                {
+                                    "raw_text": "明天",
+                                    "start_at": "2026-07-16T00:00:00+08:00",
+                                    "end_at": "2026-07-17T00:00:00+08:00",
+                                    "granularity": "day",
+                                }
+                            ],
+                        },
+                        "tool_interactions": [
+                            {
+                                "tool_call_id": "call_time_1",
+                                "tool": "memory_time_search",
+                                "arguments": {"query": "明天"},
+                                "ok": True,
+                                "returned_memory_ids": ["evt_1"],
+                                "error": {},
+                            }
+                        ],
+                    }
+                },
+            )
+
+            packet = manager._build_low_level_packet(
+                session_id="sess_temporal",
+                pending_turns=[
+                    {
+                        "turn_id": "turn_temporal",
+                        "user_message_id": user_id,
+                        "assistant_message_id": assistant_id,
+                    }
+                ],
+            )
+
+            turn = packet["new_turns"][0]
+            self.assertEqual(turn["turn_id"], "turn_temporal")
+            self.assertEqual(
+                turn["temporal_context"]["time_queries"][0]["start_at"],
+                "2026-07-16T00:00:00+08:00",
+            )
+            self.assertEqual(turn["tool_interactions"][0]["tool_call_id"], "call_time_1")
 
     def test_reflection_rejects_missing_empty_or_extra_fields(self) -> None:
         invalid_reflections = (

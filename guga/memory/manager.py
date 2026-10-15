@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import os
+from copy import deepcopy
 from pathlib import Path
 from threading import RLock
 from time import perf_counter, sleep
@@ -1195,13 +1196,22 @@ class MemoryManager:
             assistant = by_id.get(str(turn.get("assistant_message_id", "")), {})
             if not user:
                 continue
+            user_metadata = dict(user.get("metadata", {}) or {})
+            turn_metadata = dict(user_metadata.get("turn", {}) or {})
             new_turns.append(
                 {
+                    "turn_id": str(
+                        turn_metadata.get("turn_id")
+                        or turn.get("turn_id")
+                        or f"turn_{user.get('id', '')}"
+                    ),
                     "user_message_id": str(user.get("id", "")),
                     "assistant_message_id": str(assistant.get("id", "")),
                     "created_at": str(user.get("created_at", "")),
                     "user_text": str(user.get("content", "")),
                     "assistant_text": str(assistant.get("content", "")),
+                    "temporal_context": dict(turn_metadata.get("temporal_context", {}) or {}),
+                    "tool_interactions": list(turn_metadata.get("tool_interactions", []) or []),
                 }
             )
         return new_turns
@@ -1244,21 +1254,14 @@ class MemoryManager:
         text = json.dumps(packet, ensure_ascii=False)
         if len(text) <= self.consolidation_config.max_packet_chars:
             return packet
-        trimmed = dict(packet)
-        for key in (
-            "retrieved_context",
-            "recent_active_events",
-            "relevant_active_events",
-            "personality_insights",
-        ):
-            value = trimmed.get(key)
-            if isinstance(value, list) and len(json.dumps(trimmed, ensure_ascii=False)) > self.consolidation_config.max_packet_chars:
-                trimmed[key] = value[-5:]
-        if len(json.dumps(trimmed, ensure_ascii=False)) > self.consolidation_config.max_packet_chars:
-            for turn in trimmed.get("new_turns", []) or []:
-                if isinstance(turn, dict):
-                    turn["user_text"] = str(turn.get("user_text", ""))[-2000:]
-                    turn["assistant_text"] = str(turn.get("assistant_text", ""))[-2000:]
+        trimmed = deepcopy(packet)
+        for turn in trimmed.get("new_turns", []) or []:
+            if isinstance(turn, dict):
+                turn["user_text"] = str(turn.get("user_text", ""))[-2000:]
+                turn["assistant_text"] = str(turn.get("assistant_text", ""))[-2000:]
+        for item in trimmed.get("retrieved_context", []) or []:
+            if isinstance(item, dict):
+                item["summary"] = str(item.get("summary", ""))[-1000:]
         return trimmed
 
     def _read_consolidation_state(self) -> dict:
