@@ -678,9 +678,13 @@ class MemoryManager:
         for future in futures:
             future.result(timeout=timeout)
 
-    def flush_session_memory(self, session_id: str) -> dict[str, int]:
+    def flush_session_memory(self, session_id: str, trigger_reason: str = "manual") -> dict[str, Any]:
         """Force consolidation for any pending completed turns in a session."""
-        return self._consolidate_pending_turns(session_id=session_id, force=True)
+        return self._consolidate_pending_turns(
+            session_id=session_id,
+            force=True,
+            trigger_reason=trigger_reason,
+        )
 
     def consolidate_until_settled(
         self,
@@ -691,7 +695,7 @@ class MemoryManager:
         progress: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Synchronously settle one session's ordered memory chain."""
-        result = self.flush_session_memory(session_id)
+        result = self.flush_session_memory(session_id, trigger_reason="exit")
         while not bool(result.get("memory_complete", False)):
             cycle = int(result.get("retry_cycle", 0) or 0)
             stage = str(result.get("pending_stage", ""))
@@ -705,7 +709,11 @@ class MemoryManager:
             if retry_delays:
                 delay_index = min(max(cycle - 1, 0), len(retry_delays) - 1)
                 sleep(max(float(retry_delays[delay_index]), 0.0))
-            result = self._consolidate_pending_turns(session_id=session_id, force=True)
+            result = self._consolidate_pending_turns(
+                session_id=session_id,
+                force=True,
+                trigger_reason="exit",
+            )
             if bool(result.get("memory_complete", False)) and progress is not None:
                 progress({"phase": "stage_retry_succeeded", "stage": stage, "cycle": cycle + 1})
         return result
@@ -731,7 +739,11 @@ class MemoryManager:
         elapsed_ms = int((perf_counter() - started) * 1000)
         self._debug(session_id, f"writeback status=pending_turn_added pending={pending_count} latency_ms={elapsed_ms}")
         if pending_count >= self.consolidation_config.batch_turns:
-            self._consolidate_pending_turns(session_id=session_id, force=False)
+            self._consolidate_pending_turns(
+                session_id=session_id,
+                force=False,
+                trigger_reason="interval",
+            )
 
     def _append_pending_turn(self, *, session_id: str, state: dict[str, Any]) -> int:
         if not state.get("user_message_id"):
@@ -740,20 +752,30 @@ class MemoryManager:
             payload = self._read_consolidation_state()
             session_state = self._session_consolidation_state(payload, session_id)
             target = "queued_turns" if isinstance(session_state.get("active_batch"), dict) else "pending_turns"
+            user_message_id = str(state.get("user_message_id", ""))
+            turn_id = str(state.get("turn_id") or f"turn_{user_message_id}")
             session_state[target].append(
                 {
-                    "user_message_id": state.get("user_message_id", ""),
+                    "turn_id": turn_id,
+                    "user_message_id": user_message_id,
                     "assistant_message_id": state.get("assistant_message_id", ""),
                     "session_memory_id": state.get("session_memory_id", ""),
                     "created_at": str(self._load_memory_by_id(self.session_memory_file, state.get("session_memory_id", "")).get("created_at", "")),
                 }
             )
             session_state["completed_turns"] = int(session_state.get("completed_turns", 0) or 0) + 1
+            session_state["last_completed_turn_id"] = turn_id
             pending_count = len(session_state[target])
             self._write_consolidation_state(payload)
             return pending_count
 
-    def _consolidate_pending_turns(self, *, session_id: str, force: bool) -> dict[str, Any]:
+    def _consolidate_pending_turns(
+        self,
+        *,
+        session_id: str,
+        force: bool,
+        trigger_reason: str,
+    ) -> dict[str, Any]:
         with self._turn_state_lock:
             payload = self._read_consolidation_state()
             session_state = self._session_consolidation_state(payload, session_id)
@@ -769,6 +791,8 @@ class MemoryManager:
                     "attempt_count": 0,
                     "retry_cycle": 0,
                     "turns": [],
+                    "turn_ids": [],
+                    "trigger_reason": trigger_reason,
                     "low_level_updates": int(legacy_high.get("low_level_updates", 0) or 0),
                 }
                 session_state["active_batch"] = active
@@ -782,6 +806,11 @@ class MemoryManager:
                 self._debug(session_id, "consolidation_skipped reason=no_llm_model")
                 return self._consolidation_result(session_state, status="no_llm")
             if active is None:
+                turn_ids = [
+                    str(turn.get("turn_id", ""))
+                    for turn in pending_turns
+                    if str(turn.get("turn_id", ""))
+                ]
                 active = {
                     "batch_seq": int(session_state.get("batch_seq", 0) or 0) + 1,
                     "stage": "low",
@@ -789,10 +818,26 @@ class MemoryManager:
                     "attempt_count": 0,
                     "retry_cycle": 0,
                     "turns": pending_turns,
+                    "turn_ids": turn_ids,
+                    "trigger_reason": trigger_reason,
                 }
                 session_state["active_batch"] = active
                 session_state["pending_turns"] = []
                 self._write_consolidation_state(payload)
+                self._debug(
+                    session_id,
+                    "consolidation_trigger "
+                    + json.dumps(
+                        {
+                            "batch_seq": active["batch_seq"],
+                            "trigger_reason": trigger_reason,
+                            "turn_ids": turn_ids,
+                            "pending_count": len(pending_turns),
+                        },
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
 
         batch_seq = int(active.get("batch_seq", 0) or 0)
         if str(active.get("stage", "low")) == "high":
@@ -864,6 +909,10 @@ class MemoryManager:
             if not isinstance(active, dict) or int(active.get("batch_seq", 0) or 0) != batch_seq:
                 return self._consolidation_result(session_state, status="stale")
             low_updates = int(active.get("low_level_updates", 0) or 0)
+            active_trigger_reason = str(active.get("trigger_reason") or "manual")
+            turn_ids = [str(value) for value in active.get("turn_ids", []) if str(value)]
+            if turn_ids:
+                session_state["last_consolidated_turn_id"] = turn_ids[-1]
             session_state["active_batch"] = None
             session_state["pending_high_level"] = None
             session_state["pending_turns"] = list(session_state.get("queued_turns", []) or [])
@@ -880,10 +929,28 @@ class MemoryManager:
             result = self._consolidation_result(session_state, status="complete")
         self._debug(
             session_id,
-            f"consolidation_done batch_seq={batch_seq} low_updates={low_updates} high_updates={high_counts['high_level_updates']} high_noops={high_counts['high_level_noops']}",
+            "consolidation_done "
+            + json.dumps(
+                {
+                    "batch_seq": batch_seq,
+                    "trigger_reason": active_trigger_reason,
+                    "turn_ids": turn_ids,
+                    "last_completed_turn_id": session_state["last_completed_turn_id"],
+                    "last_consolidated_turn_id": session_state["last_consolidated_turn_id"],
+                    "low_updates": low_updates,
+                    "high_updates": high_counts["high_level_updates"],
+                    "high_noops": high_counts["high_level_noops"],
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
         )
         if should_continue:
-            return self._consolidate_pending_turns(session_id=session_id, force=force)
+            return self._consolidate_pending_turns(
+                session_id=session_id,
+                force=force,
+                trigger_reason=active_trigger_reason,
+            )
         return result
 
     def _mark_active_batch_failure(
@@ -1324,6 +1391,8 @@ class MemoryManager:
                 "low_level_updates": 0,
                 "high_level_updates": 0,
                 "high_level_noops": 0,
+                "last_completed_turn_id": "",
+                "last_consolidated_turn_id": "",
             },
         )
         session_state.setdefault("batch_seq", 0)
@@ -1336,6 +1405,8 @@ class MemoryManager:
         session_state.setdefault("low_level_updates", 0)
         session_state.setdefault("high_level_updates", 0)
         session_state.setdefault("high_level_noops", 0)
+        session_state.setdefault("last_completed_turn_id", "")
+        session_state.setdefault("last_consolidated_turn_id", "")
         session_state["completed_turns"] = int(session_state.get("completed_turns", 0) or 0)
         return session_state
 

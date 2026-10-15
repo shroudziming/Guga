@@ -35,7 +35,9 @@ class FakeChatModel:
                             "entity": "work context",
                             "description": "用户在杭州工作，做后端开发。",
                             "time_expression": "",
-                            "end_unknown": True,
+                            "start_at": "2026-08-18T10:00:00+08:00",
+                            "end_at": "2026-08-18T10:01:00+08:00",
+                            "time_granularity": "minute",
                             "source_message_ids": [],
                             "guga_reflection": {
                                 "appraisal": "这项工作背景值得记住。",
@@ -64,6 +66,8 @@ class FakeChatModel:
                             "summary": "用户在杭州工作，做后端开发",
                             "importance": 0.8,
                             "confidence": 0.9,
+                            "valid_at": "2026-08-18T10:00:00+08:00",
+                            "invalid_at": None,
                             "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                         }
                     ],
@@ -319,7 +323,9 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                                     "entity": "work context",
                                     "description": "The user works on backend systems.",
                                     "time_expression": "",
-                                    "end_unknown": True,
+                                    "start_at": "2026-08-18T10:00:00+08:00",
+                                    "end_at": "2026-08-18T10:01:00+08:00",
+                                    "time_granularity": "minute",
                                     "source_message_ids": [],
                                     "guga_reflection": {
                                         "appraisal": "This work context is worth remembering.",
@@ -347,6 +353,8 @@ class ChatSessionRagFlowTest(unittest.TestCase):
                                     "summary": "The user works on backend systems.",
                                     "importance": 0.8,
                                     "confidence": 0.9,
+                                    "valid_at": "2026-08-18T10:00:00+08:00",
+                                    "invalid_at": None,
                                     "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                                 }
                             ],

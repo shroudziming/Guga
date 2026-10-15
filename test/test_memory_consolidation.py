@@ -194,11 +194,15 @@ class FixedLowLevelModel:
 
 
 class MemoryConsolidationTest(unittest.TestCase):
-    def _record_turns(self, manager: MemoryManager, session_id: str, count: int) -> None:
+    def _record_turns(self, manager: MemoryManager, session_id: str, count: int) -> list[str]:
+        user_ids: list[str] = []
         for index in range(count):
-            manager.record_user_message(session_id, f"turn {index}: submit project report on 2026-07-03")
+            user_ids.append(
+                manager.record_user_message(session_id, f"turn {index}: submit project report on 2026-07-03")
+            )
             manager.record_assistant_message(session_id, "noted")
             manager.finalize_turn(session_id)
+        return user_ids
 
     def test_low_level_prompt_injects_complete_skill_only_for_enabled_reflection(self) -> None:
         model = ConsolidationModel()
@@ -396,21 +400,49 @@ class MemoryConsolidationTest(unittest.TestCase):
                 consolidation_config=MemoryConsolidationConfig(batch_turns=10),
             )
 
-            self._record_turns(manager, "sess_batch", 9)
+            first_user_ids = self._record_turns(manager, "sess_batch", 9)
 
             state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
             self.assertEqual(len(state["sessions"]["sess_batch"]["pending_turns"]), 9)
+            self.assertEqual(
+                state["sessions"]["sess_batch"]["last_completed_turn_id"],
+                f"turn_{first_user_ids[-1]}",
+            )
             self.assertEqual(model.prompts, [])
             self.assertTrue((Path(tmp) / "sessions" / "sess_batch.jsonl").exists())
             self.assertTrue((Path(tmp) / "session_memories.jsonl").exists())
 
-            self._record_turns(manager, "sess_batch", 1)
+            second_user_id = self._record_turns(manager, "sess_batch", 1)[0]
 
             state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
             self.assertEqual(state["sessions"]["sess_batch"]["batch_seq"], 1)
             self.assertEqual(state["sessions"]["sess_batch"]["pending_turns"], [])
             self.assertTrue(any("Low-level memory consolidation" in prompt for prompt in model.prompts))
             self.assertTrue(any("High-level memory consolidation" in prompt for prompt in model.prompts))
+            session_state = state["sessions"]["sess_batch"]
+            self.assertEqual(session_state["last_completed_turn_id"], f"turn_{second_user_id}")
+            self.assertEqual(session_state["last_consolidated_turn_id"], f"turn_{second_user_id}")
+
+    def test_interval_and_exit_consolidation_log_distinct_trigger_reasons(self) -> None:
+        logs: list[str] = []
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(
+                memory_root=Path(tmp),
+                model=ConsolidationModel(),
+                enable_semantic=False,
+                debug=True,
+                debug_sink=logs.append,
+                consolidation_config=MemoryConsolidationConfig(batch_turns=2),
+            )
+            manager.record_user_message("sess_trigger", "第一轮", created_at="2026-08-18T10:00:00+08:00")
+            manager.record_assistant_message(
+                "sess_trigger", "已记录。", created_at="2026-08-18T10:01:00+08:00"
+            )
+            manager.finalize_turn_async("sess_trigger")
+            manager.wait_for_background_tasks()
+            self.assertFalse(any('"trigger_reason":"interval"' in line for line in logs))
+            manager.consolidate_until_settled("sess_trigger", retry_delays=())
+            self.assertTrue(any('"trigger_reason":"exit"' in line for line in logs))
 
     def test_low_level_consolidation_can_omit_guga_reflection_for_benchmark(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -718,8 +750,12 @@ class MemoryConsolidationTest(unittest.TestCase):
                 consolidation_config=MemoryConsolidationConfig(batch_turns=1),
             )
             first.summarizer.retry_delays = ()
-            self._record_turns(first, "sess_restart_high", 1)
+            turn_id = f"turn_{self._record_turns(first, 'sess_restart_high', 1)[0]}"
             event_count = len((root / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines())
+            failed_state = json.loads((root / "consolidation_state.json").read_text(encoding="utf-8"))
+            failed_batch = failed_state["sessions"]["sess_restart_high"]["active_batch"]
+            self.assertEqual(failed_batch["trigger_reason"], "interval")
+            self.assertEqual(failed_batch["turn_ids"], [turn_id])
 
             recovery_model = ConsolidationModel(high_decision="no_high_level_update")
             recovered = MemoryManager(
@@ -736,6 +772,8 @@ class MemoryConsolidationTest(unittest.TestCase):
             low_calls = [prompt for prompt in recovery_model.prompts if "Low-level memory consolidation" in prompt]
             self.assertEqual(low_calls, [])
             self.assertIsNone(session_state["active_batch"])
+            self.assertEqual(session_state["last_completed_turn_id"], turn_id)
+            self.assertEqual(session_state["last_consolidated_turn_id"], turn_id)
             self.assertEqual(len((root / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()), event_count)
 
     def test_pending_high_level_retry_does_not_repeat_stage_one(self) -> None:
