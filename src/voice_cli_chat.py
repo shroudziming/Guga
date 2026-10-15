@@ -91,50 +91,55 @@ def main() -> None:
     tts_client = GptSoVitsHttpClient(tts_config)
     _prewarm_tts(tts_client)
 
-    while True:
-        user_text = read_user_input("你> ").strip()
-        if not user_text:
-            continue
+    try:
+        while True:
+            try:
+                user_text = read_user_input("你> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not user_text:
+                continue
 
-        if user_text == "/exit":
-            result = session.settle_memory_for_shutdown()
-            print(f"记忆整理: {result.get('status', 'unknown')}")
-            print("已退出。")
-            return
+            if user_text in {"/exit", "exit", "quit"}:
+                break
 
-        if user_text == "/clear":
-            session.clear()
-            print("会话已清空。")
-            continue
+            if user_text == "/clear":
+                session.clear()
+                print("会话已清空。")
+                continue
 
-        if user_text == "/rag_rebuild":
-            result = session.memory_manager.rebuild_rag_indexes(session_id=session.session_id)
-            print(
-                f"RAG 索引已重建: memory_chunks={result['memory_chunks']}, "
-                f"document_chunks={result['document_chunks']}, total_chunks={result['total_chunks']}"
+            if user_text == "/rag_rebuild":
+                result = session.memory_manager.rebuild_rag_indexes(session_id=session.session_id)
+                print(
+                    f"RAG 索引已重建: memory_chunks={result['memory_chunks']}, "
+                    f"document_chunks={result['document_chunks']}, total_chunks={result['total_chunks']}"
+                )
+                continue
+
+            cancel_event = Event()
+            print("小咕嘎> ", end="", flush=True)
+            player = audio_player_from_env(os.environ)
+            runner = VoiceChatRunner(
+                session=session,
+                tts_client=tts_client,
+                audio_player=player,
+                text_sink=lambda chunk: print(chunk, end="", flush=True),
+                sentence_buffer=sentence_buffer_from_env(os.environ),
+                raise_tts_errors=False,
+                expression_tags=persona.expression_tags,
             )
-            continue
 
-        cancel_event = Event()
-        print("小咕嘎> ", end="", flush=True)
-        player = audio_player_from_env(os.environ)
-        runner = VoiceChatRunner(
-            session=session,
-            tts_client=tts_client,
-            audio_player=player,
-            text_sink=lambda chunk: print(chunk, end="", flush=True),
-            sentence_buffer=sentence_buffer_from_env(os.environ),
-            raise_tts_errors=False,
-            expression_tags=persona.expression_tags,
-        )
-
-        try:
-            summary = runner.run_turn(user_text, cancel_event=cancel_event)
-            print("\n")
-            _print_metrics(summary)
-        except KeyboardInterrupt:
-            cancel_event.set()
-            print("\n[已停止生成]\n")
+            try:
+                summary = runner.run_turn(user_text, cancel_event=cancel_event)
+                print("\n")
+                _print_metrics(summary)
+            except KeyboardInterrupt:
+                cancel_event.set()
+                print("\n[已停止生成]\n")
+    finally:
+        result = session.settle_memory_for_shutdown()
+        print(f"记忆整理: {result.get('status', 'unknown')}")
+        print("已退出。")
 
 
 def _print_metrics(summary) -> None:

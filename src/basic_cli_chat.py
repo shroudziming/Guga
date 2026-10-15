@@ -75,46 +75,51 @@ def main() -> None:
         debug_sink=sink,
     )
 
-    while True:
-        user_text = read_user_input("你> ").strip()
-        if not user_text:
-            continue
+    try:
+        while True:
+            try:
+                user_text = read_user_input("你> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not user_text:
+                continue
 
-        if user_text == "/exit":
-            result = session.settle_memory_for_shutdown()
-            print(f"记忆整理: {result.get('status', 'unknown')}")
-            print("已退出。")
-            return
+            if user_text in {"/exit", "exit", "quit"}:
+                break
 
-        if user_text == "/clear":
-            session.clear()
-            print("会话已清空。")
-            continue
+            if user_text == "/clear":
+                session.clear()
+                print("会话已清空。")
+                continue
 
-        if user_text == "/rag_rebuild":
-            result = session.memory_manager.rebuild_rag_indexes(session_id=session.session_id)
-            print(
-                f"RAG 索引已重建: memory_chunks={result['memory_chunks']}, "
-                f"document_chunks={result['document_chunks']}, total_chunks={result['total_chunks']}"
-            )
-            continue
+            if user_text == "/rag_rebuild":
+                result = session.memory_manager.rebuild_rag_indexes(session_id=session.session_id)
+                print(
+                    f"RAG 索引已重建: memory_chunks={result['memory_chunks']}, "
+                    f"document_chunks={result['document_chunks']}, total_chunks={result['total_chunks']}"
+                )
+                continue
 
-        cancel_event = Event()
-        stream = session.reply_stream(user_text, cancel_event=cancel_event)
-        output_parser = PersonaOutputParser(persona.expression_tags)
+            cancel_event = Event()
+            stream = session.reply_stream(user_text, cancel_event=cancel_event)
+            output_parser = PersonaOutputParser(persona.expression_tags)
 
-        print("小咕嘎> ", end="", flush=True)
-        try:
-            for chunk in stream:
-                _render_persona_events(output_parser.feed(chunk), debug_enabled=debug_enabled)
-            _render_persona_events(output_parser.flush(), debug_enabled=debug_enabled)
-            print("\n")
-        except KeyboardInterrupt:
-            cancel_event.set()
-            for _ in stream:
-                pass
-            _render_persona_events(output_parser.flush(), debug_enabled=debug_enabled)
-            print("\n[已停止生成]\n")
+            print("小咕嘎> ", end="", flush=True)
+            try:
+                for chunk in stream:
+                    _render_persona_events(output_parser.feed(chunk), debug_enabled=debug_enabled)
+                _render_persona_events(output_parser.flush(), debug_enabled=debug_enabled)
+                print("\n")
+            except KeyboardInterrupt:
+                cancel_event.set()
+                for _ in stream:
+                    pass
+                _render_persona_events(output_parser.flush(), debug_enabled=debug_enabled)
+                print("\n[已停止生成]\n")
+    finally:
+        result = session.settle_memory_for_shutdown()
+        print(f"记忆整理: {result.get('status', 'unknown')}")
+        print("已退出。")
 
 
 def _render_persona_events(events, *, debug_enabled: bool) -> None:
