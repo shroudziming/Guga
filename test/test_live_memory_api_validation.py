@@ -17,24 +17,27 @@ def _load_script_module():
 
 
 class LiveMemoryApiValidationUnitTest(unittest.TestCase):
-    def test_time_validator_accepts_same_day_and_unknown_end_contracts(self) -> None:
+    def test_time_validator_accepts_exclusive_end_contract(self) -> None:
         module = _load_script_module()
         module.validate_time_event(
             {
-                "start_at": "2026-07-14T15:00:00+08:00",
-                "end_at": "2026-07-14T15:00:00+08:00",
+                "start_at": "2026-08-20T00:00:00+08:00",
+                "end_at": "2026-08-21T00:00:00+08:00",
                 "end_unknown": False,
-            },
-            expect_unknown_end=False,
+            }
         )
-        module.validate_time_event(
-            {
-                "start_at": "2026-07-13T00:00:00+08:00",
-                "end_at": None,
-                "end_unknown": True,
-            },
-            expect_unknown_end=True,
-        )
+
+    def test_time_validator_rejects_equal_or_missing_end(self) -> None:
+        module = _load_script_module()
+        for end_at in ("2026-08-20T00:00:00+08:00", None):
+            with self.subTest(end_at=end_at), self.assertRaises(AssertionError):
+                module.validate_time_event(
+                    {
+                        "start_at": "2026-08-20T00:00:00+08:00",
+                        "end_at": end_at,
+                        "end_unknown": end_at is None,
+                    }
+                )
 
 
 if __name__ == "__main__":

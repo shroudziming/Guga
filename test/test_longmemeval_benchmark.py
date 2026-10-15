@@ -243,7 +243,9 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                                     "entity": "notebook preference",
                                     "description": "User likes blue notebooks.",
                                     "time_expression": "",
-                                    "end_unknown": True,
+                                    "start_at": "2026-08-18T10:00:00+08:00",
+                                    "end_at": "2026-08-18T10:01:00+08:00",
+                                    "time_granularity": "minute",
                                     "source_message_ids": [],
                                     "guga_reflection": {
                                         "appraisal": "This preference is worth remembering.",
@@ -271,6 +273,8 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                                     "summary": "User likes blue notebooks.",
                                     "importance": 0.8,
                                     "confidence": 0.9,
+                                    "valid_at": "2026-08-18T10:00:00+08:00",
+                                    "invalid_at": None,
                                     "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                                 }
                             ],
@@ -554,9 +558,9 @@ class LongMemEvalBenchmarkTest(unittest.TestCase):
                                     "entity": "notebook preference",
                                     "description": "The user likes blue notebooks.",
                                     "time_expression": "",
-                                    "start_at": None,
-                                    "end_at": None,
-                                    "end_unknown": True,
+                                    "start_at": "2026-08-18T10:00:00+08:00",
+                                    "end_at": "2026-08-18T10:01:00+08:00",
+                                    "time_granularity": "minute",
                                     "source_message_ids": [],
                                     "confidence": 0.9,
                                 }
