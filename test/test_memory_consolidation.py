@@ -88,6 +88,8 @@ class ConsolidationModel:
                             "importance": 0.8,
                             "confidence": 0.88,
                             "sources": sources,
+                            "valid_at": "2026-07-03T00:00:00+08:00",
+                            "invalid_at": "2026-07-04T00:00:00+08:00",
                         }
                     ],
                     "user_model_operations": [
@@ -240,6 +242,66 @@ class MemoryConsolidationTest(unittest.TestCase):
             "later explicit user correction > explicit absolute user time > temporal_context > existing memory time > model inference",
             model.prompts[0],
         )
+
+    def test_high_level_archival_operation_requires_validity_interval(self) -> None:
+        class MissingValidityModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return json.dumps(
+                    {
+                        "decision": "update_high_level_memory",
+                        "archival_operations": [
+                            {
+                                "topic": "interview",
+                                "summary": "用户正在准备面试",
+                                "importance": 0.8,
+                                "confidence": 0.9,
+                                "sources": [{"type": "semantic_event", "id": "evt_1"}],
+                            }
+                        ],
+                        "user_model_operations": [],
+                        "reason": "time-bound fact",
+                    },
+                    ensure_ascii=False,
+                )
+
+        summarizer = MemoryBankSummarizer(model=MissingValidityModel(), use_llm=True, retry_delays=())
+        with self.assertRaisesRegex(SummaryGenerationError, "valid_at"):
+            summarizer.consolidate_high_level_memory(
+                {
+                    "semantic_events": [{"id": "evt_1"}],
+                    "event_summaries": [],
+                    "archival_memory": [],
+                    "guga_user_model": {"insights": []},
+                }
+            )
+
+    def test_archival_update_persists_closed_and_open_validity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(memory_root=Path(tmp), model=None, enable_semantic=False)
+            base = {
+                "topic": "interview",
+                "summary": "用户正在准备面试",
+                "importance": 0.8,
+                "confidence": 0.9,
+                "sources": [{"type": "semantic_event", "id": "evt_1"}],
+                "valid_at": "2026-08-18T10:00:00+08:00",
+            }
+            closed = manager._build_archival_update(
+                item={**base, "invalid_at": "2026-08-21T00:00:00+08:00"},
+                session_id="sess_archive",
+                batch_seq=1,
+                operation_index=0,
+            )
+            opened = manager._build_archival_update(
+                item={**base, "invalid_at": None},
+                session_id="sess_archive",
+                batch_seq=1,
+                operation_index=1,
+            )
+            self.assertEqual(closed["valid_at"], "2026-08-18T10:00:00+08:00")
+            self.assertEqual(closed["invalid_at"], "2026-08-21T00:00:00+08:00")
+            self.assertEqual(opened["invalid_at"], "")
 
     def test_low_level_packet_includes_persisted_turn_temporal_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -831,6 +893,8 @@ class MemoryConsolidationTest(unittest.TestCase):
                                 "summary": "用户希望记忆保留被修正的余地。",
                                 "importance": 0.8,
                                 "confidence": 0.9,
+                                "valid_at": "2026-08-18T10:00:00+08:00",
+                                "invalid_at": None,
                                 "sources": [
                                     {"type": "event_summary", "id": "summary_1"},
                                     {"type": "message", "id": "msg_1"},

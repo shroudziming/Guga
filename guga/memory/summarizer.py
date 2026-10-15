@@ -270,7 +270,9 @@ class MemoryBankSummarizer:
             "{"
             "\"decision\": \"update_high_level_memory|no_high_level_update\", "
             "\"archival_operations\": [{\"topic\": string, \"summary\": string, \"importance\": number, "
-            "\"confidence\": number, \"sources\": [{\"type\": \"semantic_event|event_summary|message\", \"id\": string}]}], "
+            "\"confidence\": number, \"sources\": [{\"type\": \"semantic_event|event_summary|message\", \"id\": string}], "
+            "\"valid_at\": \"timezone-aware ISO 8601\", "
+            "\"invalid_at\": \"timezone-aware ISO 8601 or null\"}], "
             "\"user_model_operations\": [{\"operation\": \"upsert|deactivate\", \"statement\": string, "
             "\"kind\": string, \"confidence\": number, \"stability\": string, \"sources\": [{\"type\": \"semantic_event|event_summary|message\", \"id\": string}]}], "
             "\"reason\": string"
@@ -279,6 +281,10 @@ class MemoryBankSummarizer:
             "- Use only semantic_events and derived event_summaries in the packet.\n"
             "- Never infer directly from raw sessions or transcript text.\n"
             "- sources is optional. Use an empty array when reliable provenance is unavailable; never invent or force an unrelated id.\n"
+            "- valid_at/invalid_at describe when the archival fact is true; they are not record creation timestamps.\n"
+            "- Derive validity only from committed semantic_events and event_summaries in this packet.\n"
+            "- invalid_at may be null only for an intentionally open-ended fact.\n"
+            "- Never output created_at or updated_at.\n"
             "- Return no_high_level_update when there is no stable long-term value.\n\n"
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
@@ -585,6 +591,33 @@ class MemoryBankSummarizer:
                     if source_id not in valid_ids[source_type]:
                         raise SummaryGenerationError(f"{key}[{index}].sources[{source_index}] contains unknown source")
                 operation["sources"] = normalize_memory_sources(raw_sources)
+                if key == "archival_operations":
+                    valid_raw = str(operation.get("valid_at", "")).strip()
+                    if not valid_raw:
+                        raise SummaryGenerationError(f"{key}[{index}].valid_at is required")
+                    try:
+                        valid_at = datetime.fromisoformat(valid_raw)
+                    except ValueError as exc:
+                        raise SummaryGenerationError(f"{key}[{index}].valid_at must use ISO 8601") from exc
+                    if valid_at.tzinfo is None:
+                        raise SummaryGenerationError(f"{key}[{index}].valid_at must include timezone")
+                    invalid_raw = operation.get("invalid_at")
+                    if invalid_raw is not None:
+                        invalid_text = str(invalid_raw).strip()
+                        if not invalid_text:
+                            raise SummaryGenerationError(f"{key}[{index}].invalid_at must be null or ISO 8601")
+                        try:
+                            invalid_at = datetime.fromisoformat(invalid_text)
+                        except ValueError as exc:
+                            raise SummaryGenerationError(
+                                f"{key}[{index}].invalid_at must use ISO 8601"
+                            ) from exc
+                        if invalid_at.tzinfo is None:
+                            raise SummaryGenerationError(f"{key}[{index}].invalid_at must include timezone")
+                        if valid_at >= invalid_at:
+                            raise SummaryGenerationError(
+                                f"{key}[{index}].valid_at must be earlier than invalid_at"
+                            )
         parsed["reason"] = str(parsed.get("reason", "")).strip()
         return parsed
 

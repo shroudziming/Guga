@@ -40,7 +40,13 @@ from guga.memory.temporal_retrieval import (
     parse_time_queries,
     search_temporal_records,
 )
-from guga.memory.time_utils import apply_temporal_fields, day_bucket as time_day_bucket, now_beijing_iso, parse_datetime
+from guga.memory.time_utils import (
+    apply_temporal_fields,
+    day_bucket as time_day_bucket,
+    format_beijing,
+    now_beijing_iso,
+    parse_datetime,
+)
 from guga.memory.user_model import GugaUserModelStore
 from guga.rag.faiss_store import IncompatibleIndexError
 from guga.rag.pipeline import RagPipeline
@@ -1170,27 +1176,38 @@ class MemoryManager:
             return {}
         now = now_beijing_iso()
         sources = normalize_memory_sources(item.get("sources"))
+        valid_at_value = parse_datetime(str(item.get("valid_at", "")))
+        invalid_raw = item.get("invalid_at")
+        invalid_at_value = parse_datetime(str(invalid_raw)) if invalid_raw else None
+        if valid_at_value is None or (invalid_raw and invalid_at_value is None):
+            raise SummaryGenerationError("invalid archival validity interval")
+        if invalid_at_value is not None and valid_at_value >= invalid_at_value:
+            raise SummaryGenerationError("archival valid_at must be earlier than invalid_at")
+        valid_at = format_beijing(valid_at_value)
+        invalid_at = format_beijing(invalid_at_value) if invalid_at_value is not None else ""
         return normalize_memorybank_fields(
-            apply_temporal_fields(
-                {
-                    "id": f"mem_{hashlib.sha256(f'{session_id}:{batch_seq}:archival:{operation_index}'.encode('utf-8')).hexdigest()[:24]}",
-                    "type": "episodic",
-                    "topic": str(item.get("topic") or "general").strip()[:64] or "general",
-                    "summary": summary[:500],
-                    "raw_excerpt": summary[:500],
-                    "importance": self._clamp_float(item.get("importance"), 0.7),
-                    "confidence": self._clamp_float(item.get("confidence"), 0.7),
-                    "created_at": now,
-                    "last_recalled_at": now,
-                    "memory_strength": 1,
-                    "retention": 1.0,
-                    "source_session_id": session_id,
-                    "sources": sources,
-                    "status": "active",
-                },
-                text=summary,
-                reference_time=now,
-            )
+            {
+                "id": f"mem_{hashlib.sha256(f'{session_id}:{batch_seq}:archival:{operation_index}'.encode('utf-8')).hexdigest()[:24]}",
+                "type": "episodic",
+                "topic": str(item.get("topic") or "general").strip()[:64] or "general",
+                "summary": summary[:500],
+                "raw_excerpt": summary[:500],
+                "importance": self._clamp_float(item.get("importance"), 0.7),
+                "confidence": self._clamp_float(item.get("confidence"), 0.7),
+                "created_at": now,
+                "updated_at": now,
+                "valid_at": valid_at,
+                "invalid_at": invalid_at,
+                "semantic_day": time_day_bucket(valid_at),
+                "time_source": "llm_consolidated",
+                "time_granularity": "range",
+                "last_recalled_at": now,
+                "memory_strength": 1,
+                "retention": 1.0,
+                "source_session_id": session_id,
+                "sources": sources,
+                "status": "active",
+            }
         )
 
     def _load_pending_turn_messages(self, *, session_id: str, pending_turns: list[dict]) -> list[dict]:

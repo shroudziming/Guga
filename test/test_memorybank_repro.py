@@ -25,7 +25,7 @@ class SummaryModel:
             return json.dumps(
                 {
                     "semantic_event_operations": [
-                        {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "user context", "description": summary, "time_expression": "", "end_unknown": True, "source_message_ids": [], "guga_reflection": {"appraisal": "这项用户背景值得记住。", "felt_response": "我会认真留意。"}}
+                        {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "user context", "description": summary, "time_expression": "", "start_at": "2026-08-18T10:00:00+08:00", "end_at": "2026-08-18T10:01:00+08:00", "time_granularity": "minute", "source_message_ids": [], "guga_reflection": {"appraisal": "这项用户背景值得记住。", "felt_response": "我会认真留意。"}}
                     ],
                     "event_summaries": [
                         {
@@ -45,7 +45,7 @@ class SummaryModel:
                     {
                         "decision": "update_high_level_memory",
                         "archival_operations": [
-                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9, "sources": [{"type": "semantic_event", "id": event_id} for event_id in event_ids]}
+                            {"topic": "identity", "summary": "用户自称叔本明。", "importance": 0.8, "confidence": 0.9, "valid_at": "2026-08-18T10:00:00+08:00", "invalid_at": None, "sources": [{"type": "semantic_event", "id": event_id} for event_id in event_ids]}
                         ],
                         "user_model_operations": [],
                         "reason": "identity",
@@ -61,6 +61,8 @@ class SummaryModel:
                             "summary": "用户提到深圳工作和不喜欢说教式安慰",
                             "importance": 0.8,
                             "confidence": 0.9,
+                            "valid_at": "2026-08-18T10:00:00+08:00",
+                            "invalid_at": None,
                             "sources": [{"type": "semantic_event", "id": event_id} for event_id in event_ids],
                         }
                     ],
@@ -127,7 +129,7 @@ class MemoryBankReproTest(unittest.TestCase):
                     return json.dumps(
                         {
                             "semantic_event_operations": [
-                                {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "work", "description": "The user works as a backend engineer in Hangzhou.", "time_expression": "", "end_unknown": True, "source_message_ids": [], "guga_reflection": {"appraisal": "This work context is worth remembering.", "felt_response": "I will keep it in mind."}}
+                                {"operation": "create", "event_kind": "state_change", "subject": "user", "entity": "work", "description": "The user works as a backend engineer in Hangzhou.", "time_expression": "", "start_at": "2026-08-18T10:00:00+08:00", "end_at": "2026-08-18T10:01:00+08:00", "time_granularity": "minute", "source_message_ids": [], "guga_reflection": {"appraisal": "This work context is worth remembering.", "felt_response": "I will keep it in mind."}}
                             ],
                             "event_summaries": [
                                 {
@@ -148,6 +150,8 @@ class MemoryBankReproTest(unittest.TestCase):
                                     "summary": "The user works as a backend engineer in Hangzhou.",
                                     "importance": 0.9,
                                     "confidence": 0.8,
+                                    "valid_at": "2026-08-18T10:00:00+08:00",
+                                    "invalid_at": None,
                                     "sources": ([{"type": "semantic_event", "id": event_match.group(1)}] if event_match else []),
                                 }
                             ],
