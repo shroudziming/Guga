@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -128,7 +129,7 @@ class SemanticEventStore:
         entity = _required_text(payload, "entity")
         description = _required_text(payload, "description")
         reference_created_at = str(payload.get("reference_created_at") or now).strip()
-        time_fields = _llm_time_fields(payload, default_end_unknown=False)
+        time_fields = _llm_time_fields(payload)
         event = {
             "id": str(payload.get("event_id") or f"evt_{uuid4().hex}"),
             "type": "semantic_event",
@@ -170,9 +171,9 @@ class SemanticEventStore:
                 if key == "subject" and str(payload[key]).strip() != "user":
                     raise ValueError("semantic event subject must be 'user'")
                 event[key] = str(payload[key]).strip()
-        if any(key in payload for key in ("time_expression", "start_at", "end_at", "end_unknown")):
+        if any(key in payload for key in ("time_expression", "start_at", "end_at", "time_granularity")):
             reference_created_at = str(payload.get("reference_created_at") or event["reference_created_at"]).strip()
-            time_fields = _llm_time_fields(payload, default_end_unknown=bool(event["end_unknown"]))
+            time_fields = _llm_time_fields(payload)
             event.update(
                 {
                     "start_at": time_fields["start_at"],
@@ -213,42 +214,38 @@ def _required_text(payload: dict, key: str) -> str:
     return value
 
 
-def _llm_time_fields(payload: dict, *, default_end_unknown: bool) -> dict:
-    start_at = _optional_datetime(payload.get("start_at"), field="start_at")
-    end_at = _optional_datetime(payload.get("end_at"), field="end_at")
-    end_unknown = bool(payload.get("end_unknown", default_end_unknown))
-    if start_at is None:
-        if end_at is not None:
-            raise ValueError("end_at requires start_at")
-        return {
-            "start_at": None,
-            "end_at": None,
-            "end_unknown": True,
-            "time_source": "unknown",
-            "time_granularity": "unknown",
-        }
-    if end_at is not None:
-        if end_at < start_at:
-            raise ValueError("end_at must not be before start_at")
-        end_unknown = False
-    elif not end_unknown:
-        end_at = start_at
+def _llm_time_fields(payload: dict) -> dict:
+    start_value = payload.get("start_at")
+    end_value = payload.get("end_at")
+    start_raw = str(start_value).strip() if start_value is not None else ""
+    end_raw = str(end_value).strip() if end_value is not None else ""
+    if not start_raw:
+        raise ValueError("start_at is required")
+    if not end_raw:
+        raise ValueError("end_at is required")
+    try:
+        start_source = datetime.fromisoformat(start_raw)
+        end_source = datetime.fromisoformat(end_raw)
+    except ValueError as exc:
+        raise ValueError("start_at and end_at must be ISO 8601") from exc
+    if start_source.tzinfo is None:
+        raise ValueError("start_at must include timezone")
+    if end_source.tzinfo is None:
+        raise ValueError("end_at must include timezone")
+    start_at = parse_datetime(start_raw)
+    end_at = parse_datetime(end_raw)
+    if start_at is None or end_at is None or start_at >= end_at:
+        raise ValueError("start_at must be earlier than end_at")
+    granularity = str(payload.get("time_granularity", "")).strip()
+    if granularity not in {"minute", "hour", "day", "week", "month", "year", "range"}:
+        raise ValueError("time_granularity is invalid")
     return {
         "start_at": format_beijing(start_at),
-        "end_at": format_beijing(end_at) if end_at is not None else None,
-        "end_unknown": end_unknown,
+        "end_at": format_beijing(end_at),
+        "end_unknown": False,
         "time_source": "llm_resolved",
-        "time_granularity": "datetime",
+        "time_granularity": granularity,
     }
-
-
-def _optional_datetime(value: object, *, field: str):
-    if value is None or not str(value).strip():
-        return None
-    parsed = parse_datetime(str(value))
-    if parsed is None:
-        raise ValueError(f"invalid {field}: {value!r}")
-    return parsed
 
 
 def _merge_ids(existing: object, incoming: object) -> list[str]:

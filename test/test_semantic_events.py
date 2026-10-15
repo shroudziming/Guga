@@ -36,7 +36,36 @@ class SemanticEventTimeTest(unittest.TestCase):
 
 
 class SemanticEventStoreTest(unittest.TestCase):
-    def test_store_uses_llm_absolute_time_and_defaults_same_day_end(self) -> None:
+    def test_store_rejects_create_without_complete_non_empty_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
+            base = {
+                "operation": "create",
+                "event_kind": "appointment",
+                "subject": "user",
+                "entity": "面试",
+                "description": "用户参加面试",
+                "time_expression": "8月20号",
+                "time_granularity": "day",
+            }
+            for start_at, end_at, error in (
+                ("2026-08-20T00:00:00+08:00", None, "end_at is required"),
+                (
+                    "2026-08-20T00:00:00+08:00",
+                    "2026-08-20T00:00:00+08:00",
+                    "start_at must be earlier than end_at",
+                ),
+                ("2026-08-20T00:00:00", "2026-08-21T00:00:00+08:00", "start_at must include timezone"),
+            ):
+                with self.subTest(start_at=start_at, end_at=end_at):
+                    with self.assertRaisesRegex(ValueError, error):
+                        store.apply_operations(
+                            operations=[{**base, "start_at": start_at, "end_at": end_at}],
+                            session_id="sess_strict",
+                            include_guga_reflection=False,
+                        )
+
+    def test_store_persists_end_exclusive_interval_and_granularity(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
             outcome = store.apply_operations(
@@ -45,87 +74,25 @@ class SemanticEventStoreTest(unittest.TestCase):
                         "operation": "create",
                         "event_kind": "appointment",
                         "subject": "user",
-                        "entity": "dental appointment",
-                        "description": "用户将在周日看牙",
-                        "time_expression": "周日",
-                        "end_unknown": False,
-                        "reference_created_at": "2026-07-09T09:30:00+08:00",
-                        "source_message_ids": ["msg_1"],
-                        "start_at": "2026-07-12T10:30:00+08:00",
+                        "entity": "面试",
+                        "description": "用户参加面试",
+                        "time_expression": "8月20号",
+                        "start_at": "2026-08-20T00:00:00+08:00",
+                        "end_at": "2026-08-21T00:00:00+08:00",
+                        "time_granularity": "day",
                         "confidence": 0.9,
-                        "guga_reflection": {
-                            "appraisal": "我会在意这件事。",
-                            "felt_response": "有点挂心。",
-                        },
                     }
                 ],
-                session_id="sess_1",
+                session_id="sess_strict",
                 include_guga_reflection=False,
             )
 
             self.assertEqual(len(outcome.created_event_ids), 1)
             event = store.load_active()[0]
-            self.assertEqual(event["start_at"], "2026-07-12T10:30:00+08:00")
-            self.assertEqual(event["end_at"], "2026-07-12T10:30:00+08:00")
+            self.assertEqual(event["end_at"], "2026-08-21T00:00:00+08:00")
+            self.assertEqual(event["time_granularity"], "day")
             self.assertFalse(event["end_unknown"])
             self.assertEqual(event["time_source"], "llm_resolved")
-            self.assertNotIn("guga_reflection", event)
-            self.assertNotIn("summary", event)
-            self.assertNotIn("object", event)
-            self.assertNotIn("raw_excerpt", event)
-            self.assertEqual(event["source_session_id"], "sess_1")
-
-            persisted = json.loads((Path(tmp_dir) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()[0])
-            self.assertEqual(persisted["id"], event["id"])
-
-    def test_store_keeps_unknown_end_for_multi_day_event(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
-            store.apply_operations(
-                operations=[
-                    {
-                        "operation": "create",
-                        "event_kind": "travel",
-                        "subject": "user",
-                        "entity": "business trip",
-                        "description": "用户下周开始出差。",
-                        "time_expression": "下周开始",
-                        "start_at": "2026-07-13T00:00:00+08:00",
-                        "end_at": None,
-                        "end_unknown": True,
-                        "reference_created_at": "2026-07-09T09:30:00+08:00",
-                    }
-                ],
-                session_id="sess_trip",
-                include_guga_reflection=False,
-            )
-
-            event = store.load_active()[0]
-            self.assertEqual(event["start_at"], "2026-07-13T00:00:00+08:00")
-            self.assertIsNone(event["end_at"])
-            self.assertTrue(event["end_unknown"])
-
-    def test_store_rejects_llm_time_range_with_end_before_start(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            store = SemanticEventStore(Path(tmp_dir) / "semantic_events.jsonl")
-            with self.assertRaisesRegex(ValueError, "end_at must not be before start_at"):
-                store.apply_operations(
-                    operations=[
-                        {
-                            "operation": "create",
-                            "event_kind": "travel",
-                            "subject": "user",
-                            "entity": "business trip",
-                            "description": "用户出差。",
-                            "start_at": "2026-07-16T00:00:00+08:00",
-                            "end_at": "2026-07-14T00:00:00+08:00",
-                            "end_unknown": False,
-                        }
-                    ],
-                    session_id="sess_invalid_time",
-                    include_guga_reflection=False,
-                )
-            self.assertFalse((Path(tmp_dir) / "semantic_events.jsonl").exists())
 
     def test_store_rejects_non_user_semantic_event_subject(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -140,7 +107,8 @@ class SemanticEventStoreTest(unittest.TestCase):
                             "entity": "dentist",
                             "description": "Guga sees a dentist.",
                             "start_at": "2026-07-14T15:00:00+08:00",
-                            "end_unknown": False,
+                            "end_at": "2026-07-14T16:00:00+08:00",
+                            "time_granularity": "hour",
                         }
                     ],
                     session_id="sess_non_user",
@@ -159,7 +127,9 @@ class SemanticEventStoreTest(unittest.TestCase):
                         "entity": "mortgage preapproval",
                         "description": "用户的房贷预批额度为 $350,000",
                         "time_expression": "",
-                        "end_unknown": True,
+                        "start_at": "2023-08-11T00:01:00+08:00",
+                        "end_at": "2023-08-11T00:02:00+08:00",
+                        "time_granularity": "minute",
                         "reference_created_at": "2023-08-11T00:01:00+08:00",
                         "source_message_ids": ["msg_old"],
                     }
@@ -179,7 +149,9 @@ class SemanticEventStoreTest(unittest.TestCase):
                         "entity": "mortgage preapproval",
                         "description": "用户的房贷预批额度为 $400,000",
                         "time_expression": "",
-                        "end_unknown": True,
+                        "start_at": "2023-11-30T00:36:00+08:00",
+                        "end_at": "2023-11-30T00:37:00+08:00",
+                        "time_granularity": "minute",
                         "reference_created_at": "2023-11-30T00:36:00+08:00",
                         "source_message_ids": ["msg_new"],
                         "guga_reflection": {
@@ -229,6 +201,9 @@ class SemanticEventStoreTest(unittest.TestCase):
                         "subject": "user",
                         "entity": "report",
                         "description": "用户计划提交报告。",
+                        "start_at": "2026-07-03T00:00:00+08:00",
+                        "end_at": "2026-07-04T00:00:00+08:00",
+                        "time_granularity": "day",
                         "source_message_ids": ["msg_user"],
                         "guga_reflection": {
                             "appraisal": "这件事很重要。",

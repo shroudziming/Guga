@@ -7,7 +7,9 @@ from pathlib import Path
 from datetime import datetime
 
 from guga.memory.consolidation import MemoryConsolidationConfig
+from guga.memory.event_summary_store import EventSummaryStore
 from guga.memory.manager import MemoryManager
+from guga.memory.semantic_events import EventApplyResult
 from guga.memory.summarizer import MemoryBankSummarizer
 from guga.memory.time_utils import extract_semantic_time, parse_datetime
 from guga.tools import default_tool_registry
@@ -89,6 +91,45 @@ class SummaryModel:
 
 
 class MemoryTimeUtilsTest(unittest.TestCase):
+    def test_event_summary_uses_covered_event_exclusive_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = EventSummaryStore(Path(tmp_dir) / "event_summaries.jsonl")
+            result = EventApplyResult(["evt_1", "evt_2"], [], [])
+            summary = store.upsert_batch_summary(
+                session_id="sess_summary",
+                batch_seq=1,
+                payload={"summary": "两项安排", "confidence": 0.9},
+                source_message_ids=["msg_1"],
+                event_result=result,
+                covered_events=[
+                    {
+                        "id": "evt_1",
+                        "start_at": "2026-08-20T14:00:00+08:00",
+                        "end_at": "2026-08-20T15:00:00+08:00",
+                    },
+                    {
+                        "id": "evt_2",
+                        "start_at": "2026-08-21T09:00:00+08:00",
+                        "end_at": "2026-08-21T10:00:00+08:00",
+                    },
+                ],
+            )
+            self.assertEqual(summary["time_window_start"], "2026-08-20T14:00:00+08:00")
+            self.assertEqual(summary["time_window_end"], "2026-08-21T10:00:00+08:00")
+
+    def test_event_summary_rejects_missing_covered_interval(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            store = EventSummaryStore(Path(tmp_dir) / "event_summaries.jsonl")
+            with self.assertRaisesRegex(ValueError, "covered canonical event intervals"):
+                store.upsert_batch_summary(
+                    session_id="sess_summary",
+                    batch_seq=1,
+                    payload={"summary": "无来源总结"},
+                    source_message_ids=["msg_1"],
+                    event_result=EventApplyResult([], [], []),
+                    covered_events=[],
+                )
+
     def test_parse_datetime_returns_none_when_timezone_normalization_overflows(self) -> None:
         for raw in ("0001-01-01T00:00:00+14:00", "9999-12-31T23:59:59-12:00"):
             for value in (raw, datetime.fromisoformat(raw)):

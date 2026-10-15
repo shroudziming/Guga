@@ -1038,11 +1038,14 @@ class MemoryManager:
             operations=result.get("semantic_event_operations", []) or [],
             fallback_source_ids=source_message_ids,
         )
-        outcome = self.semantic_event_store.apply_operations(
-            operations=operations,
-            session_id=session_id,
-            include_guga_reflection=self.consolidation_config.include_guga_reflection,
-        )
+        try:
+            outcome = self.semantic_event_store.apply_operations(
+                operations=operations,
+                session_id=session_id,
+                include_guga_reflection=self.consolidation_config.include_guga_reflection,
+            )
+        except ValueError as exc:
+            raise SummaryGenerationError(f"invalid semantic event operation: {exc}") from exc
         changed_ids = set(outcome.created_event_ids + outcome.updated_event_ids + outcome.deactivated_event_ids)
         all_events = self.semantic_event_store.load_all()
         current_event_ids = active_event_ids(all_events)
@@ -1057,14 +1060,17 @@ class MemoryManager:
         for item in result.get("event_summaries", []) or []:
             if not isinstance(item, dict):
                 continue
-            payload = self.event_summary_store.upsert_batch_summary(
-                session_id=session_id,
-                batch_seq=batch_seq,
-                payload=item,
-                source_message_ids=source_message_ids,
-                event_result=outcome,
-                covered_events=changed_events,
-            )
+            try:
+                payload = self.event_summary_store.upsert_batch_summary(
+                    session_id=session_id,
+                    batch_seq=batch_seq,
+                    payload=item,
+                    source_message_ids=source_message_ids,
+                    event_result=outcome,
+                    covered_events=changed_events,
+                )
+            except ValueError as exc:
+                raise SummaryGenerationError(f"invalid event summary: {exc}") from exc
             if payload:
                 updates += 1
                 if self.rag_pipeline is not None:

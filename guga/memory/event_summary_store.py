@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from guga.memory.forgetting import now_iso, normalize_memorybank_fields
+from guga.memory.time_utils import parse_datetime
 
 
 class EventSummaryStore:
@@ -40,12 +41,14 @@ class EventSummaryStore:
         updated_at = now_iso()
         payload_source_ids = list(payload.get("source_message_ids") or source_message_ids)
         event_ids = [str(event.get("id", "")) for event in covered_events if str(event.get("id", ""))]
-        time_values = [
-            str(event.get(field, ""))
-            for event in covered_events
-            for field in ("start_at", "end_at")
-            if str(event.get(field, ""))
-        ]
+        starts = [str(event.get("start_at", "")) for event in covered_events if str(event.get("start_at", ""))]
+        ends = [str(event.get("end_at", "")) for event in covered_events if str(event.get("end_at", ""))]
+        if not starts or not ends:
+            raise ValueError("event summary requires covered canonical event intervals")
+        time_window_start = min(starts)
+        time_window_end = max(ends)
+        if parse_datetime(time_window_start) >= parse_datetime(time_window_end):
+            raise ValueError("event summary time window must be non-empty")
         event = normalize_memorybank_fields(
             {
                 "id": row_id,
@@ -56,8 +59,8 @@ class EventSummaryStore:
                 "created_event_ids": list(event_result.created_event_ids),
                 "updated_event_ids": list(event_result.updated_event_ids),
                 "deactivated_event_ids": list(event_result.deactivated_event_ids),
-                "time_window_start": min(time_values) if time_values else None,
-                "time_window_end": max(time_values) if time_values else None,
+                "time_window_start": time_window_start,
+                "time_window_end": time_window_end,
                 "source_session_id": session_id,
                 "source_message_ids": [item for item in payload_source_ids if item],
                 "created_at": created_at,

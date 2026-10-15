@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import re
+from datetime import datetime
 from time import sleep
 from time import perf_counter
 from collections.abc import Sequence
@@ -222,8 +223,10 @@ class MemoryBankSummarizer:
             "{"
             "\"semantic_event_operations\": [{\"operation\": \"create|update|replace|cancel|ignore\", "
             "\"event_kind\": string, \"subject\": \"user\", \"entity\": string, "
-            "\"description\": string, \"time_expression\": string, \"start_at\": string|null, "
-            "\"end_at\": string|null, \"end_unknown\": boolean, "
+            "\"description\": string, \"time_expression\": string, "
+            "\"start_at\": \"timezone-aware ISO 8601 inclusive start\", "
+            "\"end_at\": \"timezone-aware ISO 8601 exclusive end\", "
+            "\"time_granularity\": \"minute|hour|day|week|month|year|range\", "
             "\"source_message_ids\": [string], \"confidence\": number, "
             "\"guga_reflection\": {\"appraisal\": string, \"felt_response\": string}}], "
             "\"event_summaries\": [{\"summary\": string, \"source_message_ids\": [string], \"confidence\": number}]"
@@ -238,12 +241,12 @@ class MemoryBankSummarizer:
             "- subject is always the literal string user for the human user's events; never use Guga as subject.\n"
             "- Do not create events for generic questions, advice requests, recommendations, definitions, explanations, preferences, or assistant-only content.\n"
             "- Resolve time against the source turn's created_at and output absolute ISO-8601 timestamps in +08:00.\n"
-            "- If a relative expression has a uniquely determined calendar date from created_at, fill start_at; do not leave it null.\n"
             "- new_turns[*].created_at is the calendar reference. Example: created_at=2026-07-09T09:30:00+08:00 and time_expression=下周开始 requires start_at=2026-07-13T00:00:00+08:00.\n"
-            "- Copy the user's original time_expression. Never output time_source or time_granularity.\n"
-            "- If the event is completed within one day and no end time is stated, set end_at equal to start_at and end_unknown=false.\n"
-            "- If the event normally spans multiple days but its end is not known, set end_at=null and end_unknown=true.\n"
-            "- If the start time cannot be determined, set start_at=null, end_at=null, and end_unknown=true.\n"
+            "- Copy the user's original time_expression. Never output time_source or end_unknown.\n"
+            "- Every create and replace operation must contain a complete non-empty interval with start_at < end_at.\n"
+            "- end_at is exclusive. A calendar day is [00:00:00 on that day, 00:00:00 on the next day).\n"
+            "- For a stated hour or minute without a duration, use the smallest expressed granularity as the exclusive bucket end.\n"
+            "- If the user gives an unknown open-ended state, do not invent an event end; route stable open-ended truth to high-level archival memory only when supported by committed facts.\n"
             "- For create, omit target_event_id. The application assigns the new event id.\n"
             "- For update/replace/cancel, target_event_id must be one of the supplied conflict candidates.\n"
             "- At most 1 event_summary. Keep it compact and factual; summarize the batch in no more than 80 words.\n"
@@ -455,6 +458,40 @@ class MemoryBankSummarizer:
                 target = str(operation.get("target_event_id", ""))
                 if not target or target not in candidate_ids:
                     raise SummaryGenerationError(f"semantic_event_operations[{index}].target_event_id is not an allowed candidate")
+            temporal_fields = ("start_at", "end_at", "time_granularity")
+            requires_interval = action in {"create", "replace"} or (
+                action == "update" and any(field in operation for field in temporal_fields)
+            )
+            if requires_interval:
+                for field in temporal_fields:
+                    if not str(operation.get(field, "")).strip():
+                        raise SummaryGenerationError(
+                            f"semantic_event_operations[{index}].{field} is required"
+                        )
+                start_raw = str(operation["start_at"]).strip()
+                end_raw = str(operation["end_at"]).strip()
+                try:
+                    start_at = datetime.fromisoformat(start_raw)
+                    end_at = datetime.fromisoformat(end_raw)
+                except ValueError as exc:
+                    raise SummaryGenerationError(
+                        f"semantic_event_operations[{index}] interval must use ISO 8601"
+                    ) from exc
+                if start_at.tzinfo is None or end_at.tzinfo is None:
+                    raise SummaryGenerationError(
+                        f"semantic_event_operations[{index}] interval must include timezone"
+                    )
+                if start_at >= end_at:
+                    raise SummaryGenerationError(
+                        f"semantic_event_operations[{index}].start_at must be earlier than end_at"
+                    )
+                if operation["time_granularity"] not in {
+                    "minute", "hour", "day", "week", "month", "year", "range"
+                }:
+                    raise SummaryGenerationError(
+                        f"semantic_event_operations[{index}].time_granularity is invalid"
+                    )
+            operation.pop("end_unknown", None)
             operation_sources = operation.get("source_message_ids", []) or []
             if not isinstance(operation_sources, list):
                 raise SummaryGenerationError(f"semantic_event_operations[{index}].source_message_ids must be an array")
