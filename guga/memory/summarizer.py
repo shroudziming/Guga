@@ -466,7 +466,8 @@ class MemoryBankSummarizer:
                     raise SummaryGenerationError(f"semantic_event_operations[{index}].target_event_id is not an allowed candidate")
             temporal_fields = ("start_at", "end_at", "time_granularity")
             requires_interval = action in {"create", "replace"} or (
-                action == "update" and any(field in operation for field in temporal_fields)
+                action == "update"
+                and any(field in operation for field in ("time_expression", *temporal_fields))
             )
             if requires_interval:
                 for field in temporal_fields:

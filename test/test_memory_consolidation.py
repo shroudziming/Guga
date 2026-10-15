@@ -247,6 +247,34 @@ class MemoryConsolidationTest(unittest.TestCase):
             model.prompts[0],
         )
 
+    def test_update_time_expression_requires_complete_interval(self) -> None:
+        class IncompleteUpdateModel:
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                return json.dumps(
+                    {
+                        "semantic_event_operations": [
+                            {
+                                "operation": "update",
+                                "target_event_id": "evt_existing",
+                                "subject": "user",
+                                "time_expression": "改到明天",
+                                "source_message_ids": [],
+                            }
+                        ],
+                        "event_summaries": [],
+                    }
+                )
+
+        summarizer = MemoryBankSummarizer(model=IncompleteUpdateModel(), use_llm=True, retry_delays=())
+        packet = {
+            **_reflection_packet(),
+            "recent_active_events": [{"id": "evt_existing"}],
+        }
+
+        with self.assertRaisesRegex(SummaryGenerationError, "start_at"):
+            summarizer.consolidate_low_level_memory(packet, include_guga_reflection=False)
+
     def test_high_level_archival_operation_requires_validity_interval(self) -> None:
         class MissingValidityModel:
             def generate_reply(self, messages, gen):
