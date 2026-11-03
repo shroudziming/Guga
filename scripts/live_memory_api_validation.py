@@ -65,11 +65,15 @@ class RecordingModel:
         return response
 
 
-def validate_time_event(event: dict) -> None:
+def validate_time_interval(event: dict) -> None:
     start = _parse_iso(str(event.get("start_at") or ""), "start_at")
     end = _parse_iso(str(event.get("end_at") or ""), "end_at")
     if start >= end:
         raise AssertionError(f"event interval must be non-empty and end-exclusive: {event}")
+
+
+def validate_persisted_time_event(event: dict) -> None:
+    validate_time_interval(event)
     if event.get("end_unknown") is not False:
         raise AssertionError(f"new event must persist end_unknown=false: {event}")
 
@@ -117,7 +121,7 @@ def run_same_day_time(summarizer: MemoryBankSummarizer) -> dict:
         summarizer,
         _low_level_packet("我下周二下午三点去看牙。", "2026-07-09T09:30:00+08:00"),
     )
-    validate_time_event(operation)
+    validate_time_interval(operation)
     if not str(operation["start_at"]).startswith("2026-07-14T15:00:00+08:00"):
         raise AssertionError(f"unexpected relative-time resolution: {operation}")
     return operation
@@ -161,12 +165,13 @@ def run_replace_lifecycle(summarizer: MemoryBankSummarizer) -> dict:
         operation = _single_operation(summarizer, packet)
         if operation.get("operation") not in {"update", "replace"} or operation.get("target_event_id") != old_id:
             raise AssertionError(f"expected mutation of {old_id}, got: {operation}")
-        validate_time_event(operation)
+        validate_time_interval(operation)
         store.apply_operations(operations=[operation], session_id="replace", include_guga_reflection=False)
         rows = {row["id"]: row for row in store.load_all()}
         active = [row for row in rows.values() if row.get("status") == "active"]
         if len(active) != 1 or active[0]["start_at"] != operation["start_at"]:
             raise AssertionError(f"invalid mutation lifecycle: {rows}")
+        validate_persisted_time_event(active[0])
         return operation
 
 
@@ -230,7 +235,7 @@ def run_two_stage_persistence(model: RecordingModel) -> dict:
         if len(events) != 1:
             raise AssertionError(f"expected one persisted event, got: {events}")
         persisted = events[0]
-        validate_time_event(persisted)
+        validate_persisted_time_event(persisted)
         scenario_prompts = model.prompts[prompt_start:]
         low_prompts = [prompt for prompt in scenario_prompts if "Low-level memory consolidation" in prompt]
         high_prompts = [prompt for prompt in scenario_prompts if "High-level memory consolidation" in prompt]
@@ -313,7 +318,7 @@ def run_temporal_e2e() -> dict:
         if len(events) != 1 or len(interview_events) != 1:
             raise AssertionError(f"expected exactly one active interview event: {events}")
         event = interview_events[0]
-        validate_time_event(event)
+        validate_persisted_time_event(event)
         if event["start_at"] != "2026-08-20T00:00:00+08:00" or event["end_at"] != "2026-08-21T00:00:00+08:00":
             raise AssertionError(f"unexpected interview interval: {event}")
 
