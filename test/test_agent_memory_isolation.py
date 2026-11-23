@@ -160,7 +160,7 @@ class AgentMemoryIsolationTest(unittest.TestCase):
             self.assertEqual(context.archival_memories, [])
             self.assertFalse((memory_base / "agents" / "default" / "sessions" / "sess_legacy.jsonl").exists())
 
-    def test_schema_one_manifest_migrates_without_moving_existing_memory(self) -> None:
+    def test_schema_one_manifest_is_rejected_without_modifying_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             memory_base = Path(tmp_dir) / "data" / "memory"
             root = memory_base / "agents" / "default"
@@ -179,8 +179,9 @@ class AgentMemoryIsolationTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            with self._patch_memory_roots(memory_base):
-                manager = MemoryManager(
+            original = (root / "agent_manifest.json").read_bytes()
+            with self._patch_memory_roots(memory_base), self.assertRaisesRegex(ValueError, "unsupported agent manifest schema"):
+                MemoryManager(
                     agent_identity=AgentIdentity(
                         "default", "skill", "config/personas/default/SKILL.md", "skill-v2"
                     ),
@@ -188,17 +189,9 @@ class AgentMemoryIsolationTest(unittest.TestCase):
                     enable_semantic=False,
                 )
 
-            manifest = json.loads((manager.memory_root / "agent_manifest.json").read_text(encoding="utf-8"))
-            revisions = [
-                json.loads(line)
-                for line in (manager.memory_root / "persona_revisions.jsonl")
-                .read_text(encoding="utf-8")
-                .splitlines()
-            ]
-            self.assertEqual(set(manifest), {"schema_version", "agent_id", "created_at"})
-            self.assertEqual(manifest["schema_version"], 2)
-            self.assertTrue((manager.memory_root / "sessions" / "existing.jsonl").exists())
-            self.assertEqual([row["fingerprint"] for row in revisions], ["inline-v1", "skill-v2"])
+            self.assertEqual((root / "agent_manifest.json").read_bytes(), original)
+            self.assertEqual((root / "sessions" / "existing.jsonl").read_text(encoding="utf-8"), "{}\n")
+            self.assertFalse((root / "persona_revisions.jsonl").exists())
 
     def test_new_skill_revision_appends_once_and_reuses_same_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
