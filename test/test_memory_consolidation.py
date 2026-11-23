@@ -742,7 +742,10 @@ class MemoryConsolidationTest(unittest.TestCase):
             state = json.loads((Path(tmp) / "consolidation_state.json").read_text(encoding="utf-8"))
             session_state = state["sessions"]["sess_bad_high"]
             self.assertEqual(session_state["pending_turns"], [])
-            self.assertEqual(session_state["pending_high_level"]["batch_seq"], 1)
+            self.assertNotIn("pending_high_level", session_state)
+            self.assertEqual(session_state["active_batch"]["batch_seq"], 1)
+            self.assertEqual(session_state["active_batch"]["stage"], "high")
+            self.assertEqual(session_state["active_batch"]["status"], "pending_retry")
             self.assertTrue((Path(tmp) / "semantic_events.jsonl").exists())
             self.assertTrue((Path(tmp) / "event_summaries.jsonl").exists())
             self.assertFalse((Path(tmp) / "archival_memory.jsonl").exists())
@@ -809,7 +812,7 @@ class MemoryConsolidationTest(unittest.TestCase):
             self.assertEqual(session_state["last_consolidated_turn_id"], turn_id)
             self.assertEqual(len((root / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()), event_count)
 
-    def test_pending_high_level_retry_does_not_repeat_stage_one(self) -> None:
+    def test_high_level_retry_does_not_repeat_stage_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             model = RetryHighLevelModel()
             manager = MemoryManager(
@@ -827,7 +830,8 @@ class MemoryConsolidationTest(unittest.TestCase):
             events = (Path(tmp) / "semantic_events.jsonl").read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(low_prompts), 1)
             self.assertEqual(len(events), 1)
-            self.assertIsNone(state["sessions"]["sess_retry_high"]["pending_high_level"])
+            self.assertNotIn("pending_high_level", state["sessions"]["sess_retry_high"])
+            self.assertIsNone(state["sessions"]["sess_retry_high"]["active_batch"])
             self.assertEqual(state["sessions"]["sess_retry_high"]["consolidation_batches"], 1)
 
     def test_chat_session_flush_consolidates_incomplete_batch(self) -> None:
