@@ -66,7 +66,6 @@ class RagPipeline:
             - memory_root/event_summaries.jsonl
             - memory_root/session_memories.jsonl
             - memory_root/semantic_events.jsonl
-            - memory_root/sessions/**/*.jsonl (legacy fallback user messages)
             - documents_dir/**/*.txt|md|json|jsonl
 
         Returns:
@@ -156,7 +155,7 @@ class RagPipeline:
         return hits
 
     def _collect_memory_chunks(self, memory_root: Path) -> list[DocumentChunk]:
-        """Collect chunked memory texts from archival and session user messages."""
+        """Collect chunks from canonical memory records."""
         chunks: list[DocumentChunk] = []
         semantic_event_file = memory_root / "semantic_events.jsonl"
         event_rows = self._read_jsonl_payloads(semantic_event_file)
@@ -171,34 +170,6 @@ class RagPipeline:
             if jsonl_file.exists():
                 for payload in self._read_jsonl_payloads(jsonl_file):
                     chunks.extend(self._memory_chunks_from_payload(payload, active_event_ids=current_event_ids))
-
-        if session_memory_file.exists():
-            return chunks
-
-        sessions_dir = memory_root / "sessions"
-        if sessions_dir.exists():
-            for path in sessions_dir.glob("**/*.jsonl"):
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        payload = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    if str(payload.get("role", "")) != "user":
-                        continue
-                    content = str(payload.get("content", "")).strip()
-                    if not content:
-                        continue
-                    chunks.extend(self._build_chunks(
-                        source_type="memory",
-                        source_id=str(payload.get("id", self._hash_text(content))),
-                        text=content,
-                        source_session_id=str(payload.get("session_id", "")),
-                        source_message_id=str(payload.get("id", "")),
-                        created_at=str(payload.get("created_at", "")),
-                    ))
 
         return chunks
 
