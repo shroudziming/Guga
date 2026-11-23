@@ -334,6 +334,29 @@ class MemoryConsolidationTest(unittest.TestCase):
             self.assertEqual(closed["valid_at"], "2026-08-18T10:00:00+08:00")
             self.assertEqual(closed["invalid_at"], "2026-08-21T00:00:00+08:00")
             self.assertEqual(opened["invalid_at"], "")
+            for record in (closed, opened):
+                self.assertNotIn("raw_excerpt", record)
+                self.assertEqual(record["summary"], "用户正在准备面试")
+                normalized = manager._normalize_archival_record(record)
+                self.assertEqual(normalized["summary"], "用户正在准备面试")
+
+    def test_high_level_packet_omits_only_duplicate_archival_excerpts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MemoryManager(memory_root=Path(tmp), enable_semantic=False)
+            rows = [
+                {"id": "duplicate", "summary": "用户正在准备面试", "raw_excerpt": "用户正在准备面试"},
+                {"id": "distinct", "summary": "用户正在准备面试", "raw_excerpt": "我下周要去面试"},
+                {"id": "legacy", "raw_excerpt": "只有原文的旧记录"},
+                {"id": "new", "summary": "没有摘录的新记录"},
+            ]
+            original = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n"
+            manager.archival_file.write_text(original, encoding="utf-8")
+
+            records = manager._build_high_level_packet()["archival_memory"]
+
+            self.assertEqual(records[0], {"id": "duplicate", "summary": "用户正在准备面试"})
+            self.assertEqual(records[1:], rows[1:])
+            self.assertEqual(manager.archival_file.read_text(encoding="utf-8"), original)
 
     def test_low_level_packet_includes_persisted_turn_temporal_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
