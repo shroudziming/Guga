@@ -304,24 +304,17 @@ class MemoryManager:
         if self.agent_identity is None:
             return
         manifest_path = self.memory_root / "agent_manifest.json"
-        legacy_revision = None
         if manifest_path.exists():
             payload = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError(f"agent manifest must be an object: {manifest_path}")
             schema_version = payload.get("schema_version")
-            if type(schema_version) is not int or schema_version not in {1, 2}:
+            if type(schema_version) is not int or schema_version != 2:
                 raise ValueError(f"unsupported agent manifest schema in {manifest_path}")
-            expected_keys = (
-                {"schema_version", "agent_id", "persona_source", "persona_fingerprint", "created_at"}
-                if schema_version == 1
-                else {"schema_version", "agent_id", "created_at"}
-            )
+            expected_keys = {"schema_version", "agent_id", "created_at"}
             if set(payload) != expected_keys:
                 raise ValueError(f"invalid agent manifest keys in {manifest_path}")
             required_strings = {"agent_id", "created_at"}
-            if schema_version == 1:
-                required_strings.update({"persona_source", "persona_fingerprint"})
             if any(
                 not isinstance(payload[key], str) or not payload[key].strip()
                 for key in required_strings
@@ -332,12 +325,6 @@ class MemoryManager:
             if payload["agent_id"] != self.agent_identity.agent_id:
                 raise ValueError("agent manifest mismatch for agent_id")
             created_at = payload["created_at"]
-            if schema_version == 1:
-                legacy_revision = (
-                    payload["persona_source"],
-                    payload["persona_fingerprint"],
-                    created_at,
-                )
         else:
             created_at = now_beijing_iso()
         self._write_json_atomically(
@@ -348,8 +335,6 @@ class MemoryManager:
                 "created_at": created_at,
             },
         )
-        if legacy_revision and legacy_revision[1]:
-            self._record_persona_revision(*legacy_revision)
         self._record_persona_revision()
 
     def _write_json_atomically(self, path: Path, payload: dict) -> None:
@@ -782,21 +767,6 @@ class MemoryManager:
             active = session_state.get("active_batch")
             if not isinstance(active, dict):
                 active = None
-            legacy_high = session_state.get("pending_high_level")
-            if active is None and isinstance(legacy_high, dict):
-                active = {
-                    "batch_seq": int(legacy_high.get("batch_seq", 0) or 0),
-                    "stage": "high",
-                    "status": "pending_retry",
-                    "attempt_count": 0,
-                    "retry_cycle": 0,
-                    "turns": [],
-                    "turn_ids": [],
-                    "trigger_reason": trigger_reason,
-                    "low_level_updates": int(legacy_high.get("low_level_updates", 0) or 0),
-                }
-                session_state["active_batch"] = active
-                self._write_consolidation_state(payload)
             pending_turns = list(session_state.get("pending_turns", []) or [])
             if active is None and not pending_turns:
                 return self._consolidation_result(session_state, status="idle")
@@ -914,7 +884,6 @@ class MemoryManager:
             if turn_ids:
                 session_state["last_consolidated_turn_id"] = turn_ids[-1]
             session_state["active_batch"] = None
-            session_state["pending_high_level"] = None
             session_state["pending_turns"] = list(session_state.get("queued_turns", []) or [])
             session_state["queued_turns"] = []
             session_state["batch_seq"] = batch_seq
@@ -979,11 +948,6 @@ class MemoryManager:
                     "response_hash": str(getattr(error, "response_hash", "")),
                 }
             )
-            if stage == "high":
-                state["pending_high_level"] = {
-                    "batch_seq": batch_seq,
-                    "low_level_updates": int(active.get("low_level_updates", 0) or 0),
-                }
             self._write_consolidation_state(payload)
 
     def _current_consolidation_result(self, session_id: str, *, status: str) -> dict[str, Any]:
@@ -1384,7 +1348,6 @@ class MemoryManager:
                 "pending_turns": [],
                 "queued_turns": [],
                 "active_batch": None,
-                "pending_high_level": None,
                 "completed_turns": 0,
                 "consolidation_batches": 0,
                 "low_level_updates": 0,
@@ -1398,7 +1361,6 @@ class MemoryManager:
         session_state.setdefault("pending_turns", [])
         session_state.setdefault("queued_turns", [])
         session_state.setdefault("active_batch", None)
-        session_state.setdefault("pending_high_level", None)
         session_state.setdefault("completed_turns", 0)
         session_state.setdefault("consolidation_batches", 0)
         session_state.setdefault("low_level_updates", 0)
