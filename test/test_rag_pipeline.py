@@ -87,6 +87,29 @@ class RagPipelineTest(unittest.TestCase):
         chunks = chunk_text(text, chunk_size=4, chunk_overlap=2)
         self.assertEqual(chunks, ["abcd", "cdef", "efgh", "ghij", "ij"])
 
+    def test_rebuild_does_not_index_raw_sessions_when_session_memory_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sessions = root / "memory" / "sessions"
+            sessions.mkdir(parents=True)
+            source = sessions / "session.jsonl"
+            original = json.dumps({"id": "msg_old", "role": "user", "content": "raw session only"}) + "\n"
+            source.write_text(original, encoding="utf-8")
+            pipeline = RagPipeline(
+                index_dir=root / "index",
+                documents_dir=root / "documents",
+                embedding_model="test-hashing",
+                chunk_size=64,
+                chunk_overlap=8,
+                embedder=HashingEmbedder(dim=64),
+            )
+
+            result = pipeline.rebuild_indexes(root / "memory")
+
+            self.assertEqual(result["memory_chunks"], 0)
+            self.assertEqual(pipeline.store.chunks, [])
+            self.assertEqual(source.read_text(encoding="utf-8"), original)
+
     def test_rebuild_excludes_records_derived_from_inactive_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
