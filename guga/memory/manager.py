@@ -1092,6 +1092,11 @@ class MemoryManager:
             ][-50:],
             "guga_user_model": user_model,
         }
+        # Older archives copied summary into raw_excerpt. Omit only exact
+        # duplicates from model input; preserve distinct original evidence.
+        for item in packet["archival_memory"]:
+            if "summary" in item and item.get("raw_excerpt") == item["summary"]:
+                item.pop("raw_excerpt", None)
         return self._trim_packet(packet)
 
     def _apply_low_level_consolidation(
@@ -1258,7 +1263,6 @@ class MemoryManager:
                 "type": "episodic",
                 "topic": str(item.get("topic") or "general").strip()[:64] or "general",
                 "summary": summary[:500],
-                "raw_excerpt": summary[:500],
                 "importance": self._clamp_float(item.get("importance"), 0.7),
                 "confidence": self._clamp_float(item.get("confidence"), 0.7),
                 "created_at": now,
