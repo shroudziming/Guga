@@ -655,6 +655,70 @@ class MemoryConsolidationTest(unittest.TestCase):
         self.assertIn("At most 1 event_summary", model.prompts[0])
         self.assertIn("Do not create events for generic questions", model.prompts[0])
 
+    def test_low_level_prompt_defines_fields_and_uses_a_valid_example(self) -> None:
+        class PromptCaptureModel:
+            def __init__(self) -> None:
+                self.prompt = ""
+
+            def generate_json_reply(self, messages, gen):
+                _ = gen
+                self.prompt = messages[-1]["content"]
+                return json.dumps({"semantic_event_operations": [], "event_summaries": []})
+
+            def generate_reply(self, messages, gen):
+                return self.generate_json_reply(messages, gen)
+
+        model = PromptCaptureModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True)
+
+        summarizer.consolidate_low_level_memory(
+            {
+                "new_turns": [
+                    {
+                        "user_message_id": "msg_user_test",
+                        "assistant_message_id": "msg_assistant_test",
+                        "created_at": "2026-11-24T10:00:00+08:00",
+                        "user_text": "我明天下午三点要参加面试。",
+                        "assistant_text": "祝你顺利。",
+                    }
+                ]
+            },
+            include_guga_reflection=False,
+        )
+
+        self.assertNotIn('"operation": "create|update|replace|cancel|ignore"', model.prompt)
+        self.assertIn('operation must be exactly one of: "create", "update", "replace", "cancel", "ignore"', model.prompt)
+        self.assertIn("event_kind is a concise event category", model.prompt)
+        self.assertIn("entity is the real-world object, organization, activity, or topic", model.prompt)
+        self.assertIn("source_message_ids must contain the exact input message IDs", model.prompt)
+        self.assertIn('"operation":"create"', model.prompt)
+        self.assertIn('"source_message_ids":["msg_user_example"]', model.prompt)
+
+    def test_low_level_prompt_places_host_contract_after_persona(self) -> None:
+        class PromptCaptureModel:
+            def __init__(self) -> None:
+                self.prompt = ""
+
+            def generate_reply(self, messages, gen):
+                _ = gen
+                self.prompt = messages[-1]["content"]
+                return json.dumps({"semantic_event_operations": [], "event_summaries": []})
+
+        model = PromptCaptureModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True)
+
+        summarizer.consolidate_low_level_memory(
+            {"new_turns": []},
+            include_guga_reflection=True,
+            reflection_context="PERSONA_MARKER",
+        )
+
+        self.assertLess(
+            model.prompt.index("PERSONA_MARKER"),
+            model.prompt.index("The root object must contain exactly these two array fields"),
+        )
+        self.assertIn('"guga_reflection":{"appraisal":', model.prompt)
+
     def test_summarizer_retries_invalid_json_once(self) -> None:
         class RetryModel:
             def __init__(self) -> None:
@@ -716,6 +780,30 @@ class MemoryConsolidationTest(unittest.TestCase):
         summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
 
         result = summarizer.consolidate_low_level_memory({"new_turns": []}, include_guga_reflection=False)
+
+        self.assertEqual(result, {"semantic_event_operations": [], "event_summaries": []})
+        self.assertEqual(model.calls, 2)
+        self.assertEqual(summarizer.last_structured_attempts[0]["error_type"], "schema")
+
+    def test_summarizer_rejects_reflection_at_the_top_level(self) -> None:
+        class RootReflectionModel:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def generate_reply(self, messages, gen):
+                _ = messages, gen
+                self.calls += 1
+                if self.calls == 1:
+                    return json.dumps({"appraisal": "重要事件", "felt_response": "替用户高兴"})
+                return json.dumps({"semantic_event_operations": [], "event_summaries": []})
+
+        model = RootReflectionModel()
+        summarizer = MemoryBankSummarizer(model=model, use_llm=True, retry_delays=())
+
+        result = summarizer.consolidate_low_level_memory(
+            {"new_turns": []},
+            include_guga_reflection=True,
+        )
 
         self.assertEqual(result, {"semantic_event_operations": [], "event_summaries": []})
         self.assertEqual(model.calls, 2)
