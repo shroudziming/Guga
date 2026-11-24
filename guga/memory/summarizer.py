@@ -213,38 +213,72 @@ class MemoryBankSummarizer:
                 "Write exactly appraisal and felt_response as non-empty strings.\n"
                 "Never copy subjective interpretation into objective event fields.\n\n"
             )
+        example_operation: dict[str, object] = {
+            "operation": "create",
+            "event_kind": "interview",
+            "subject": "user",
+            "entity": "星海公司产品面试",
+            "description": "用户参加星海公司的产品面试。",
+            "time_expression": "明天下午三点",
+            "start_at": "2026-07-10T15:00:00+08:00",
+            "end_at": "2026-07-10T15:00:00+08:00",
+            "end_unknown": False,
+            "source_message_ids": ["msg_user_example"],
+            "confidence": 0.95,
+        }
+        if include_guga_reflection:
+            example_operation["guga_reflection"] = {
+                "appraisal": "这场面试关系到用户的求职进展，值得记住。",
+                "felt_response": "我有点替他紧张，也希望他准备顺利。",
+            }
+        example_output = json.dumps(
+            {"semantic_event_operations": [example_operation], "event_summaries": []},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         prompt = (
             "Low-level memory consolidation for Guga.\n"
             "Return strict JSON object only, without markdown.\n"
             f"include_guga_reflection: {str(include_guga_reflection).lower()}\n\n"
-            "Output schema:\n"
-            "{"
-            "\"semantic_event_operations\": [{\"operation\": \"create|update|replace|cancel|ignore\", "
-            "\"event_kind\": string, \"subject\": \"user\", \"entity\": string, "
-            "\"description\": string, \"time_expression\": string, \"start_at\": string|null, "
-            "\"end_at\": string|null, \"end_unknown\": boolean, "
-            "\"source_message_ids\": [string], \"confidence\": number, "
-            "\"guga_reflection\": {\"appraisal\": string, \"felt_response\": string}}], "
-            "\"event_summaries\": [{\"summary\": string, \"source_message_ids\": [string], \"confidence\": number}]"
-            "}\n"
+            f"{reflection_wrapper}"
+            "The root object must contain exactly these two array fields and no other root fields.\n"
+            "Output shape (empty result):\n"
+            "{\"semantic_event_operations\": [], \"event_summaries\": []}\n"
+            "Each semantic_event_operations item may contain only these fields:\n"
+            "operation, target_event_id, event_kind, subject, entity, description, time_expression, "
+            "start_at, end_at, end_unknown, source_message_ids, confidence, guga_reflection.\n"
+            "Each event_summaries item contains summary, source_message_ids, and confidence.\n"
             "Rules:\n"
+            "- operation must be exactly one of: \"create\", \"update\", \"replace\", \"cancel\", \"ignore\". "
+            "Write one value, never copy the list or join values with |.\n"
             "- semantic_event_operations describe objective events or objective state changes only.\n"
             "- subject is always the literal string user for the human user's events; never use Guga as subject.\n"
+            "- event_kind is a concise event category such as interview, meeting, deadline, trip, or appointment; "
+            "it is never a speaker role, message ID, timestamp, or full sentence.\n"
+            "- entity is the real-world object, organization, activity, or topic central to the event; "
+            "it is never user, assistant, a message ID, timestamp, or field name.\n"
+            "- description states only the user's objective event in a concise sentence.\n"
             "- Do not create events for generic questions, advice requests, recommendations, definitions, explanations, preferences, or assistant-only content.\n"
             "- Resolve time against the source turn's created_at and output absolute ISO-8601 timestamps in +08:00.\n"
             "- If a relative expression has a uniquely determined calendar date from created_at, fill start_at; do not leave it null.\n"
             "- new_turns[*].created_at is the calendar reference. Example: created_at=2026-07-09T09:30:00+08:00 and time_expression=下周开始 requires start_at=2026-07-13T00:00:00+08:00.\n"
-            "- Copy the user's original time_expression. Never output time_source or time_granularity.\n"
+            "- time_expression must be the exact time phrase copied from user_text, not created_at and not an ISO timestamp. Never output time_source or time_granularity.\n"
             "- If the event is completed within one day and no end time is stated, set end_at equal to start_at and end_unknown=false.\n"
             "- If the event normally spans multiple days but its end is not known, set end_at=null and end_unknown=true.\n"
             "- If the start time cannot be determined, set start_at=null, end_at=null, and end_unknown=true.\n"
             "- For create, omit target_event_id. The application assigns the new event id.\n"
             "- For update/replace/cancel, target_event_id must be one of the supplied conflict candidates.\n"
+            "- source_message_ids must contain the exact input message IDs that directly support the event. "
+            "For events stated by the user, cite user_message_id; never invent an ID or use created_at.\n"
             "- At most 1 event_summary. Keep it compact and factual; summarize the batch in no more than 80 words.\n"
             "- guga_reflection is a role-specific interpretation, never factual evidence.\n"
             "- If include_guga_reflection is false, omit guga_reflection.\n"
             "- Do not write archival/profile/personality updates here.\n\n"
-            f"{reflection_wrapper}"
+            f"Valid example when include_guga_reflection is {str(include_guga_reflection).lower()}:\n"
+            "Example input: user_message_id=msg_user_example, created_at=2026-07-09T09:30:00+08:00, "
+            "user_text=我明天下午三点参加星海公司的产品面试。\n"
+            "Example output:\n"
+            f"{example_output}\n\n"
             "Input packet:\n"
             f"{json.dumps(packet, ensure_ascii=False)}"
         )
@@ -409,8 +443,14 @@ class MemoryBankSummarizer:
         }
 
     def _validate_low_level_result(self, parsed: dict, packet: dict, include_guga_reflection: bool) -> dict:
-        parsed.setdefault("semantic_event_operations", [])
-        parsed.setdefault("event_summaries", [])
+        required_root_fields = {"semantic_event_operations", "event_summaries"}
+        actual_root_fields = set(parsed)
+        if actual_root_fields != required_root_fields:
+            missing = sorted(required_root_fields - actual_root_fields)
+            unexpected = sorted(actual_root_fields - required_root_fields)
+            raise SummaryGenerationError(
+                f"low-level root fields are invalid; missing={missing}, unexpected={unexpected}"
+            )
         operations = parsed["semantic_event_operations"]
         summaries = parsed["event_summaries"]
         if not isinstance(operations, list) or not isinstance(summaries, list):
